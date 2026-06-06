@@ -188,13 +188,16 @@ pub struct PiiFindingRecord {
     pub value_hash: String,
 }
 
-/// What was done about a PII finding.
+/// What was done about a PII finding (04 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PiiAction {
-    /// Logged only (v0 default).
+    /// Logged only (observe-mode default).
     Observed,
-    /// Masked before forwarding (opt-in, §7.6).
+    /// Masking is enabled but in dry-run: the span *would* have been masked,
+    /// but traffic was forwarded unchanged (opt-in preview, §7.6).
+    WouldMask,
+    /// Masked before forwarding to the engine (opt-in, live, §7.6).
     Masked,
 }
 
@@ -964,12 +967,14 @@ fn parse_confidence(s: &str) -> Confidence {
 fn pii_action_str(a: PiiAction) -> &'static str {
     match a {
         PiiAction::Observed => "observed",
+        PiiAction::WouldMask => "would_mask",
         PiiAction::Masked => "masked",
     }
 }
 
 fn parse_pii_action(s: &str) -> PiiAction {
     match s {
+        "would_mask" => PiiAction::WouldMask,
         "masked" => PiiAction::Masked,
         _ => PiiAction::Observed,
     }

@@ -235,6 +235,11 @@ pub struct SettingsView {
     pub proxy_port: u16,
     /// Studio port.
     pub studio_port: u16,
+    /// Opt-in PII masking master switch (04 §7.6; observe-only default: false).
+    pub masking_enabled: bool,
+    /// Masking dry-run: when true (default), record what *would* be masked but
+    /// forward traffic unchanged. Only `enabled && !dry_run` redacts requests.
+    pub masking_dry_run: bool,
 }
 
 /// `PUT /api/settings` — partial update; only present fields change. Toggling
@@ -250,6 +255,11 @@ pub struct SettingsUpdate {
     pub retention: Option<Retention>,
     /// New handover policy.
     pub handover: Option<HandoverPolicy>,
+    /// Toggle opt-in PII masking (04 §7.6). Enabling is an explicit user action.
+    pub masking_enabled: Option<bool>,
+    /// Toggle masking dry-run. Setting this to `false` turns on real request
+    /// redaction — the only traffic-mutating action in v1.
+    pub masking_dry_run: Option<bool>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.

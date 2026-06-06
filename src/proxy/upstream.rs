@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::proxy::{ProxyState, TeeEvent};
+use crate::proxy::{MaskAction, ProxyState, TeeEvent};
 
 /// Process-global streaming HTTP client used to reach the local engine.
 ///
@@ -102,13 +102,28 @@ pub async fn forward_streaming(
         }
     };
 
-    // Tee the request start. Best-effort; never blocks.
+    // Decide masking BEFORE forwarding (04 §7.6). Default is observe-only; only
+    // when masking is enabled AND not in dry-run do we redact the request body
+    // before it reaches the engine — the high-value case (keep PII off the
+    // model). Fail-open: any error here yields the ORIGINAL body + `Observed`.
+    //
+    // SCOPE (v1): we mask the REQUEST body here (the full body is in hand). For
+    // NON-STREAMING responses, masking would happen on the response path; for
+    // STREAMING responses it is deferred because a PII span can straddle two
+    // chunks and we must never buffer the stream (the transparent-streaming
+    // invariant). See `mask_request_body` and the response path for details.
+    let (forward_bytes, mask_action) = mask_request_body(state, &req_bytes);
+
+    // Tee the request start with the ORIGINAL (unredacted) body so the logger
+    // records the true findings + offsets, plus what masking did to the
+    // forwarded body. Best-effort; never blocks.
     tee_drop_oldest(
         state,
         TeeEvent::RequestStarted {
             id: id.clone(),
             endpoint: endpoint.to_string(),
             body: req_bytes.clone(),
+            mask_action,
             peer: Some(peer),
             headers: req_headers.clone(),
         },
@@ -122,11 +137,14 @@ pub async fn forward_streaming(
         .unwrap_or(endpoint);
     let url = format!("{}{}", state.upstream.trim_end_matches('/'), path_and_query);
 
-    // Construct the upstream request.
+    // Construct the upstream request. When masking redacted the body,
+    // `forward_bytes` differs from `req_bytes`; otherwise it is the same buffer.
+    // `content-length` is stripped as hop-by-hop and re-derived by reqwest from
+    // the body we set, so a length change after redaction stays consistent.
     let mut builder = UPSTREAM_CLIENT.request(method, &url);
     builder = builder.headers(forward_request_headers(&req_headers));
-    if !req_bytes.is_empty() {
-        builder = builder.body(req_bytes);
+    if !forward_bytes.is_empty() {
+        builder = builder.body(forward_bytes);
     }
 
     // Send. On a connect/transport error, fail open with a 502 — the request
@@ -255,6 +273,59 @@ fn send_chunk(tee: &crate::proxy::TeeSender, id: &str, chunk: Bytes) {
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {}
         }
     }
+}
+
+/// Decide + apply request-body masking (04 §7.6). Returns the bytes to forward
+/// upstream and the [`MaskAction`] taken.
+///
+/// Behaviour (observe-by-default invariant):
+/// - masking disabled -> `(original, Observed)` — pure passthrough.
+/// - masking enabled + dry-run -> `(original, WouldMask)` — body unchanged, but
+///   findings are recorded as `would_mask` by the logger.
+/// - masking enabled + live -> scan, redact HIGH-confidence spans in scope,
+///   and forward the redacted bytes as `Masked`. If nothing was actually
+///   maskable, returns `(original, Observed)` so we never claim a mask we did
+///   not perform.
+///
+/// **Fail-open:** this function never errors and never panics. Worst case it
+/// returns the ORIGINAL body untouched. Only HIGH-confidence findings in the
+/// configured kind allow-list are ever redacted (delegated to
+/// [`crate::brain::pii::mask`] / `should_mask`); low-confidence findings are
+/// never masked.
+fn mask_request_body(state: &ProxyState, body: &Bytes) -> (Bytes, MaskAction) {
+    mask_body_with(&state.config.masking, &state.detector, body)
+}
+
+/// Core of [`mask_request_body`], decoupled from [`ProxyState`] so it is unit
+/// testable without a live store/tee. See `mask_request_body` for behaviour +
+/// the fail-open / low-confidence guarantees.
+fn mask_body_with(
+    masking: &crate::config::MaskingConfig,
+    detector: &crate::brain::pii::Detector,
+    body: &Bytes,
+) -> (Bytes, MaskAction) {
+    if !masking.enabled || body.is_empty() {
+        return (body.clone(), MaskAction::Observed);
+    }
+
+    if masking.dry_run {
+        // Preview only: forward unchanged. The logger stamps `would_mask` on the
+        // request findings (it re-scans the original body), so we do no work here
+        // beyond signalling the action.
+        return (body.clone(), MaskAction::WouldMask);
+    }
+
+    // Live masking. Scan the body text and redact maskable spans. A body that is
+    // not valid UTF-8 yields a lossy view; we only forward redacted bytes when at
+    // least one span was masked, otherwise we observe (never claim a no-op mask).
+    let text = String::from_utf8_lossy(body);
+    let kinds = masking.kinds.as_deref();
+    let findings = detector.scan(crate::brain::Side::Request, &text);
+    let (redacted, masked) = crate::brain::pii::mask(&text, &findings, kinds);
+    if masked == 0 {
+        return (body.clone(), MaskAction::Observed);
+    }
+    (Bytes::from(redacted.into_bytes()), MaskAction::Masked)
 }
 
 /// Compute the stable hash stored as `requests.request_hash`.
@@ -451,6 +522,129 @@ mod tests {
         assert!(!out.contains_key("content-length"));
         assert_eq!(out.get("content-type").unwrap(), "application/json");
         assert_eq!(out.get("x-client-name").unwrap(), "my-app");
+    }
+
+    // --- Request masking (04 §7.6) ------------------------------------------
+
+    use crate::brain::pii::Detector;
+    use crate::config::MaskingConfig;
+
+    fn detector() -> Detector {
+        Detector::new(&[]).expect("default detector compiles")
+    }
+
+    fn body_with_pii() -> Bytes {
+        Bytes::from_static(
+            br#"{"model":"llama3","messages":[{"role":"user","content":"email me at jane@example.com"}]}"#,
+        )
+    }
+
+    #[test]
+    fn masking_disabled_forwards_original_observed() {
+        let cfg = MaskingConfig {
+            enabled: false,
+            dry_run: true,
+            kinds: None,
+        };
+        let body = body_with_pii();
+        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        assert_eq!(action, MaskAction::Observed);
+        assert_eq!(out, body, "disabled masking must forward verbatim");
+    }
+
+    #[test]
+    fn masking_dry_run_passes_through_but_would_mask() {
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: true,
+            kinds: None,
+        };
+        let body = body_with_pii();
+        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        assert_eq!(action, MaskAction::WouldMask);
+        assert_eq!(
+            out, body,
+            "dry-run must forward the ORIGINAL body unchanged"
+        );
+        assert!(
+            std::str::from_utf8(&out)
+                .unwrap()
+                .contains("jane@example.com"),
+            "dry-run must not redact"
+        );
+    }
+
+    #[test]
+    fn masking_live_redacts_request_body() {
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            kinds: None,
+        };
+        let body = body_with_pii();
+        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        assert_eq!(action, MaskAction::Masked);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("[EMAIL]"), "email must be replaced: {text}");
+        assert!(
+            !text.contains("jane@example.com"),
+            "raw email must not reach the engine: {text}"
+        );
+    }
+
+    #[test]
+    fn masking_live_with_no_pii_observes() {
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            kinds: None,
+        };
+        let body = Bytes::from_static(br#"{"model":"llama3","messages":[]}"#);
+        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        // Nothing maskable -> never claim a mask; forward original as observed.
+        assert_eq!(action, MaskAction::Observed);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn masking_live_empty_body_is_observed() {
+        // Fail-open: an empty (e.g. GET) body is never touched.
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            kinds: None,
+        };
+        let (out, action) = mask_body_with(&cfg, &detector(), &Bytes::new());
+        assert_eq!(action, MaskAction::Observed);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn masking_respects_kind_allow_list() {
+        // Only mask IPs; an email in the body must survive.
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            kinds: Some(vec![crate::brain::PiiKind::IpAddress]),
+        };
+        let body =
+            Bytes::from_static(br#"{"content":"reach me at jane@example.com via 192.168.1.100"}"#);
+        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        assert_eq!(action, MaskAction::Masked);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("[IP]"), "IP masked: {text}");
+        assert!(
+            text.contains("jane@example.com"),
+            "email not in allow-list, must survive: {text}"
+        );
+    }
+
+    #[test]
+    fn mask_action_maps_to_pii_action() {
+        use crate::store::PiiAction;
+        assert_eq!(MaskAction::Observed.to_pii_action(), PiiAction::Observed);
+        assert_eq!(MaskAction::WouldMask.to_pii_action(), PiiAction::WouldMask);
+        assert_eq!(MaskAction::Masked.to_pii_action(), PiiAction::Masked);
     }
 
     #[test]

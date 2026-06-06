@@ -396,6 +396,91 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
     !RE_DATE.is_match(s)
 }
 
+/// The typed placeholder a masked span of `kind` is replaced with (04 §7.6).
+///
+/// Only the high-confidence deterministic kinds have a placeholder; a [`Custom`]
+/// pattern maps to a generic `[REDACTED]` so a user pattern is never silently
+/// left in place when masking is on for it. Phone/email/etc. get their own tag
+/// so the masked text stays self-describing for the reader.
+///
+/// [`Custom`]: PiiKind::Custom
+pub fn placeholder(kind: PiiKind) -> &'static str {
+    match kind {
+        PiiKind::Email => "[EMAIL]",
+        PiiKind::CreditCard => "[CARD]",
+        PiiKind::ApiKey => "[API_KEY]",
+        PiiKind::IpAddress => "[IP]",
+        PiiKind::Phone => "[PHONE]",
+        PiiKind::Custom => "[REDACTED]",
+    }
+}
+
+/// Whether a finding is eligible to be masked.
+///
+/// **Hard rule:** only HIGH-confidence findings are ever masked — best-effort /
+/// low-confidence matches are never touched (04 §7.6, §6.1). `kinds`, when
+/// `Some`, further restricts masking to that allow-list; `None` means *all*
+/// high-confidence kinds. This is the single gate every masking path goes
+/// through, so the low-confidence guarantee can never be bypassed.
+pub fn should_mask(finding: &Finding, kinds: Option<&[PiiKind]>) -> bool {
+    if finding.confidence != Confidence::High {
+        return false;
+    }
+    match kinds {
+        Some(allowed) => allowed.contains(&finding.kind),
+        None => true,
+    }
+}
+
+/// Redact `text`, replacing each maskable span with its typed placeholder.
+///
+/// Given the already-computed `findings` for `text`, returns a new string where
+/// every finding that passes [`should_mask`] (HIGH-confidence, in `kinds`) is
+/// replaced by [`placeholder`]. Low-confidence / out-of-allow-list spans are
+/// left verbatim. Returns the number of spans actually masked alongside the
+/// redacted string so callers can record the action.
+///
+/// ## Safety / correctness
+/// - Spans are applied **left-to-right, highest-offset-first** is not needed
+///   because we rebuild the string in a single forward pass; overlapping spans
+///   cannot occur (the detector claims byte ranges so findings never overlap),
+///   but we still skip any finding whose start is behind the last emitted
+///   cursor as a defensive guard.
+/// - Offsets are byte offsets on UTF-8 boundaries (the detector guarantees
+///   this); we slice on them directly. A finding with out-of-range or
+///   non-boundary offsets is skipped rather than panicking (fail-open).
+pub fn mask(text: &str, findings: &[Finding], kinds: Option<&[PiiKind]>) -> (String, usize) {
+    // Collect maskable spans in offset order. The detector already emits
+    // offset-sorted, non-overlapping findings, but sort defensively so this
+    // function is correct for any caller-supplied slice.
+    let mut spans: Vec<(usize, usize, PiiKind)> = findings
+        .iter()
+        .filter(|f| should_mask(f, kinds))
+        .map(|f| (f.start, f.end, f.kind))
+        .collect();
+    spans.sort_by_key(|&(s, e, _)| (s, e));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut masked = 0usize;
+
+    for (start, end, kind) in spans {
+        // Defensive bounds + boundary checks: skip a malformed span (fail-open).
+        if start < cursor || end > text.len() || start > end {
+            continue;
+        }
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(placeholder(kind));
+        cursor = end;
+        masked += 1;
+    }
+    out.push_str(&text[cursor..]);
+    (out, masked)
+}
+
 pub fn hash_value(matched: &str) -> String {
     let mut hasher = DefaultHasher::new();
     matched.hash(&mut hasher);
@@ -757,6 +842,116 @@ mod tests {
             "The quick brown fox jumps over the lazy dog.",
         );
         assert!(f.is_empty(), "unexpected findings: {:?}", kinds(&f));
+    }
+
+    // --- Masking (04 §7.6) --------------------------------------------------
+
+    #[test]
+    fn placeholders_are_typed_per_kind() {
+        assert_eq!(placeholder(PiiKind::Email), "[EMAIL]");
+        assert_eq!(placeholder(PiiKind::CreditCard), "[CARD]");
+        assert_eq!(placeholder(PiiKind::ApiKey), "[API_KEY]");
+        assert_eq!(placeholder(PiiKind::IpAddress), "[IP]");
+        assert_eq!(placeholder(PiiKind::Phone), "[PHONE]");
+    }
+
+    #[test]
+    fn mask_redacts_high_confidence_spans() {
+        let d = det();
+        let text = "email jane@example.com and ip 192.168.1.100 done";
+        let findings = d.scan(Side::Request, text);
+        let (redacted, n) = mask(text, &findings, None);
+        assert_eq!(n, 2, "two high-confidence spans masked");
+        assert_eq!(redacted, "email [EMAIL] and ip [IP] done");
+        // The raw values must be gone from the redacted output.
+        assert!(!redacted.contains("jane@example.com"));
+        assert!(!redacted.contains("192.168.1.100"));
+    }
+
+    #[test]
+    fn mask_only_touches_allowed_kinds() {
+        let d = det();
+        let text = "email jane@example.com and ip 192.168.1.100 done";
+        let findings = d.scan(Side::Request, text);
+        // Restrict to email only: the IP must survive verbatim.
+        let (redacted, n) = mask(text, &findings, Some(&[PiiKind::Email]));
+        assert_eq!(n, 1);
+        assert!(redacted.contains("[EMAIL]"));
+        assert!(redacted.contains("192.168.1.100"), "IP not in allow-list");
+        assert!(!redacted.contains("[IP]"));
+    }
+
+    #[test]
+    fn mask_never_touches_low_confidence() {
+        // A custom Low-confidence finding must never be masked, even when its
+        // kind would otherwise be in scope.
+        let custom = vec![CustomPattern {
+            name: "employee_id".to_string(),
+            regex: r"EMP-\d{6}".to_string(),
+            confidence: Confidence::Low,
+        }];
+        let d = Detector::new(&custom).expect("compiles");
+        let text = "user EMP-004217 mailed a@b.com";
+        let findings = d.scan(Side::Request, text);
+        // No kind filter -> everything high-confidence is fair game, but the
+        // Low-confidence custom hit must still be left verbatim.
+        let (redacted, _n) = mask(text, &findings, None);
+        assert!(
+            redacted.contains("EMP-004217"),
+            "low-confidence span must never be masked: {redacted}"
+        );
+        assert!(should_mask(
+            &Finding {
+                kind: PiiKind::Email,
+                label: None,
+                side: Side::Request,
+                start: 0,
+                end: 1,
+                confidence: Confidence::High,
+                value_hash: "h".into(),
+            },
+            None
+        ));
+        assert!(!should_mask(
+            &Finding {
+                kind: PiiKind::Custom,
+                label: Some("employee_id".into()),
+                side: Side::Request,
+                start: 0,
+                end: 1,
+                confidence: Confidence::Low,
+                value_hash: "h".into(),
+            },
+            None
+        ));
+    }
+
+    #[test]
+    fn mask_clean_text_is_identity() {
+        let d = det();
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let findings = d.scan(Side::Request, text);
+        let (redacted, n) = mask(text, &findings, None);
+        assert_eq!(n, 0);
+        assert_eq!(redacted, text);
+    }
+
+    #[test]
+    fn mask_skips_out_of_range_spans_fail_open() {
+        // A malformed finding (offsets past the end) must be skipped, not panic.
+        let text = "short";
+        let bad = Finding {
+            kind: PiiKind::Email,
+            label: None,
+            side: Side::Request,
+            start: 2,
+            end: 999,
+            confidence: Confidence::High,
+            value_hash: "h".into(),
+        };
+        let (redacted, n) = mask(text, &[bad], None);
+        assert_eq!(n, 0, "out-of-range span skipped");
+        assert_eq!(redacted, text);
     }
 
     #[test]

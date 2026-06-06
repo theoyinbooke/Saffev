@@ -352,8 +352,9 @@ pub async fn privacy(
         by_app,
         by_model,
         total: findings.len() as u64,
-        // Masking (§7.6) does not ship in v0.
-        masking_enabled: false,
+        // Reflect the opt-in masking switch (§7.6). The Privacy page badges
+        // dry-run vs live via the Settings view; here we just expose enablement.
+        masking_enabled: state.config.masking.enabled,
     }))
 }
 
@@ -508,6 +509,23 @@ pub async fn settings_put(
             value: format!("{:?}", handover).to_lowercase(),
         });
     }
+    if let Some(masking_enabled) = body.masking_enabled {
+        cfg.masking.enabled = masking_enabled;
+        // Enabling masking is an explicit, logged action (04 §7.6, §7.9).
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "masking_enabled".to_string(),
+            value: masking_enabled.to_string(),
+        });
+    }
+    if let Some(masking_dry_run) = body.masking_dry_run {
+        cfg.masking.dry_run = masking_dry_run;
+        // Leaving dry-run (dry_run=false) is the step that turns on real request
+        // redaction — log it explicitly.
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "masking_dry_run".to_string(),
+            value: masking_dry_run.to_string(),
+        });
+    }
 
     cfg.save().map_err(internal)?;
 
@@ -565,6 +583,8 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         custom_patterns: cfg.custom_patterns.iter().map(|p| p.name.clone()).collect(),
         proxy_port: cfg.ports.proxy,
         studio_port: cfg.ports.studio,
+        masking_enabled: cfg.masking.enabled,
+        masking_dry_run: cfg.masking.dry_run,
     }
 }
 
@@ -822,5 +842,25 @@ mod tests {
         assert_eq!(view.studio_port, crate::config::DEFAULT_STUDIO_PORT);
         assert!(!view.payload_storage); // privacy default
                                         // The SettingsView struct has no token field — contract guarantees it.
+    }
+
+    #[test]
+    fn settings_view_surfaces_masking_defaults() {
+        // Observe-only default: masking off, and dry-run on so the very first
+        // act of enabling it never mutates traffic.
+        let cfg = crate::config::Config::default();
+        let view = settings_view(&cfg);
+        assert!(!view.masking_enabled, "masking off by default");
+        assert!(view.masking_dry_run, "dry-run on by default");
+    }
+
+    #[test]
+    fn settings_view_reflects_enabled_live_masking() {
+        let mut cfg = crate::config::Config::default();
+        cfg.masking.enabled = true;
+        cfg.masking.dry_run = false;
+        let view = settings_view(&cfg);
+        assert!(view.masking_enabled);
+        assert!(!view.masking_dry_run);
     }
 }

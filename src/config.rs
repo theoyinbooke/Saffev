@@ -117,6 +117,46 @@ impl Default for PortsConfig {
     }
 }
 
+/// Opt-in PII masking (04 §5 Mask mode, §7.6).
+///
+/// **Observe stays the default**: `enabled` is `false`, so nothing is mutated.
+/// When enabled the default is still safe — `dry_run` is `true`, so the proxy
+/// passes traffic through unchanged and only records what *would* be masked.
+/// Only when `enabled && !dry_run` does the request body get redacted before it
+/// reaches the engine (the high-value case: keep PII off the model). Masking is
+/// always fail-open: any error forwards the original request untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaskingConfig {
+    /// Master switch. `false` (default) = pure observe; nothing is mutated.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When `true` (default), do not mutate traffic — only record what *would*
+    /// be masked. Flipping this to `false` is the explicit step that turns on
+    /// real request redaction.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Which HIGH-confidence kinds to mask. `None` (default) means *all* the
+    /// high-confidence deterministic kinds (email, credit card, API key, IP,
+    /// phone). Best-effort / low-confidence findings are **never** masked,
+    /// regardless of this list.
+    #[serde(default)]
+    pub kinds: Option<Vec<crate::brain::PiiKind>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MaskingConfig {
+    fn default() -> Self {
+        MaskingConfig {
+            enabled: false,
+            dry_run: true,
+            kinds: None,
+        }
+    }
+}
+
 /// A user-defined PII pattern (custom-pattern list, 04 §6.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomPattern {
@@ -161,6 +201,10 @@ pub struct Config {
     /// Extra user-defined PII patterns.
     #[serde(default)]
     pub custom_patterns: Vec<CustomPattern>,
+
+    /// Opt-in PII masking (04 §5, §7.6). Defaults to observe-only.
+    #[serde(default)]
+    pub masking: MaskingConfig,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -177,6 +221,7 @@ impl Default for Config {
             handover: HandoverPolicy::default(),
             data_dir: default_data_dir(),
             custom_patterns: Vec::new(),
+            masking: MaskingConfig::default(),
         }
     }
 }
@@ -348,6 +393,72 @@ mod tests {
         assert_eq!(loaded.ports.shadow, expected.ports.shadow);
         assert_eq!(loaded.ports.upstream, expected.ports.upstream);
         assert_eq!(loaded.custom_patterns.len(), expected.custom_patterns.len());
+        assert_eq!(loaded.masking.enabled, expected.masking.enabled);
+        assert_eq!(loaded.masking.dry_run, expected.masking.dry_run);
+        assert_eq!(loaded.masking.kinds, expected.masking.kinds);
+    }
+
+    /// Masking defaults must keep observe-only behaviour: disabled, and even if
+    /// enabled it is dry-run by default with no explicit kind list (= all
+    /// high-confidence kinds).
+    #[test]
+    fn masking_defaults_are_observe_only() {
+        let cfg = Config::default();
+        assert!(!cfg.masking.enabled, "masking must be off by default");
+        assert!(cfg.masking.dry_run, "masking must be dry-run by default");
+        assert!(cfg.masking.kinds.is_none(), "no kind filter by default");
+    }
+
+    /// Omitting the whole `[masking]` table in a loaded TOML falls back to the
+    /// safe observe-only defaults (older configs keep working unchanged).
+    #[test]
+    fn masking_section_absent_falls_back_to_defaults() {
+        let dir = unique_temp_dir("masking-absent");
+        let path = dir.join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "mode = \"cooperative\"\ndata_dir = {:?}\n[ports]\nproxy = 11434\nupstream = 11999\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).expect("loads without [masking]");
+        assert!(!cfg.masking.enabled);
+        assert!(cfg.masking.dry_run);
+        assert!(cfg.masking.kinds.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit `[masking]` table parses its fields, including a kinds filter.
+    #[test]
+    fn masking_section_parses_explicit_fields() {
+        use crate::brain::PiiKind;
+        let dir = unique_temp_dir("masking-explicit");
+        let path = dir.join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "mode = \"cooperative\"\ndata_dir = {:?}\n[ports]\nproxy = 11434\nupstream = 11999\n\
+                 [masking]\nenabled = true\ndry_run = false\nkinds = [\"email\", \"api_key\"]\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).expect("loads with explicit [masking]");
+        assert!(cfg.masking.enabled);
+        assert!(!cfg.masking.dry_run);
+        assert_eq!(
+            cfg.masking.kinds,
+            Some(vec![PiiKind::Email, PiiKind::ApiKey])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (a) First-run default materialization, TOML layer: serializing the shipped

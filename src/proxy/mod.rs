@@ -41,8 +41,15 @@ pub enum TeeEvent {
         id: String,
         /// Endpoint path.
         endpoint: String,
-        /// Captured request body (for hashing + PII scan + optional payload).
+        /// **Original** captured request body (for hashing + PII scan + optional
+        /// payload). This is always the unredacted body even when masking is
+        /// live, so the logger records the true findings + offsets; the redacted
+        /// body (if any) is what was forwarded to the engine and is not retained.
         body: Bytes,
+        /// What masking did to the forwarded request body (04 §7.6). The logger
+        /// uses this to stamp each request-side finding's `action`
+        /// (`observed` | `would_mask` | `masked`).
+        mask_action: MaskAction,
         /// The client's peer socket address (remote end of the accepted
         /// connection), if axum threaded it through `ConnectInfo`. Used by the
         /// logger to resolve the source app via socket-PID lookup **off the hot
@@ -69,6 +76,38 @@ pub enum TeeEvent {
         /// Total time (millis).
         total_ms: Option<u32>,
     },
+}
+
+/// What the masking layer did to a forwarded request body (04 §7.6).
+///
+/// Decided inline in the forwarder (where the body is in hand) and carried on
+/// the tee so the logger can stamp the matching [`PiiAction`] on each request
+/// finding without re-deciding. Maps 1:1 to the recorded action for request-side
+/// findings.
+///
+/// [`PiiAction`]: crate::store::PiiAction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskAction {
+    /// Masking off, or no maskable spans: pure observe, body forwarded as-is.
+    Observed,
+    /// Masking on but dry-run: body forwarded unchanged; findings *would* have
+    /// been masked.
+    WouldMask,
+    /// Masking live: the request body was redacted before forwarding.
+    Masked,
+}
+
+impl MaskAction {
+    /// Project to the storable [`PiiAction`].
+    ///
+    /// [`PiiAction`]: crate::store::PiiAction
+    pub fn to_pii_action(self) -> PiiAction {
+        match self {
+            MaskAction::Observed => PiiAction::Observed,
+            MaskAction::WouldMask => PiiAction::WouldMask,
+            MaskAction::Masked => PiiAction::Masked,
+        }
+    }
 }
 
 /// Sender half of the bounded, drop-oldest tee.
@@ -230,6 +269,7 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                 id,
                 endpoint,
                 body,
+                mask_action,
                 peer,
                 headers,
             } => {
@@ -241,6 +281,7 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                     id,
                     endpoint,
                     body,
+                    mask_action,
                     peer,
                     &headers,
                 );
@@ -290,6 +331,7 @@ fn on_request_started(
     id: String,
     endpoint: String,
     body: Bytes,
+    mask_action: MaskAction,
     peer: Option<std::net::SocketAddr>,
     headers: &axum::http::HeaderMap,
 ) {
@@ -337,11 +379,26 @@ fn on_request_started(
     // Enqueue request metadata (always).
     state.store.enqueue(WriteOp::Request(meta));
 
-    // Enqueue request-side PII findings (if any).
+    // Enqueue request-side PII findings (if any). The action recorded per
+    // finding reflects what masking did to the forwarded body: `observed` (off /
+    // nothing maskable), `would_mask` (dry-run), or `masked` (redacted before
+    // forwarding). Only HIGH-confidence findings are eligible for the non-observe
+    // actions — a low-confidence finding is always recorded as `observed` since
+    // it is never masked (see `pii::should_mask`).
     if !findings.is_empty() {
+        let mask_kinds = state.config.masking.kinds.as_deref();
         let records: Vec<PiiFindingRecord> = findings
             .iter()
-            .map(|f| PiiFindingRecord::from_finding(&id, f, PiiAction::Observed))
+            .map(|f| {
+                let action = match mask_action {
+                    MaskAction::Observed => PiiAction::Observed,
+                    other if crate::brain::pii::should_mask(f, mask_kinds) => other.to_pii_action(),
+                    // Masking was active but this specific finding is not
+                    // maskable (low confidence / out of allow-list): observe it.
+                    _ => PiiAction::Observed,
+                };
+                PiiFindingRecord::from_finding(&id, f, action)
+            })
             .collect();
         state.store.enqueue(WriteOp::PiiFindings(records));
     }

@@ -15,7 +15,7 @@
      POST /api/engines/revert { engine }              -> EngineView
      GET  /api/exposure -> ExposureReport
      GET  /api/settings -> SettingsView
-     PUT  /api/settings { mode?, payloadStorage?, retention?, handover? } -> SettingsView
+     PUT  /api/settings { mode?, payloadStorage?, retention?, handover?, maskingEnabled?, maskingDryRun? } -> SettingsView
      GET  /api/stream   SSE of StreamEvent (tagged by `type`)
 
    Every /api/* call needs `Authorization: Bearer <install-token>` + an
@@ -1012,6 +1012,41 @@
       privCard.appendChild(setRow('Retention', 'How long exchanges are kept before pruning. Currently: ' + retVal + '.', el('div', { class: 'ctl' }, [retSel])));
 
       view.appendChild(privCard);
+
+      // Masking card (opt-in PII redaction, dry-run by default).
+      const maskCard = el('div', { class: 'card reveal', style: 'animation-delay:.09s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'PII masking' })])]);
+
+      // master enable toggle
+      const mEnable = el('button', { class: 'switch' + (s.maskingEnabled ? ' on' : ''), 'aria-label': 'Toggle PII masking' });
+      mEnable.addEventListener('click', () => {
+        const next = !mEnable.classList.contains('on');
+        this.save(view, { maskingEnabled: next });
+      });
+      const enHint = s.maskingEnabled
+        ? 'On — high-confidence PII detectors feed the masking pipeline.'
+        : 'Off — observe-only (default). Traffic is never altered.';
+      maskCard.appendChild(setRow('Enable masking', enHint, el('div', { class: 'ctl' }, [mEnable])));
+
+      // dry-run toggle (only meaningful when enabled)
+      const mDry = el('button', { class: 'switch' + (s.maskingDryRun ? ' on' : ''), 'aria-label': 'Toggle masking dry-run' });
+      if (!s.maskingEnabled) mDry.setAttribute('disabled', '');
+      mDry.addEventListener('click', () => {
+        if (!s.maskingEnabled) return;
+        const next = !mDry.classList.contains('on');
+        // Leaving dry-run turns on real request redaction — confirm explicitly.
+        if (!next && !confirm('Turn OFF dry-run and start redacting requests?\n\nWith dry-run off, high-confidence PII (email, card, API key, IP, phone) is removed from request bodies BEFORE they reach the model. Responses and streaming are unaffected. Fail-open: any error forwards the original request.')) return;
+        this.save(view, { maskingDryRun: next });
+      });
+      const dryHint = !s.maskingEnabled
+        ? 'Enable masking first to choose dry-run vs live.'
+        : (s.maskingDryRun
+          ? 'On (default) — records what WOULD be masked; traffic is unchanged.'
+          : 'Off — LIVE: high-confidence PII is redacted from requests before forwarding.');
+      const dryRow = setRow('Dry-run', dryHint, el('div', { class: 'ctl' }, [mDry]));
+      if (s.maskingEnabled && !s.maskingDryRun) dryRow.querySelector('.hint').classList.add('danger-note');
+      maskCard.appendChild(dryRow);
+
+      view.appendChild(maskCard);
 
       // Read-only system card
       const sysCard = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'System' })])]);
