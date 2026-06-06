@@ -1,0 +1,180 @@
+# macOS notarization for Saffev release archives.
+#
+# WIRED INTO dist via `post-announce-jobs = ["./notarize-macos"]` in
+# dist-workspace.toml. dist invokes this as a reusable workflow AFTER the
+# GitHub Release has been created and all archives (already code-signed in the
+# build job by dist's native `macos-sign`) have been uploaded.
+#
+# WHY POST-ANNOUNCE (not a re-sign): the macOS binaries are code-signed *during*
+# the build, before dist tars + checksums them — so the published `.tar.xz` and
+# the checksums embedded in the shell installer are computed over the SIGNED
+# binary. We must NOT re-tar here or those checksums (and the installer) would
+# break. Notarization is a read-only verification: we submit a COPY of the
+# signed binary to Apple, Apple registers a notarization ticket server-side, and
+# Gatekeeper verifies it ONLINE on first run. A bare CLI Mach-O binary cannot be
+# stapled, so online verification is the correct (and only) path — no artifact
+# is modified or re-uploaded.
+#
+# GATING: every step is a no-op unless the Apple notarization secrets are
+# present, so this job is safe to ship before secrets are added — it simply
+# skips with a clear message. Add the secrets (see README "Releasing / macOS
+# signing") to turn it on.
+#
+# INVARIANTS: this job only ever runs in release CI, only touches the release
+# archives, and sends nothing about end users — consistent with on-device /
+# no-content-telemetry.
+
+name: Notarize macOS
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+    secrets:
+      # App Store Connect API key path: the robust, non-interactive credential
+      # set for notarytool. All three are required together.
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_ISSUER_ID:
+        required: false
+      APPLE_API_KEY_P8:
+        required: false
+
+jobs:
+  notarize-macos:
+    name: Notarize macOS archives
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+    steps:
+      - name: Check for notarization credentials
+        id: creds
+        shell: bash
+        run: |
+          if [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER_ID:-}" ] && [ -n "${APPLE_API_KEY_P8:-}" ]; then
+            echo "have_creds=true" >> "$GITHUB_OUTPUT"
+            echo "Apple App Store Connect API credentials present — will notarize."
+          else
+            echo "have_creds=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Notarization skipped::Apple notarization secrets are not set (APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8). Skipping notarization. See README 'Releasing / macOS signing'."
+          fi
+
+      - name: Resolve release tag + macOS archive names from plan
+        if: steps.creds.outputs.have_creds == 'true'
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          # dist's announcement tag (e.g. "v0.1.0"); used to address the GH release.
+          TAG="$(printf '%s' "$PLAN" | jq -r '.announcement_tag')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Every macOS executable-zip / tarball artifact dist produced. We match
+          # on the apple-darwin target triple in the artifact's target_triples.
+          NAMES="$(printf '%s' "$PLAN" \
+            | jq -r '.artifacts | to_entries[]
+                     | .value as $a
+                     | select($a.kind == "executable-zip")
+                     | select((($a.target_triples // []) | map(test("apple-darwin")) | any))
+                     | $a.name')"
+          if [ -z "$NAMES" ]; then
+            echo "::warning title=No macOS archives::plan had no apple-darwin executable-zip artifacts; nothing to notarize."
+          fi
+          # Persist as a newline-delimited list for the next step.
+          {
+            echo "names<<EOF"
+            echo "$NAMES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write App Store Connect API key
+        if: steps.creds.outputs.have_creds == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYDIR="$RUNNER_TEMP/asc"
+          mkdir -p "$KEYDIR"
+          # The secret may be raw .p8 PEM, or base64 of the .p8 — accept either.
+          if printf '%s' "$APPLE_API_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s' "$APPLE_API_KEY_P8" > "$KEYDIR/key.p8"
+          else
+            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEYDIR/key.p8"
+          fi
+          echo "ASC_KEY_PATH=$KEYDIR/key.p8" >> "$GITHUB_ENV"
+
+      - name: Download, zip, and notarize each macOS archive
+        if: steps.creds.outputs.have_creds == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          NAMES: ${{ steps.plan.outputs.names }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/notarize"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          status=0
+          # Read names into an array WITHOUT a pipe, so the loop runs in this
+          # shell (not a subshell) and `status` survives to the final `exit`.
+          mapfile -t ARCHIVES < <(printf '%s\n' "$NAMES")
+          for archive in "${ARCHIVES[@]}"; do
+            [ -n "$archive" ] || continue
+            echo "==> Notarizing $archive"
+
+            # Pull the exact published archive from the release. This is the same
+            # bytes users download; the binary inside was code-signed at build time.
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir "$WORK" --clobber
+
+            # Extract the signed binary out of the tarball.
+            extract="$WORK/extract-$archive"
+            rm -rf "$extract"
+            mkdir -p "$extract"
+            tar -xf "$WORK/$archive" -C "$extract"
+
+            # Find the Mach-O executable (the `saffev` binary) inside the archive.
+            bin="$(find "$extract" -type f -name saffev | head -n1)"
+            if [ -z "$bin" ]; then
+              echo "::error title=Binary not found::could not find 'saffev' inside $archive"
+              status=1
+              continue
+            fi
+
+            # Verify the build-time signature carries a secure timestamp +
+            # hardened runtime (set via dist macos-sign + CODESIGN_OPTIONS=runtime).
+            # notarytool rejects signatures without these, so fail loudly if not.
+            echo "--- codesign verification for $archive"
+            codesign --verify --strict --verbose=2 "$bin" || {
+              echo "::error title=Unsigned binary::$archive's saffev is not validly code-signed; cannot notarize. Check the macos-sign secrets on the build job."
+              status=1
+              continue
+            }
+            if ! codesign --display --verbose=4 "$bin" 2>&1 | grep -qi "Timestamp="; then
+              echo "::error title=No secure timestamp::$archive's saffev was signed without a secure timestamp; notarytool will reject it. Ensure CODESIGN_OPTIONS=runtime and that the build-time codesign used --timestamp."
+              status=1
+              continue
+            fi
+
+            # notarytool requires a zip/pkg/dmg container, NOT a bare binary or
+            # a .tar.xz. Zip the signed binary (ditto preserves the signature).
+            zip="$WORK/$archive.notarize.zip"
+            rm -f "$zip"
+            /usr/bin/ditto -c -k --keepParent "$bin" "$zip"
+
+            # Submit and wait. This registers a notarization ticket with Apple;
+            # it does NOT modify our published archive. Gatekeeper verifies online.
+            xcrun notarytool submit "$zip" \
+              --key "$ASC_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER_ID" \
+              --wait \
+              --timeout 30m
+          done
+
+          exit $status

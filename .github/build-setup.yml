@@ -1,0 +1,27 @@
+# dist build-setup fragment — injected into the `build-local-artifacts` job
+# (after Rust setup, before `dist build`) via `github-build-setup` in
+# dist-workspace.toml. It is NOT a standalone workflow; it lives outside
+# .github/workflows/ on purpose so GitHub doesn't try to run it directly, and it
+# survives `dist generate` (dist reads this file and re-injects it every time).
+#
+# Purpose: make dist's native macOS code-signing (`macos-sign = true`) produce a
+# *notarizable* signature. dist's signer calls `codesign --sign <identity>` and
+# passes `--options <value>` only when CODESIGN_OPTIONS is set. We set it to
+# "runtime" here so every macOS binary is signed with the HARDENED RUNTIME, which
+# Apple requires for notarization. This runs before the build, so the env var is
+# live when dist signs.
+#
+# NOTE: on darwin runners `codesign` contacts Apple's secure timestamp authority
+# by default when signing with a Developer ID Application identity, which is the
+# other notarization prerequisite. The notarize-macos job verifies both the
+# hardened-runtime flag and the secure timestamp are present before submitting,
+# and fails loudly if either is missing.
+#
+# This step is a safe no-op on Linux runners and when signing is not configured.
+
+- name: Configure macOS hardened-runtime codesigning for dist
+  if: ${{ runner.os == 'macOS' }}
+  shell: bash
+  run: |
+    echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
+    echo "dist macOS codesigning will use --options runtime (hardened runtime)"

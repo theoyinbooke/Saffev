@@ -21,3 +21,32 @@ install-path = "CARGO_HOME"
 # PRIVACY: the receipt is a local file; the updater only ever contacts GitHub
 # release metadata — no user/content data ever leaves the device.
 install-updater = true
+
+# --- macOS code-signing + notarization (gated on Apple secrets) ---
+#
+# Native dist code-signing of the macOS binaries. dist sets up an ephemeral
+# keychain on the macOS runner, imports the Developer ID Application cert from the
+# CODESIGN_CERTIFICATE / CODESIGN_CERTIFICATE_PASSWORD secrets, and runs
+# `codesign --sign "$CODESIGN_IDENTITY"` on each binary *before* it is tarred and
+# checksummed — so the published archive and the checksums baked into the shell
+# installer are computed over the SIGNED binary. Required secrets the generated
+# workflow reads: CODESIGN_CERTIFICATE, CODESIGN_CERTIFICATE_PASSWORD,
+# CODESIGN_IDENTITY (see README "Releasing / macOS signing").
+#
+# This is gated: with the secrets absent, dist's signer no-ops (it only signs
+# when all three env vars are present) — releases keep working unsigned. Add the
+# secrets to turn signing on. fail-open extends to the release pipeline.
+macos-sign = true
+# Inject a pre-build step that exports CODESIGN_OPTIONS=runtime on macOS runners,
+# so dist's `codesign` call uses the HARDENED RUNTIME (an Apple notarization
+# prerequisite). The fragment lives at .github/build-setup.yml; dist re-injects
+# it on every `dist generate`, so it is not clobbered. Path is relative to
+# .github/workflows/.
+github-build-setup = "../build-setup.yml"
+# Notarization runs as a custom post-announce job (.github/workflows/notarize-macos.yml).
+# A bare CLI Mach-O binary cannot be stapled, so we notarize a zip of the signed
+# binary with `xcrun notarytool submit --wait` AFTER the release is published, and
+# Gatekeeper verifies the ticket online. This job does NOT re-tar or re-upload any
+# archive (that would break the installer's embedded checksums); it is read-only
+# against the release. It no-ops unless the Apple API-key secrets are present.
+post-announce-jobs = ["./notarize-macos"]

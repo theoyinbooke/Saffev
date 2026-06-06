@@ -35,12 +35,14 @@ on-device invariant below. (A dev / `cargo install` build has no install receipt
 so it can't self-update — it reports the current version and points you at the
 installer instead, never erroring.)
 
-> **macOS, first run:** the binary is not yet code-signed, so Gatekeeper may say
-> it "cannot be verified". Allow it once via **System Settings → Privacy &
-> Security → Open Anyway**, or `xattr -d com.apple.quarantine "$(which saffev)"`.
-> Signed + notarized builds are on the way. macOS may also prompt to allow
-> **Keychain** access on first start (for the encryption key + Studio token) —
-> choose **Always Allow**.
+> **macOS, first run:** release builds are code-signed + notarized once the
+> maintainer's Apple signing secrets are configured (see **Releasing / macOS
+> signing**); Gatekeeper then verifies them online with no extra steps. If you
+> run a build cut before signing was enabled, Gatekeeper may say it "cannot be
+> verified" — allow it once via **System Settings → Privacy & Security → Open
+> Anyway**, or `xattr -d com.apple.quarantine "$(which saffev)"`. macOS may also
+> prompt to allow **Keychain** access on first start (for the encryption key +
+> Studio token) — choose **Always Allow**.
 
 Then start it **alongside** your existing Ollama (Cooperative mode — it never
 touches your engine):
@@ -406,6 +408,58 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11434/api/tags  # 200
   raw value) and the finding was recorded as `masked`.
 - **Stop:** `saffev stop` shut the daemon down gracefully, removed the PID file,
   and Ollama's `/api/tags` still returned `200` — the engine was never modified.
+
+## Releasing / macOS signing
+
+Releases are cut by `dist` (cargo-dist 0.32.0): push a version tag and
+`.github/workflows/release.yml` builds the archives, the shell installer, and the
+GitHub Release. macOS **code-signing + notarization** is wired in and **gated on
+Apple secrets** — until the secrets below exist, the pipeline still produces
+working (unsigned) builds, so nothing breaks before you opt in (fail-open).
+
+**How it works (mechanism).**
+
+- **Code-signing** uses `dist`'s native `macos-sign = true`. On the macOS build
+  runner `dist` creates an ephemeral keychain, imports your Developer ID
+  Application cert, and runs `codesign --sign` on each binary **before** it is
+  tarred and checksummed — so the published `.tar.xz` and the checksums baked
+  into `saffev-installer.sh` are computed over the signed binary.
+- A pre-build step (`.github/build-setup.yml`) sets `CODESIGN_OPTIONS=runtime`
+  so the signature uses the **hardened runtime** (required for notarization).
+- **Notarization** runs as a post-announce job (`.github/workflows/notarize-macos.yml`):
+  after the release is published it downloads each macOS archive, verifies the
+  signature has a hardened runtime + secure timestamp, zips the signed binary,
+  and submits it with `xcrun notarytool submit --wait`. A bare CLI binary can't
+  be *stapled*, so the notarization ticket is registered with Apple and
+  **Gatekeeper verifies it online** on first run — the published archive is never
+  modified or re-uploaded (that would break the installer's checksums).
+
+**GitHub Actions secrets to add** (Settings → Secrets and variables → Actions).
+Signing turns on when the first three are set; notarization turns on when the
+last three are set.
+
+| Secret | What it is / how to get it |
+| --- | --- |
+| `CODESIGN_CERTIFICATE` | Your **Developer ID Application** certificate exported from Keychain Access as a `.p12`, then base64-encoded: `base64 -i DeveloperID.p12 \| pbcopy`. Paste the base64 string. |
+| `CODESIGN_CERTIFICATE_PASSWORD` | The password you set when exporting the `.p12`. |
+| `CODESIGN_IDENTITY` | The signing identity string, e.g. `Developer ID Application: Your Name (TEAMID)`. Find it with `security find-identity -v -p codesigning`. |
+| `APPLE_API_KEY_ID` | App Store Connect **API key ID** (the `Key ID` column). Create the key at App Store Connect → Users and Access → Integrations → App Store Connect API, with the **Developer** role (sufficient for notarization). |
+| `APPLE_API_ISSUER_ID` | The **Issuer ID** shown above the keys list on that same page (one per team). |
+| `APPLE_API_KEY_P8` | The downloaded `AuthKey_<KEYID>.p8` (downloadable **once**). Paste its contents directly, or base64-encode it — the workflow accepts either. |
+
+Notes:
+
+- Export the `.p12` with the **private key** included (select both the cert and
+  its key in Keychain Access before exporting), or `codesign` can't use it.
+- The App Store Connect API key is preferred over an Apple-ID + app-specific
+  password because it is non-interactive and not tied to a personal account; the
+  notarization job is written to read the API-key triple.
+- After adding the secrets, the next tagged release signs + notarizes
+  automatically. Verify a downloaded build with
+  `codesign --verify --strict --verbose=2 ./saffev` and
+  `spctl -a -vvv -t install ./saffev` (Gatekeeper assessment).
+- **Do not** commit any cert, `.p8`, or password to the repo — only the GitHub
+  secret store. The pipeline reads them by `secrets.*` env at run time.
 
 ## License
 
