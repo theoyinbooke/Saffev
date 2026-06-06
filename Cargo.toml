@@ -5,8 +5,8 @@ edition = "2021"
 rust-version = "1.80"
 description = "Saffev — a transparent, on-device proxy + Studio in front of a local LLM engine (observe-only, fail-open)."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/theoyinbooke/Saffev-Lab"
-homepage = "https://github.com/theoyinbooke/Saffev-Lab"
+repository = "https://github.com/theoyinbooke/Saffev"
+homepage = "https://github.com/theoyinbooke/Saffev"
 default-run = "saffev"
 
 [[bin]]

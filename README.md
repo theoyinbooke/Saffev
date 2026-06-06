@@ -7,14 +7,15 @@ see, structure, and protect everything your local models send and receive —
 without ever leaving the machine and without changing what the engine returns.
 
 It is the **passive core** of a larger vision: usable today with zero research
-dependency, and also the instrument the lab's research track later plugs into.
+dependency, with a pluggable judgment interface that later guard/eval work plugs
+into.
 
 ## Install
 
 **macOS & Linux — one command:**
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/theoyinbooke/Saffev-Lab/releases/latest/download/saffev-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/theoyinbooke/Saffev/releases/latest/download/saffev-installer.sh | sh
 ```
 
 This pulls the prebuilt `saffev` binary for your OS/arch from the latest GitHub
@@ -271,9 +272,9 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 ## Status: v0/v1 implemented vs deferred
 
 Per `04-implementation-plan.md`, this build is the **passive core, v1 complete**
-(see "What's new in v1" above). The validation refuted four of six original
-"smart" claims; all four are in the deferred set. Everything in scope is
-independently reliable and ships no unreliable model signal.
+(see "What's new in v1" above). The model-based capabilities are in the deferred
+set. Everything in scope is independently reliable and ships no unreliable model
+signal.
 
 **Implemented and verified in this build:**
 
@@ -302,11 +303,11 @@ independently reliable and ships no unreliable model signal.
 - **LM Studio Gateway** — Cooperative only later; LM Studio's Auto-Evict and
   opt-in server make adoption unsafe until the serving research lands.
 - **Windows** — out of scope.
-- **The research track** — model-based guards, judges, evaluation, and the
-  scheduler. The schema and a pluggable judgment interface are *ready* (Safety /
-  Evaluation tables and Studio panels exist as disabled placeholders), but this
-  build ships **none** of them. They light up only after `03-research-agenda.md`
-  components graduate, behind a device-capability gate, labeled honestly.
+- **Model-based capabilities** — guards, judges, evaluation, and the scheduler.
+  The schema and a pluggable judgment interface are *ready* (Safety / Evaluation
+  tables and Studio panels exist as disabled placeholders), but this build ships
+  **none** of them. They light up only once those components graduate, behind a
+  device-capability gate, labeled honestly.
 
 ## Smoke test (the exact commands used to verify this build)
 
