@@ -9,6 +9,48 @@ without ever leaving the machine and without changing what the engine returns.
 It is the **passive core** of a larger vision: usable today with zero research
 dependency, and also the instrument the lab's research track later plugs into.
 
+## Install
+
+**macOS & Linux — one command:**
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/theoyinbooke/Saffev-Lab/releases/latest/download/saffev-installer.sh | sh
+```
+
+This pulls the prebuilt `saffev` binary for your OS/arch from the latest GitHub
+release, installs it to `~/.cargo/bin` (added to your `PATH`), and is fully
+self-contained — SQLCipher is bundled, so there are no other dependencies. Re-run
+the same command to update. (Prebuilt targets: macOS arm64 + x86_64, Linux
+x86_64. Build from source for others — see **Build / run / test**.)
+
+> **macOS, first run:** the binary is not yet code-signed, so Gatekeeper may say
+> it "cannot be verified". Allow it once via **System Settings → Privacy &
+> Security → Open Anyway**, or `xattr -d com.apple.quarantine "$(which saffev)"`.
+> Signed + notarized builds are on the way. macOS may also prompt to allow
+> **Keychain** access on first start (for the encryption key + Studio token) —
+> choose **Always Allow**.
+
+Then start it **alongside** your existing Ollama (Cooperative mode — it never
+touches your engine):
+
+```sh
+mkdir -p ~/.config/saffev
+cat > ~/.config/saffev/saffev.toml <<'TOML'
+mode = "cooperative"
+[ports]
+proxy = 8088      # point your apps' Ollama base URL here
+studio = 7100     # open the Studio here
+upstream = 11434  # your real Ollama
+TOML
+
+saffev start --config ~/.config/saffev/saffev.toml   # daemonizes; prints the Studio URL
+```
+
+Open the Studio at **http://localhost:7100** and point your apps' Ollama base URL
+at **http://localhost:8088** to see their traffic. `saffev status` / `saffev logs
+-f` / `saffev stop` to manage it. Full details in **Build / run / test** and
+**Configuration** below.
+
 ## Hard invariants
 
 These are enforced throughout the codebase and are the reason to trust it in
