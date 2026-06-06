@@ -105,10 +105,10 @@ jobs:
           cd "$WORK"
 
           status=0
-          # Read names into an array WITHOUT a pipe, so the loop runs in this
-          # shell (not a subshell) and `status` survives to the final `exit`.
-          mapfile -t ARCHIVES < <(printf '%s\n' "$NAMES")
-          for archive in "${ARCHIVES[@]}"; do
+          # Iterate names via a here-string (not a pipe) so the loop runs in THIS
+          # shell and `status` survives to the final `exit`. Avoid bash 4's
+          # `mapfile` — macOS runners ship bash 3.2, which lacks it.
+          while IFS= read -r archive; do
             [ -n "$archive" ] || continue
             echo "==> Notarizing $archive"
 
@@ -159,6 +159,6 @@ jobs:
               --team-id "$APPLE_TEAM_ID" \
               --wait \
               --timeout 30m
-          done
+          done <<< "$NAMES"
 
           exit $status
