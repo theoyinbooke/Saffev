@@ -65,10 +65,21 @@ streaming):
 - **Config load/save/validate test coverage** for round-trips and port-collision
   rejection.
 
-> Note: traffic-affecting settings (mode, payload storage, retention, PII
-> masking) written via the Studio Settings page (`PUT /api/settings`) persist to
-> the TOML config and take effect on the **next `saffev start`** — the running
-> process holds an immutable config snapshot taken at startup.
+> Note: settings written via the Studio Settings page (`PUT /api/settings`)
+> persist to the TOML config. The running process holds the config in a live,
+> atomically-swappable handle (`ArcSwap<Config>`) shared by the proxy and Studio,
+> so most changes apply **live, with no restart**:
+>
+> - **Apply live (no restart):** PII masking (enabled / dry-run / kinds),
+>   payload storage, retention, and handover policy. A `PUT` swaps the new
+>   snapshot in place and the running proxy + Studio observe it on the very next
+>   request — verified end-to-end against a live engine (masking toggled on then
+>   off mid-process; the engine received `[EMAIL]` while masking was live and the
+>   raw value once it was disabled, all without restarting).
+> - **Restart-required:** `mode` and ports. These rebind the listeners / re-adopt
+>   the engine, so they are persisted to the TOML config and applied on the next
+>   `saffev start`. `PUT /api/settings` reports them in the response's
+>   `restartRequired` field with a `restartNote` rather than swapping them live.
 
 ## Build / run / test
 
