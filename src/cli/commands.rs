@@ -795,7 +795,13 @@ async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
 async fn run_servers(cfg: &Config) -> Result<()> {
     use std::sync::Arc;
 
-    let cfg = Arc::new(cfg.clone());
+    // ONE live, swappable config handle shared by BOTH servers. A Studio
+    // `PUT /api/settings` swaps it in place, so the proxy + Studio see
+    // hot-reloadable changes (masking / payload / retention) without a restart.
+    let config = crate::config::config_handle(cfg.clone());
+    // A startup snapshot for the local wiring below (ports/mode that are read once
+    // at bind time and are not hot-reloadable anyway).
+    let cfg = config.load_full();
 
     // Open the store (shared by both servers). If the store is a stub this
     // bails to the caller, which reports gracefully.
@@ -839,14 +845,14 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         tokio::sync::broadcast::channel(crate::studio::STREAM_CHANNEL_CAPACITY);
 
     let proxy_state = crate::proxy::ProxyState {
-        config: cfg.clone(),
+        config: config.clone(),
         store: store.clone(),
         tee,
         detector,
         upstream,
     };
     let studio_state = crate::studio::StudioState {
-        config: cfg.clone(),
+        config,
         store,
         token,
         events,

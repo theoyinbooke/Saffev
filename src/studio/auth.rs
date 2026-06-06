@@ -74,7 +74,7 @@ pub async fn require_token(State(state): State<StudioState>, req: Request, next:
 /// a request whose `Host` is not in the allowlist is refused before it can reach
 /// a control handler.
 pub async fn require_host(State(state): State<StudioState>, req: Request, next: Next) -> Response {
-    let allow = host_allowlist(state.config.ports.studio);
+    let allow = host_allowlist(state.config.load().ports.studio);
     let host = req.headers().get(header::HOST);
 
     match host {

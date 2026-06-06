@@ -133,13 +133,14 @@ fn detected_engine_view(info: &crate::engine::EngineInfo, health: &str) -> dto::
 
 /// `GET /api/health`
 pub async fn health(State(state): State<StudioState>) -> Json<dto::Health> {
+    let cfg = state.config.load();
     // proxy_up: best-effort liveness of the local engine/proxy public port.
-    let proxy_up = probe_loopback(state.config.ports.proxy).await;
+    let proxy_up = probe_loopback(cfg.ports.proxy).await;
     Json(dto::Health {
         app: crate::brand::APP_NAME.to_lowercase(),
         version: crate::VERSION.to_string(),
         proxy_up,
-        mode: state.config.mode,
+        mode: cfg.mode,
     })
 }
 
@@ -266,8 +267,8 @@ pub async fn history_detail(
 
     let item = history_item(&row, kinds);
 
-    // Payloads are present only when payload storage is on.
-    let payloads_disabled = !state.config.payload_storage;
+    // Payloads are present only when payload storage is on (load live snapshot).
+    let payloads_disabled = !state.config.load().payload_storage;
     let (prompt, response) = if payloads_disabled {
         (None, None)
     } else {
@@ -355,12 +356,13 @@ pub async fn privacy(
         total: findings.len() as u64,
         // Reflect the opt-in masking switch (§7.6). The Privacy page badges
         // dry-run vs live via the Settings view; here we just expose enablement.
-        masking_enabled: state.config.masking.enabled,
+        masking_enabled: state.config.load().masking.enabled,
     }))
 }
 
 /// `GET /api/engines`
 pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::EnginesView>, Response> {
+    let cfg = state.config.load();
     let records = state.store.engines().await.map_err(internal)?;
 
     // Health is best-effort: probe each engine's effective port (shadow if
@@ -381,7 +383,7 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
     // the configured upstream the proxy forwards to and surface that engine
     // here, unless a store record already covers the same port. Fail-soft: a
     // silent upstream just adds nothing.
-    let upstream = state.config.ports.upstream;
+    let upstream = cfg.ports.upstream;
     let already_known = records
         .iter()
         .any(|r| r.shadow_port.unwrap_or(r.public_port) == upstream || r.public_port == upstream);
@@ -398,7 +400,7 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
 
     // Exposure doctor verdict against the public proxy port. Fail-soft to a
     // benign "not exposed / unknown" report so the Engines page still renders.
-    let exposure = crate::exposure::check(state.config.ports.upstream)
+    let exposure = crate::exposure::check(cfg.ports.upstream)
         .await
         .unwrap_or_else(|_| crate::exposure::ExposureReport {
             exposed: false,
@@ -409,7 +411,7 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
 
     Ok(Json(dto::EnginesView {
         engines: views,
-        mode: state.config.mode,
+        mode: cfg.mode,
         exposure,
     }))
 }
@@ -453,7 +455,7 @@ pub async fn engines_revert(
 pub async fn exposure(
     State(state): State<StudioState>,
 ) -> Result<Json<crate::exposure::ExposureReport>, Response> {
-    let report = crate::exposure::check(state.config.ports.upstream)
+    let report = crate::exposure::check(state.config.load().ports.upstream)
         .await
         .unwrap_or_else(|_| crate::exposure::ExposureReport {
             exposed: false,
@@ -465,68 +467,106 @@ pub async fn exposure(
 }
 
 /// `GET /api/settings`
+///
+/// Reads the **live** config snapshot (`state.config.load()`), so it reflects any
+/// hot-reloadable change a prior `PUT /api/settings` swapped in — without a
+/// restart.
 pub async fn settings_get(
     State(state): State<StudioState>,
 ) -> Result<Json<dto::SettingsView>, Response> {
-    Ok(Json(settings_view(&state.config)))
+    Ok(Json(settings_view(&state.config.load())))
 }
 
 /// `PUT /api/settings`
 ///
-/// Note: this write-through persists to the TOML config, but the running proxy
-/// and Studio hold an immutable `Arc<Config>` snapshot taken at startup, so
-/// changes to traffic-affecting toggles (mode, payload storage, retention, and
-/// PII masking) take effect on the **next `saffev start`**, not mid-process. The
-/// returned [`dto::SettingsView`] reflects the just-saved file; a subsequent
-/// `GET /api/settings` reflects the still-running snapshot until restart.
+/// Builds the updated config from the **current live snapshot** plus the PUT
+/// fields, persists it to TOML (write-through), and — for the hot-reloadable
+/// fields — swaps it into the shared [`ConfigHandle`](crate::config::ConfigHandle)
+/// so the running proxy *and* Studio see the change immediately, no restart.
+///
+/// SCOPE / SAFETY (honest by design):
+/// - **Hot-reloadable** (apply live): `payload_storage`, `retention`, masking
+///   (`enabled`/`dry_run`), and `handover` (the supervisor only reads it on stop).
+/// - **NOT runtime-changeable**: `mode` (and ports) rebind the proxy/Studio
+///   listeners and re-adopt the engine. We persist `mode` to TOML so the next
+///   `saffev start` picks it up, but we do **not** swap it into the live config;
+///   it is reported in `restart_required` so the operator knows a restart is
+///   needed. The returned view reflects the *still-running* mode.
 pub async fn settings_put(
     State(state): State<StudioState>,
     Json(body): Json<dto::SettingsUpdate>,
 ) -> Result<Json<dto::SettingsView>, Response> {
-    // Apply the partial update onto a clone of the effective config, persist it
-    // (write-through to TOML), and mirror critical toggles into the settings
-    // table for audit. The token is never read or written here.
-    let mut cfg = (*state.config).clone();
+    use std::sync::Arc;
 
+    // Base everything on the CURRENT live snapshot, not a startup capture.
+    let current = state.config.load_full();
+
+    // `persisted`: the full config written to TOML (includes mode for next start).
+    // `live`: the config we will swap into the handle (hot-reloadable fields only;
+    //          mode is intentionally left at the running value).
+    let mut persisted = (*current).clone();
+    let mut live = (*current).clone();
+    let mut restart_required: Vec<String> = Vec::new();
+
+    // mode — NOT runtime-changeable: persist only, flag restart-required.
     if let Some(mode) = body.mode {
-        cfg.mode = mode;
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "mode".to_string(),
-            value: format!("{:?}", mode).to_lowercase(),
-        });
+        if mode != current.mode {
+            persisted.mode = mode;
+            restart_required.push("mode".to_string());
+            // Audit the persisted intent (it applies on the next start).
+            state.store.enqueue(crate::store::WriteOp::Setting {
+                key: "mode".to_string(),
+                value: format!("{:?}", mode).to_lowercase(),
+            });
+        }
     }
+
+    // payload_storage — HOT-RELOADABLE.
     if let Some(payload_storage) = body.payload_storage {
-        cfg.payload_storage = payload_storage;
+        persisted.payload_storage = payload_storage;
+        live.payload_storage = payload_storage;
         // Toggling payload storage is an explicit, logged action (04 §7.9).
         state.store.enqueue(crate::store::WriteOp::Setting {
             key: "payload_storage".to_string(),
             value: payload_storage.to_string(),
         });
     }
+
+    // retention — HOT-RELOADABLE.
     if let Some(retention) = body.retention {
-        cfg.retention = retention;
+        persisted.retention = retention;
+        live.retention = retention;
         state.store.enqueue(crate::store::WriteOp::Setting {
             key: "retention".to_string(),
             value: serde_json::to_string(&retention).unwrap_or_default(),
         });
     }
+
+    // handover — HOT-RELOADABLE (read by the supervisor at stop time).
     if let Some(handover) = body.handover {
-        cfg.handover = handover;
+        persisted.handover = handover;
+        live.handover = handover;
         state.store.enqueue(crate::store::WriteOp::Setting {
             key: "handover".to_string(),
             value: format!("{:?}", handover).to_lowercase(),
         });
     }
+
+    // masking.enabled — HOT-RELOADABLE.
     if let Some(masking_enabled) = body.masking_enabled {
-        cfg.masking.enabled = masking_enabled;
+        persisted.masking.enabled = masking_enabled;
+        live.masking.enabled = masking_enabled;
         // Enabling masking is an explicit, logged action (04 §7.6, §7.9).
         state.store.enqueue(crate::store::WriteOp::Setting {
             key: "masking_enabled".to_string(),
             value: masking_enabled.to_string(),
         });
     }
+
+    // masking.dry_run — HOT-RELOADABLE.
     if let Some(masking_dry_run) = body.masking_dry_run {
-        cfg.masking.dry_run = masking_dry_run;
+        persisted.masking.dry_run = masking_dry_run;
+        live.masking.dry_run = masking_dry_run;
         // Leaving dry-run (dry_run=false) is the step that turns on real request
         // redaction — log it explicitly.
         state.store.enqueue(crate::store::WriteOp::Setting {
@@ -535,9 +575,26 @@ pub async fn settings_put(
         });
     }
 
-    cfg.save().map_err(internal)?;
+    // Persist the full config (write-through to TOML). The token is never touched.
+    persisted.save().map_err(internal)?;
 
-    Ok(Json(settings_view(&cfg)))
+    // Swap the hot-reloadable config into the shared handle so BOTH running
+    // servers observe it immediately. `mode` stays at the running value in `live`,
+    // so this never changes mode mid-process even though `persisted` recorded it.
+    state.config.store(Arc::new(live));
+
+    // The returned view reflects the now-live config; restart_required surfaces any
+    // persisted-but-not-applied field (currently only mode).
+    let mut view = settings_view(&state.config.load());
+    if !restart_required.is_empty() {
+        view.restart_note = Some(format!(
+            "{} saved to config but require a `saffev start` to apply \
+             (they rebind ports / re-adopt the engine).",
+            restart_required.join(", ")
+        ));
+        view.restart_required = restart_required;
+    }
+    Ok(Json(view))
 }
 
 /// `GET /api/stream` — Server-Sent Events of [`dto::StreamEvent`].
@@ -581,6 +638,9 @@ pub async fn stream(
 // ---------------------------------------------------------------------------
 
 /// Build a [`dto::SettingsView`] from a config (token intentionally excluded).
+///
+/// The `restart_required` / `restart_note` fields are empty here; `settings_put`
+/// fills them in when a persisted-but-not-hot-applied field (mode/ports) changed.
 fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
     dto::SettingsView {
         mode: cfg.mode,
@@ -593,6 +653,8 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         studio_port: cfg.ports.studio,
         masking_enabled: cfg.masking.enabled,
         masking_dry_run: cfg.masking.dry_run,
+        restart_required: Vec::new(),
+        restart_note: None,
     }
 }
 
@@ -870,5 +932,153 @@ mod tests {
         let view = settings_view(&cfg);
         assert!(view.masking_enabled);
         assert!(!view.masking_dry_run);
+    }
+
+    #[test]
+    fn settings_view_has_no_restart_required_by_default() {
+        let view = settings_view(&crate::config::Config::default());
+        assert!(view.restart_required.is_empty());
+        assert!(view.restart_note.is_none());
+    }
+
+    // --- live-reload integration (ArcSwap<Config>) --------------------------
+
+    /// Pin a process-wide test DB key so `Store::open` never touches the keyring
+    /// (the default build links SQLCipher). Mirrors `store::tests::ensure_test_db_key`.
+    fn ensure_test_db_key() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if std::env::var(crate::store::keys::DB_KEY_ENV)
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+            {
+                std::env::set_var(
+                    crate::store::keys::DB_KEY_ENV,
+                    "test-db-key-0123456789abcdef",
+                );
+            }
+        });
+    }
+
+    /// Build a real [`StudioState`] over a throwaway on-disk store + a fresh
+    /// `ConfigHandle`. Returns the state and the shared handle so a test can
+    /// observe swaps without rebuilding state.
+    async fn test_state(
+        mut cfg: crate::config::Config,
+    ) -> (StudioState, crate::config::ConfigHandle) {
+        ensure_test_db_key();
+        // Anchor data_dir at a throwaway temp dir so `settings_put`'s TOML
+        // write-through never touches the real per-OS config.
+        let dir = std::env::temp_dir().join(format!("saffev-studio-api-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp data dir");
+        cfg.data_dir = dir.clone();
+        let path = dir.join("test.db");
+        let store = crate::store::Store::open(&path).await.expect("open store");
+        let (events, _rx) = tokio::sync::broadcast::channel(crate::studio::STREAM_CHANNEL_CAPACITY);
+        let config = crate::config::config_handle(cfg);
+        let state = StudioState {
+            config: config.clone(),
+            store,
+            token: "test-token".into(),
+            events,
+        };
+        (state, config)
+    }
+
+    /// The core contract: a `PUT /api/settings` masking change is observable
+    /// **without rebuilding state** — both `handle.load()` and a subsequent
+    /// `GET /api/settings` (over the SAME state) reflect it. Proves the ArcSwap
+    /// swap is live.
+    #[tokio::test]
+    async fn settings_put_masking_change_is_observable_live() {
+        // Start from the observe-only default: masking off, dry-run on.
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        assert!(!handle.load().masking.enabled, "precondition: masking off");
+        assert!(handle.load().masking.dry_run, "precondition: dry-run on");
+
+        // Flip masking ON and leave dry-run (turn on real redaction).
+        let update = dto::SettingsUpdate {
+            masking_enabled: Some(true),
+            masking_dry_run: Some(false),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state.clone()), Json(update))
+            .await
+            .expect("settings_put ok");
+
+        // The PUT response reflects the change.
+        assert!(resp.0.masking_enabled);
+        assert!(!resp.0.masking_dry_run);
+        // Masking is hot-reloadable: no restart required.
+        assert!(
+            resp.0.restart_required.is_empty(),
+            "masking applies live, no restart needed"
+        );
+
+        // The SHARED handle the proxy reads from now reflects it — no rebuild.
+        let live = handle.load();
+        assert!(live.masking.enabled, "swap must be visible on the handle");
+        assert!(!live.masking.dry_run);
+
+        // And GET over the same, unchanged state reads fresh (not a stale snapshot).
+        let got = settings_get(State(state)).await.expect("settings_get ok");
+        assert!(got.0.masking_enabled, "GET reflects the live swap");
+        assert!(!got.0.masking_dry_run);
+    }
+
+    /// payload_storage and retention also apply live and surface no restart flag.
+    #[tokio::test]
+    async fn settings_put_payload_and_retention_apply_live() {
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        assert!(!handle.load().payload_storage);
+
+        let update = dto::SettingsUpdate {
+            payload_storage: Some(true),
+            retention: Some(crate::config::Retention::Age { days: 7 }),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state), Json(update))
+            .await
+            .expect("settings_put ok");
+        assert!(resp.0.restart_required.is_empty());
+
+        let live = handle.load();
+        assert!(live.payload_storage, "payload_storage applies live");
+        assert_eq!(live.retention, crate::config::Retention::Age { days: 7 });
+    }
+
+    /// mode is NOT runtime-changeable: it is persisted but NOT swapped into the
+    /// live handle, and the response flags `restart_required`.
+    #[tokio::test]
+    async fn settings_put_mode_change_is_restart_required_not_live() {
+        // Start in Cooperative; request Gateway.
+        let mut cfg = crate::config::Config::default();
+        cfg.mode = crate::config::Mode::Cooperative;
+        let (state, handle) = test_state(cfg).await;
+
+        let update = dto::SettingsUpdate {
+            mode: Some(crate::config::Mode::Gateway),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state), Json(update))
+            .await
+            .expect("settings_put ok");
+
+        // Restart-required is reported with a note.
+        assert!(
+            resp.0.restart_required.iter().any(|f| f == "mode"),
+            "mode must be flagged restart-required"
+        );
+        assert!(resp.0.restart_note.is_some());
+
+        // The LIVE config still runs in the original mode (not swapped).
+        assert_eq!(
+            handle.load().mode,
+            crate::config::Mode::Cooperative,
+            "mode must NOT change at runtime"
+        );
+        // The returned view reflects the still-running mode, honestly.
+        assert_eq!(resp.0.mode, crate::config::Mode::Cooperative);
     }
 }

@@ -21,7 +21,7 @@ use axum::Router;
 use bytes::{Bytes, BytesMut};
 
 use crate::brain::Side;
-use crate::config::Config;
+use crate::config::ConfigHandle;
 use crate::store::{
     PiiAction, PiiFindingRecord, RequestMeta, ResponseMeta, Store, TokenSource, WriteOp,
 };
@@ -123,8 +123,10 @@ pub fn tee_channel() -> (TeeSender, TeeReceiver) {
 /// Shared state every proxy handler closes over.
 #[derive(Clone)]
 pub struct ProxyState {
-    /// Effective config (ports, mode, payload flag).
-    pub config: Arc<Config>,
+    /// Live, swappable config (ports, mode, payload flag, masking, retention).
+    /// Load the current snapshot at use-time (`config.load()`) so Studio settings
+    /// changes apply without a restart — `.load()` is a cheap RCU read.
+    pub config: ConfigHandle,
     /// Store handle for enqueuing writes.
     pub store: Store,
     /// Sender onto the bounded tee.
@@ -200,8 +202,12 @@ impl ProxyServer {
     where
         S: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind = self.state.config.ports.bind;
-        let port = self.state.config.ports.proxy;
+        // Ports/bind are read once here at bind time — they are NOT hot-reloadable
+        // (rebinding the listener needs a restart), so the startup snapshot is the
+        // right source for the address we actually bind.
+        let cfg = self.state.config.load();
+        let bind = cfg.ports.bind;
+        let port = cfg.ports.proxy;
         let addr = std::net::SocketAddr::new(bind, port);
 
         let router = self.router();
@@ -275,7 +281,6 @@ struct InFlight {
 
 async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
     let mut inflight: HashMap<String, InFlight> = HashMap::new();
-    let payload_storage = state.config.payload_storage;
     let engine_label = engine_label(&state.upstream);
 
     while let Some(event) = rx.recv().await {
@@ -288,6 +293,9 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                 peer,
                 headers,
             } => {
+                // payload_storage is HOT-RELOADABLE: read the current snapshot per
+                // event so a Studio toggle takes effect immediately (04 §7.9).
+                let payload_storage = state.config.load().payload_storage;
                 on_request_started(
                     &state,
                     &mut inflight,
@@ -328,6 +336,9 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                 total_ms,
             } => {
                 if let Some(entry) = inflight.remove(&id) {
+                    // Re-read at finish-time so a mid-exchange Studio toggle is
+                    // honoured for the response-side payload write too.
+                    let payload_storage = state.config.load().payload_storage;
                     on_response_finished(&state, payload_storage, id, entry, ttft_ms, total_ms);
                 }
             }
@@ -401,7 +412,10 @@ fn on_request_started(
     // actions — a low-confidence finding is always recorded as `observed` since
     // it is never masked (see `pii::should_mask`).
     if !findings.is_empty() {
-        let mask_kinds = state.config.masking.kinds.as_deref();
+        // Masking kind allow-list is HOT-RELOADABLE: load the live snapshot so the
+        // recorded action matches what the request path actually did.
+        let cfg = state.config.load();
+        let mask_kinds = cfg.masking.kinds.as_deref();
         let records: Vec<PiiFindingRecord> = findings
             .iter()
             .map(|f| {

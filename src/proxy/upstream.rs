@@ -293,7 +293,11 @@ fn send_chunk(tee: &crate::proxy::TeeSender, id: &str, chunk: Bytes) {
 /// [`crate::brain::pii::mask`] / `should_mask`); low-confidence findings are
 /// never masked.
 fn mask_request_body(state: &ProxyState, body: &Bytes) -> (Bytes, MaskAction) {
-    mask_body_with(&state.config.masking, &state.detector, body)
+    // Masking (enabled / dry_run / kinds) is HOT-RELOADABLE: load the current
+    // config snapshot on every request so a Studio settings change applies live,
+    // without a restart. `.load()` is a cheap RCU read — fine on the hot path.
+    let cfg = state.config.load();
+    mask_body_with(&cfg.masking, &state.detector, body)
 }
 
 /// Core of [`mask_request_body`], decoupled from [`ProxyState`] so it is unit

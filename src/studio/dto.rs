@@ -244,6 +244,17 @@ pub struct SettingsView {
     /// Masking dry-run: when true (default), record what *would* be masked but
     /// forward traffic unchanged. Only `enabled && !dry_run` redacts requests.
     pub masking_dry_run: bool,
+    /// Fields whose new value was persisted to TOML but is **not** applied to the
+    /// running process because it cannot be safely changed at runtime — `mode` and
+    /// the ports rebind the listeners / re-adopt the engine. Empty when the last
+    /// update was fully hot-applied. Each entry is the changed field name (e.g.
+    /// `"mode"`, `"proxy_port"`). The values shown above for these fields reflect
+    /// the **still-running** config until the next `saffev start`.
+    #[serde(default)]
+    pub restart_required: Vec<String>,
+    /// Human-readable note when `restart_required` is non-empty (else `None`).
+    #[serde(default)]
+    pub restart_note: Option<String>,
 }
 
 /// `PUT /api/settings` — partial update; only present fields change. Toggling

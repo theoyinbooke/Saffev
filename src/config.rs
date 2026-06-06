@@ -8,10 +8,35 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
+
+/// A live, atomically-swappable [`Config`] shared by the running proxy + Studio.
+///
+/// Built **once** in `saffev start` and handed to both servers, so a Studio
+/// `PUT /api/settings` that calls [`ConfigHandle::store`](arc_swap::ArcSwapAny::store)
+/// is seen immediately by every config reader without a restart. Every read site
+/// that must reflect live changes loads the current snapshot at use-time
+/// (`handle.load()` — a cheap RCU read, fine on the request hot path) rather than
+/// capturing an `Arc<Config>` at startup.
+///
+/// Scope (honest by design): only the **hot-reloadable** fields apply live —
+/// masking, payload storage, and retention. Mode and ports rebind listeners /
+/// re-adopt the engine and cannot be swapped safely at runtime; `settings_put`
+/// persists those to TOML but does **not** store them into the live handle and
+/// flags `restart_required` so the operator knows the next `saffev start` applies
+/// them.
+pub type ConfigHandle = Arc<ArcSwap<Config>>;
+
+/// Wrap a [`Config`] in a fresh [`ConfigHandle`]. Convenience for `saffev start`
+/// (one handle, shared with both servers) and tests.
+pub fn config_handle(config: Config) -> ConfigHandle {
+    Arc::new(ArcSwap::from_pointee(config))
+}
 
 /// Default Studio port (avoids common dev-server collisions).
 pub const DEFAULT_STUDIO_PORT: u16 = 7100;

@@ -41,15 +41,18 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::config::Config;
+use crate::config::ConfigHandle;
 use crate::store::Store;
 use crate::{Error, Result};
 
 /// Shared state for every Studio handler.
 #[derive(Clone)]
 pub struct StudioState {
-    /// Effective config.
-    pub config: Arc<Config>,
+    /// Live, swappable config shared with the proxy. Handlers load the current
+    /// snapshot at use-time (`config.load()`) so a `PUT /api/settings` that swaps
+    /// the handle is reflected by a subsequent `GET /api/settings` without a
+    /// restart.
+    pub config: ConfigHandle,
     /// Store handle for reads + setting writes.
     pub store: Store,
     /// Per-install bearer token required on every `/api/*` route.
@@ -78,7 +81,10 @@ impl StudioServer {
     /// every subsequent `fetch`. The passthrough proxy is an entirely separate
     /// server (port 11434) and is never gated here.
     pub fn router(&self) -> Router {
-        let studio_port = self.state.config.ports.studio;
+        // Studio port is read once when the router/CORS layer is built — ports are
+        // not hot-reloadable (they would rebind the listener), so the startup
+        // snapshot is authoritative here.
+        let studio_port = self.state.config.load().ports.studio;
 
         // The JSON + SSE API subtree. All routes here are control-plane.
         let api = Router::new()
@@ -137,7 +143,11 @@ impl StudioServer {
     where
         S: std::future::Future<Output = ()> + Send + 'static,
     {
-        let addr = SocketAddr::new(self.state.config.ports.bind, self.state.config.ports.studio);
+        // Bind/port are read once at bind time from the startup snapshot — ports
+        // are not hot-reloadable.
+        let cfg = self.state.config.load();
+        let addr = SocketAddr::new(cfg.ports.bind, cfg.ports.studio);
+        drop(cfg);
         let router = self.router();
 
         let listener = tokio::net::TcpListener::bind(addr)

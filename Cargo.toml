@@ -61,6 +61,10 @@ mime_guess = "2.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # --- misc / cross-cutting ---
+# Lock-free, atomically-swappable Arc — the live-reloadable config handle shared
+# by the proxy + Studio so Settings changes apply without a restart. `.load()` is
+# a cheap RCU read, fine on the request hot path.
+arc-swap = "1.7"
 regex = "1.10"
 thiserror = "1.0"
 anyhow = "1.0"
