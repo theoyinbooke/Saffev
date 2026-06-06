@@ -178,7 +178,7 @@ impl ProxyServer {
             .with_state(self.state.clone())
     }
 
-    /// Bind to the configured proxy port and serve until shutdown.
+    /// Bind to the configured proxy port and serve until the process is killed.
     ///
     /// Serves the router on the configured bind address + proxy port. The
     /// integrator pairs the channel up front: build `(tx, rx)` via
@@ -186,6 +186,20 @@ impl ProxyServer {
     /// [`ProxyServer::spawn_logger`], then call this. The send half handlers use
     /// is already paired with the receiver the logger drains.
     pub async fn serve(self) -> Result<()> {
+        // No external shutdown signal: serve until the future is dropped (the
+        // task is aborted on stop). `pending()` never resolves.
+        self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    /// Like [`serve`](Self::serve), but ends cleanly when `shutdown` resolves.
+    ///
+    /// Wires the signal through `axum::serve(..).with_graceful_shutdown(..)` so
+    /// in-flight requests are allowed to finish before the listener closes — the
+    /// graceful path used by `saffev stop` (SIGTERM → this future resolves).
+    pub async fn serve_with_shutdown<S>(self, shutdown: S) -> Result<()>
+    where
+        S: std::future::Future<Output = ()> + Send + 'static,
+    {
         let bind = self.state.config.ports.bind;
         let port = self.state.config.ports.proxy;
         let addr = std::net::SocketAddr::new(bind, port);
@@ -206,6 +220,7 @@ impl ProxyServer {
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(|e| crate::Error::Proxy(format!("serve: {e}")))?;
 

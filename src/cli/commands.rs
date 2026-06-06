@@ -17,7 +17,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use crate::cli::{Cli, EngineArg};
+use crate::cli::{daemon, Cli, EngineArg};
 use crate::config::{Config, HandoverPolicy, Mode, Retention};
 use crate::ui::palette::{ColorMode, Level, Painter};
 use crate::Result;
@@ -569,12 +569,20 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
 
 /// `saffev start` — run the proxy + Studio (+ supervisor in Gateway mode).
 ///
-/// In the foreground it binds both servers and blocks until Ctrl-C. Without
-/// `--foreground` it still runs in the foreground for v0 (no daemonization yet)
-/// but prints how to background it.
+/// In the foreground (`--foreground`) it binds both servers and blocks until
+/// Ctrl-C or SIGTERM, writing a PID file so `saffev stop` can find it. Without
+/// `--foreground` it re-execs itself detached into the background, prints the
+/// Studio URL, and returns promptly (the backgrounded child writes the PID file).
 pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
+
+    // Background path: detach a `--foreground` copy of ourselves, record its pid
+    // + URL, print the URL, and return. The child then runs the foreground flow
+    // below (which also writes the PID file, authoritative for the running pid).
+    if !foreground {
+        return start_background(cli, &cfg, &p).await;
+    }
 
     println!("{} {}", p.prompt("~"), p.value("saffev start"));
 
@@ -632,13 +640,30 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
         )),
     );
 
-    if !foreground {
-        println!(
-            "{} {}",
-            p.muted("·"),
-            p.muted("running in the foreground (v0); press Ctrl-C to stop"),
-        );
+    // Record our pid + Studio URL so `saffev stop` can find and signal us. This
+    // is the authoritative running pid (the foreground process actually serving),
+    // whether we were launched directly with `--foreground` or re-execed into the
+    // background by `start_background`. Best-effort: a failed write just means
+    // `stop` falls back to its port-based path.
+    let pid_path = daemon::pid_path(&cfg);
+    let url = format!(
+        "http://{}:{}",
+        display_host(cfg.ports.bind),
+        cfg.ports.studio
+    );
+    let pid_record = daemon::PidFile {
+        pid: std::process::id(),
+        url,
+    };
+    if let Err(e) = daemon::write_pid_file(&pid_path, &pid_record) {
+        tracing::debug!("could not write pid file {}: {e}", pid_path.display());
     }
+
+    println!(
+        "{} {}",
+        p.muted("·"),
+        p.muted("press Ctrl-C (or `saffev stop`) to stop"),
+    );
 
     // Assemble shared state and launch both servers. Each piece is guarded so a
     // stubbed builder can't abort the whole command; if neither server can be
@@ -646,6 +671,12 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
     // ports in `cfg` themselves; the addresses above are for display only.
     let _ = (proxy_addr, studio_addr);
     let launched = run_servers(&cfg).await;
+
+    // Clean up our PID file on the way out (graceful shutdown or bind failure),
+    // so a later `stop`/`status` doesn't see a stale entry. Idempotent.
+    if let Err(e) = daemon::remove_pid_file(&pid_path) {
+        tracing::debug!("could not remove pid file {}: {e}", pid_path.display());
+    }
 
     match launched {
         Ok(()) => {
@@ -663,6 +694,100 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Detach a `--foreground` copy of this binary into the background, print the
+/// Studio URL, and return promptly. The backgrounded child runs the foreground
+/// flow (binding the servers and writing the authoritative PID file).
+///
+/// We write a provisional PID file here too (child pid + URL) so a `stop` issued
+/// immediately after start can still find the daemon before the child has
+/// rewritten it; the child overwrites it with the same pid on startup.
+async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
+    println!("{} {}", p.prompt("~"), p.value("saffev start"));
+
+    // Refuse to start a second daemon if one is already running (live PID file).
+    let pid_path = daemon::pid_path(cfg);
+    if let Ok(Some(true)) = daemon::daemon_state(&pid_path) {
+        if let Ok(Some(existing)) = daemon::read_pid_file(&pid_path) {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("start"),
+                p.warn(&format!("already running (pid {})", existing.pid)),
+            );
+            if !existing.url.is_empty() {
+                println!("{} studio at {}", p.muted("·"), p.value(&existing.url));
+            }
+            return Ok(());
+        }
+    }
+
+    // Refuse to start if the proxy port is already taken by a foreign process.
+    let proxy_port = cfg.ports.proxy;
+    if port_listening(cfg.ports.bind, proxy_port).await {
+        println!(
+            "{} {} {}",
+            p.dot(Level::Err),
+            p.label("start"),
+            p.error(&format!("port {proxy_port} already in use")),
+        );
+        println!(
+            "{} run {} to diagnose, or adopt the engine first",
+            p.muted("·"),
+            p.value("saffev doctor"),
+        );
+        return Ok(());
+    }
+
+    let url = format!(
+        "http://{}:{}",
+        display_host(cfg.ports.bind),
+        cfg.ports.studio
+    );
+
+    // Re-exec ourselves detached, carrying the same global flags so the child
+    // resolves the identical config.
+    let pid = match daemon::spawn_background(cli.config.as_deref(), cli.no_color) {
+        Ok(pid) => pid,
+        Err(e) => {
+            tracing::debug!("daemonize failed: {e}");
+            println!(
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("start"),
+                p.error("could not start in the background"),
+            );
+            println!(
+                "{} run {} to run attached instead",
+                p.muted("·"),
+                p.value("saffev start --foreground"),
+            );
+            return Ok(());
+        }
+    };
+
+    // Provisional PID file (the child rewrites it on startup with the same pid).
+    let pid_record = daemon::PidFile {
+        pid,
+        url: url.clone(),
+    };
+    if let Err(e) = daemon::write_pid_file(&pid_path, &pid_record) {
+        tracing::debug!("could not write pid file {}: {e}", pid_path.display());
+    }
+
+    println!(
+        "{} {} {} {} {}",
+        p.dot(Level::Ok),
+        p.label("started"),
+        p.success(&format!("pid {pid}")),
+        p.muted("·"),
+        p.muted("background"),
+    );
+    println!("{} studio at {}", p.muted("·"), p.value(&url));
+    println!("{} run {} to stop", p.muted("·"), p.value("saffev stop"),);
+
+    Ok(())
 }
 
 /// Build state and run the proxy + Studio servers concurrently until shutdown
@@ -730,48 +855,148 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     // Drain the tee into the store off the request path.
     crate::proxy::ProxyServer::spawn_logger(proxy_state.clone(), rx);
 
-    // Run both servers concurrently; the first to exit (or Ctrl-C) ends start.
+    // Run both servers concurrently under a shared graceful-shutdown signal.
+    //
+    // A `watch` channel fans the single shutdown trigger (Ctrl-C *or* SIGTERM)
+    // out to both servers, which pass it into `axum::serve(..)
+    // .with_graceful_shutdown(..)` so in-flight requests drain before the
+    // listeners close. `saffev stop` sends SIGTERM; the foreground operator can
+    // still press Ctrl-C. The select also exits if either server's bind fails.
     let proxy = crate::proxy::ProxyServer::new(proxy_state);
     let studio = crate::studio::StudioServer::new(studio_state);
 
-    let proxy_task = tokio::spawn(async move { proxy.serve().await });
-    let studio_task = tokio::spawn(async move { studio.serve().await });
-    let ctrl_c = tokio::signal::ctrl_c();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let proxy_shutdown = shutdown_signal(shutdown_rx.clone());
+    let studio_shutdown = shutdown_signal(shutdown_rx);
 
+    let proxy_task = tokio::spawn(async move { proxy.serve_with_shutdown(proxy_shutdown).await });
+    let studio_task =
+        tokio::spawn(async move { studio.serve_with_shutdown(studio_shutdown).await });
+
+    // Trigger shutdown on Ctrl-C or SIGTERM, whichever comes first.
     tokio::select! {
         r = proxy_task => { let _ = r; }
         r = studio_task => { let _ = r; }
-        _ = ctrl_c => {}
+        _ = termination_signal() => {
+            // Broadcast to both servers; ignore send errors (receivers may have
+            // already dropped if a server exited first).
+            let _ = shutdown_tx.send(true);
+        }
     }
 
     Ok(())
 }
 
+/// Future that resolves on the first OS termination signal: Ctrl-C (SIGINT)
+/// everywhere, plus SIGTERM on Unix (what `saffev stop` sends). On non-Unix it
+/// is just Ctrl-C. Each branch is best-effort — a failed signal registration
+/// simply never fires that branch rather than aborting startup.
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("SIGTERM handler unavailable: {e}");
+                    // Fall back to Ctrl-C only.
+                    ctrl_c.await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Adapt a `watch` receiver into a one-shot shutdown future suitable for
+/// `with_graceful_shutdown`: resolves the first time the channel carries `true`
+/// (or the sender drops). Each server gets its own clone.
+async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    // If it's already `true` (raced), return immediately; otherwise wait for the
+    // next change to a truthy value. A dropped sender also ends the wait.
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
 /// `saffev stop` — stop the proxy + Studio + supervisor.
 ///
-/// v0 runs `start` in the foreground, so stopping is Ctrl-C in that terminal.
-/// This command reports current liveness and how to stop a foreground instance.
+/// Reads the PID file written by `start`, sends `SIGTERM` for a graceful
+/// shutdown (the servers drain in-flight requests via `with_graceful_shutdown`),
+/// waits briefly for the process to exit, then removes the PID file. A **stale**
+/// PID file (the recorded process is no longer alive) is cleaned up gracefully.
+/// When there is no PID file but a Saffev-looking proxy is up, we report that the
+/// running instance is unmanaged (foreground in another terminal: Ctrl-C there).
 pub async fn stop(cli: &Cli) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
 
     println!("{} {}", p.prompt("~"), p.value("saffev stop"));
 
-    let proxy_up = port_listening(cfg.ports.bind, cfg.ports.proxy).await;
-    let studio_up = port_listening(cfg.ports.bind, cfg.ports.studio).await;
+    let pid_path = daemon::pid_path(&cfg);
+    let record = match daemon::read_pid_file(&pid_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("reading pid file {} failed: {e}", pid_path.display());
+            None
+        }
+    };
 
-    if !proxy_up && !studio_up {
+    // No PID file: nothing we manage. Fall back to a liveness probe so the
+    // message is honest about an unmanaged (foreground) instance.
+    let Some(record) = record else {
+        let proxy_up = port_listening(cfg.ports.bind, cfg.ports.proxy).await;
+        let studio_up = port_listening(cfg.ports.bind, cfg.ports.studio).await;
+        if proxy_up || studio_up {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("stop"),
+                p.warn("running but unmanaged (no pid file) — press Ctrl-C in its terminal"),
+            );
+        } else {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("stop"),
+                p.value("not running"),
+            );
+        }
+        return Ok(());
+    };
+
+    // Stale PID file: the recorded process is gone. Clean it up and report.
+    if !daemon::process_alive(record.pid) {
+        if let Err(e) = daemon::remove_pid_file(&pid_path) {
+            tracing::debug!("removing stale pid file failed: {e}");
+        }
         println!(
             "{} {} {}",
             p.dot(Level::Ok),
             p.label("stop"),
-            p.value("not running"),
+            p.value(&format!("not running (cleared stale pid {})", record.pid)),
         );
         return Ok(());
     }
 
     // In Gateway mode, stopping honors the handover policy so the engine never
-    // goes offline unless explicitly configured to stop with Saffev.
+    // goes offline unless explicitly configured to stop with Saffev. (The
+    // supervisor itself applies the policy on shutdown; we surface it here.)
     if cfg.mode == Mode::Gateway {
         let policy = match cfg.handover {
             HandoverPolicy::Handover => "handover — engine stays serving",
@@ -785,11 +1010,44 @@ pub async fn stop(cli: &Cli) -> Result<()> {
         );
     }
 
-    println!(
-        "{} {}",
-        p.dot(Level::Warn),
-        p.warn("Saffev runs in the foreground (v0) — press Ctrl-C in its terminal to stop"),
-    );
+    // Graceful: SIGTERM, then wait briefly for the process to exit.
+    if let Err(e) = daemon::send_sigterm(record.pid) {
+        tracing::debug!("sending SIGTERM to {} failed: {e}", record.pid);
+    }
+
+    let exited = daemon::wait_for_exit(
+        record.pid,
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    if exited {
+        // The daemon removes its own PID file on clean exit; remove it here too
+        // in case it couldn't (idempotent).
+        if let Err(e) = daemon::remove_pid_file(&pid_path) {
+            tracing::debug!("removing pid file after stop failed: {e}");
+        }
+        println!(
+            "{} {} {}",
+            p.dot(Level::Ok),
+            p.label("stopped"),
+            p.success(&format!("pid {} shut down gracefully", record.pid)),
+        );
+    } else {
+        // Did not exit within the grace window. Leave the PID file in place so a
+        // follow-up `stop` can retry; report rather than force-kill (fail-open:
+        // we never escalate to SIGKILL automatically).
+        println!(
+            "{} {} {}",
+            p.dot(Level::Warn),
+            p.label("stop"),
+            p.warn(&format!(
+                "pid {} did not exit within 5s — re-run `saffev stop` to retry",
+                record.pid
+            )),
+        );
+    }
 
     Ok(())
 }

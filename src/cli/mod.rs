@@ -5,6 +5,7 @@
 //! Output uses [`crate::ui::palette`] for the calm, status-dot-prefixed voice.
 
 pub mod commands;
+pub mod daemon;
 
 use clap::{Parser, Subcommand};
 

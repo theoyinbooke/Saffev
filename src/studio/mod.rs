@@ -121,11 +121,22 @@ impl StudioServer {
             })
     }
 
-    /// Bind to the configured Studio port and serve until shutdown.
+    /// Bind to the configured Studio port and serve until the process is killed.
     ///
     /// Binds **loopback only** (the configured bind address, default
     /// `127.0.0.1`) — the Studio is never exposed to the network.
     pub async fn serve(self) -> Result<()> {
+        // No external shutdown signal: serve until the task is aborted.
+        self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    /// Like [`serve`](Self::serve), but ends cleanly when `shutdown` resolves,
+    /// letting in-flight requests drain via `with_graceful_shutdown` — the path
+    /// `saffev stop` takes (SIGTERM → this future resolves).
+    pub async fn serve_with_shutdown<S>(self, shutdown: S) -> Result<()>
+    where
+        S: std::future::Future<Output = ()> + Send + 'static,
+    {
         let addr = SocketAddr::new(self.state.config.ports.bind, self.state.config.ports.studio);
         let router = self.router();
 
@@ -136,6 +147,7 @@ impl StudioServer {
         tracing::info!("Studio listening on http://{addr}");
 
         axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| Error::Studio(format!("Studio server error: {e}")))?;
         Ok(())
