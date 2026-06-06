@@ -10,8 +10,10 @@
 //! `endpoint` label for the store/Studio, while the catch-all guarantees an
 //! unknown future engine route can never break us.
 
+use std::net::SocketAddr;
+
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::Request;
 use axum::response::Response;
 
@@ -21,64 +23,108 @@ use crate::proxy::ProxyState;
 // --- Ollama-native (NDJSON) -------------------------------------------------
 
 /// `POST /api/chat`
-pub async fn api_chat(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/chat", req).await
+pub async fn api_chat(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/chat", peer, req).await
 }
 
 /// `POST /api/generate`
-pub async fn api_generate(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/generate", req).await
+pub async fn api_generate(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/generate", peer, req).await
 }
 
 /// `GET /api/tags`
-pub async fn api_tags(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/tags", req).await
+pub async fn api_tags(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/tags", peer, req).await
 }
 
 /// `POST /api/embeddings`
-pub async fn api_embeddings(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/embeddings", req).await
+pub async fn api_embeddings(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/embeddings", peer, req).await
 }
 
 /// `POST /api/show`
-pub async fn api_show(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/show", req).await
+pub async fn api_show(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/show", peer, req).await
 }
 
 /// `GET /api/ps`
-pub async fn api_ps(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/api/ps", req).await
+pub async fn api_ps(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/api/ps", peer, req).await
 }
 
 // --- OpenAI-compatible (SSE) ------------------------------------------------
 
 /// `POST /v1/chat/completions`
-pub async fn v1_chat_completions(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/v1/chat/completions", req).await
+pub async fn v1_chat_completions(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/v1/chat/completions", peer, req).await
 }
 
 /// `POST /v1/completions`
-pub async fn v1_completions(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/v1/completions", req).await
+pub async fn v1_completions(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/v1/completions", peer, req).await
 }
 
 /// `POST /v1/embeddings`
-pub async fn v1_embeddings(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/v1/embeddings", req).await
+pub async fn v1_embeddings(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/v1/embeddings", peer, req).await
 }
 
 /// `GET /v1/models`
-pub async fn v1_models(State(state): State<ProxyState>, req: Request<Body>) -> Response {
-    forward_streaming(&state, "/v1/models", req).await
+pub async fn v1_models(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    forward_streaming(&state, "/v1/models", peer, req).await
 }
 
 // --- Catch-all --------------------------------------------------------------
 
 /// Any other path/method — reverse-proxied verbatim so an unknown engine route
 /// can never break us. The canonical endpoint label is the request's own path.
-pub async fn catch_all(State(state): State<ProxyState>, req: Request<Body>) -> Response {
+pub async fn catch_all(
+    State(state): State<ProxyState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response {
     // Use the live path as the endpoint label; the forwarder re-derives the full
     // path + query from the URI anyway, so this is purely the metadata label.
     let endpoint = req.uri().path().to_string();
-    forward_streaming(&state, &endpoint, req).await
+    forward_streaming(&state, &endpoint, peer, req).await
 }

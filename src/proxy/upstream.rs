@@ -26,7 +26,6 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::attribution;
 use crate::proxy::{ProxyState, TeeEvent};
 
 /// Process-global streaming HTTP client used to reach the local engine.
@@ -69,9 +68,16 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 /// Forward `req` to `state.upstream`, streaming the response back while teeing
-/// each chunk. `endpoint` is the canonical path used for metadata. On any error,
-/// returns a best-effort passthrough / error response — never panics the path.
-pub async fn forward_streaming(state: &ProxyState, endpoint: &str, req: Request<Body>) -> Response {
+/// each chunk. `endpoint` is the canonical path used for metadata; `peer` is the
+/// client's accepted-connection address (threaded via `ConnectInfo`) used for
+/// off-path socket-PID source-app attribution. On any error, returns a
+/// best-effort passthrough / error response — never panics the path.
+pub async fn forward_streaming(
+    state: &ProxyState,
+    endpoint: &str,
+    peer: std::net::SocketAddr,
+    req: Request<Body>,
+) -> Response {
     let id = Uuid::new_v4().to_string();
     let start = Instant::now();
 
@@ -79,9 +85,11 @@ pub async fn forward_streaming(state: &ProxyState, endpoint: &str, req: Request<
     let method = parts.method;
     let req_headers = parts.headers;
 
-    // Resolve source-app off the captured headers (cheap; PID lookup needs the
-    // peer socket which axum does not thread through here, so header/Unknown).
-    let source = attribution::resolve_by_header(&req_headers);
+    // Source-app attribution is deliberately NOT done here. It is computed in the
+    // logger task, off the request hot path (04 §7.2): the PID probe (lsof on
+    // macOS, /proc on Linux) can take milliseconds and must never sit inline. We
+    // carry the peer addr + headers on the tee so the logger can run the full
+    // ladder (PID -> X-Client-Name/User-Agent -> Unknown) fail-soft.
 
     // Buffer the *request* body. We must read it whole to (a) tee it, (b) run the
     // inline PII scan, and (c) re-send it upstream. Request bodies for chat/gen
@@ -101,7 +109,8 @@ pub async fn forward_streaming(state: &ProxyState, endpoint: &str, req: Request<
             id: id.clone(),
             endpoint: endpoint.to_string(),
             body: req_bytes.clone(),
-            source_app: source,
+            peer: Some(peer),
+            headers: req_headers.clone(),
         },
     );
 

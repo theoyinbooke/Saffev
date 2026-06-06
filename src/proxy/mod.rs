@@ -23,8 +23,7 @@ use bytes::{Bytes, BytesMut};
 use crate::brain::Side;
 use crate::config::Config;
 use crate::store::{
-    PiiAction, PiiFindingRecord, RequestMeta, ResponseMeta, SourceConfidence, Store, TokenSource,
-    WriteOp,
+    PiiAction, PiiFindingRecord, RequestMeta, ResponseMeta, Store, TokenSource, WriteOp,
 };
 use crate::Result;
 
@@ -44,8 +43,15 @@ pub enum TeeEvent {
         endpoint: String,
         /// Captured request body (for hashing + PII scan + optional payload).
         body: Bytes,
-        /// Resolved source application, if known by now.
-        source_app: Option<String>,
+        /// The client's peer socket address (remote end of the accepted
+        /// connection), if axum threaded it through `ConnectInfo`. Used by the
+        /// logger to resolve the source app via socket-PID lookup **off the hot
+        /// path**. `None` when the connect info was unavailable.
+        peer: Option<std::net::SocketAddr>,
+        /// Request headers, carried so the source-app resolution (PID, then the
+        /// `X-Client-Name`/`User-Agent` fallback) runs entirely in the logger
+        /// task rather than inline on the request path (04 §7.2).
+        headers: axum::http::HeaderMap,
     },
     /// A streamed response chunk (NDJSON line or SSE event), verbatim.
     ResponseChunk {
@@ -153,9 +159,16 @@ impl ProxyServer {
 
         tracing::info!(%addr, upstream = %self.state.upstream, "proxy: listening");
 
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| crate::Error::Proxy(format!("serve: {e}")))?;
+        // `into_make_service_with_connect_info::<SocketAddr>()` threads the
+        // accepted connection's peer address into handlers via
+        // `ConnectInfo<SocketAddr>`. The proxy uses the peer's ephemeral port to
+        // resolve the connecting process (socket-PID attribution, 04 §7.2).
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| crate::Error::Proxy(format!("serve: {e}")))?;
 
         Ok(())
     }
@@ -217,7 +230,8 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                 id,
                 endpoint,
                 body,
-                source_app,
+                peer,
+                headers,
             } => {
                 on_request_started(
                     &state,
@@ -227,7 +241,8 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                     id,
                     endpoint,
                     body,
-                    source_app,
+                    peer,
+                    &headers,
                 );
             }
             TeeEvent::ResponseChunk { id, chunk } => {
@@ -275,7 +290,8 @@ fn on_request_started(
     id: String,
     endpoint: String,
     body: Bytes,
-    source_app: Option<String>,
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
 ) {
     let started = Instant::now();
     let ts_millis = now_millis();
@@ -294,11 +310,14 @@ fn on_request_started(
 
     let request_hash = upstream::hash_body(&body);
 
-    let source_confidence = if source_app.is_some() {
-        SourceConfidence::Header
-    } else {
-        SourceConfidence::Unknown
-    };
+    // Resolve source-app **here**, off the request hot path (04 §7.2): socket-PID
+    // first (highest confidence), then the header fallback, then Unknown. The
+    // PID probe is best-effort and fail-soft — any error degrades to the header
+    // layer without disturbing logging. When we have no peer (connect info was
+    // unavailable) we resolve from headers alone.
+    let resolved = crate::attribution::resolve_opt(peer, headers);
+    let source_app = resolved.name;
+    let source_confidence = resolved.confidence;
 
     let meta = RequestMeta {
         id: id.clone(),

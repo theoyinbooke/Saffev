@@ -86,6 +86,28 @@ fn normalize_user_agent(ua: &str) -> Option<String> {
     }
 }
 
+/// Full layered resolution with an *optional* peer. Identical to [`resolve`]
+/// when a peer is present; when the connect info was unavailable (`None`), the
+/// PID layer is skipped and we resolve from headers (Header) then `Unknown`.
+///
+/// This is the entry point the off-path logger uses, since `ConnectInfo` may, in
+/// principle, be absent.
+pub fn resolve_opt(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> SourceApp {
+    match peer {
+        Some(peer) => resolve(peer, headers),
+        None => match resolve_by_header(headers) {
+            Some(name) => SourceApp {
+                name: Some(name),
+                confidence: SourceConfidence::Header,
+            },
+            None => SourceApp {
+                name: None,
+                confidence: SourceConfidence::Unknown,
+            },
+        },
+    }
+}
+
 /// Full layered resolution: PID, then header, then `Unknown`.
 pub fn resolve(peer: SocketAddr, headers: &axum::http::HeaderMap) -> SourceApp {
     // 1. Highest confidence: who actually owns the socket.
@@ -205,10 +227,14 @@ fn process_name_for_pid(pid: u32) -> Option<String> {
     }
 }
 
+/// Hard cap on how long the `lsof` probe may run before we give up and fall
+/// back to the header layer. Keeps a wedged subprocess from ever stalling the
+/// logger task (this runs off the hot path, but must still be bounded).
+#[cfg(all(unix, not(target_os = "linux")))]
+const LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
 #[cfg(all(unix, not(target_os = "linux")))]
 fn pid_lookup(peer: SocketAddr) -> Option<String> {
-    use std::process::Command;
-
     if !is_local_peer(peer) {
         return None;
     }
@@ -216,21 +242,62 @@ fn pid_lookup(peer: SocketAddr) -> Option<String> {
     // Ask lsof for the established TCP connection whose source is the client's
     // ephemeral port. `-iTCP:<port>` matches either end; `-sTCP:ESTABLISHED`
     // narrows to live connections. `-Fcn` gives terse command (`c`) + name (`n`)
-    // fields so we can correlate.
-    let output = Command::new("lsof")
-        .args([
-            "-nP",
-            &format!("-iTCP:{}", peer.port()),
-            "-sTCP:ESTABLISHED",
-            "-Fcn",
-        ])
-        .output()
-        .ok()?;
+    // fields so we can correlate. Bounded by LSOF_TIMEOUT and fail-soft.
+    let output = run_lsof_bounded(peer.port())?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
     parse_lsof_command_for_peer(&text, peer)
+}
+
+/// Run `lsof` for the given port with a wall-clock timeout, killing the child on
+/// overrun. Returns `None` on spawn failure, timeout, or wait error — never
+/// blocks indefinitely. Best-effort: a missing/slow `lsof` simply degrades to
+/// the header fallback.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn run_lsof_bounded(port: u16) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fcn"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + LSOF_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Timed out: reap the child and give up.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// Parse lsof `-Fcn` records into the command-name owning the connection whose
@@ -359,6 +426,33 @@ mod tests {
     }
 
     #[test]
+    fn resolve_opt_none_peer_uses_header() {
+        // No peer (connect info unavailable) -> skip PID, honor the header.
+        let h = hm(&[("x-client-name", "HeaderOnly")]);
+        let resolved = resolve_opt(None, &h);
+        assert_eq!(resolved.name.as_deref(), Some("HeaderOnly"));
+        assert_eq!(resolved.confidence, SourceConfidence::Header);
+    }
+
+    #[test]
+    fn resolve_opt_none_peer_no_header_is_unknown() {
+        let resolved = resolve_opt(None, &HeaderMap::new());
+        assert!(resolved.name.is_none());
+        assert_eq!(resolved.confidence, SourceConfidence::Unknown);
+    }
+
+    #[test]
+    fn resolve_opt_some_remote_peer_falls_through_to_header() {
+        // A remote peer can never resolve by PID; resolve_opt must match resolve
+        // and degrade to the header layer.
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 44444);
+        let h = hm(&[("user-agent", "curl/8.0")]);
+        let resolved = resolve_opt(Some(peer), &h);
+        assert_eq!(resolved.name.as_deref(), Some("curl"));
+        assert_eq!(resolved.confidence, SourceConfidence::Header);
+    }
+
+    #[test]
     fn non_local_peer_skips_pid_probe() {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 5000);
         assert!(!is_local_peer(peer));
@@ -389,5 +483,25 @@ mod tests {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11111);
         let text = "p900\nciTerm2\nf7\nn127.0.0.1:54321->127.0.0.1:11434\n";
         assert!(parse_lsof_command_for_peer(text, peer).is_none());
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn lsof_bounded_returns_fast_and_fail_soft_for_unused_port() {
+        // No process owns port 1 as an established TCP peer; lsof returns no
+        // matching rows. The probe must complete well within its timeout and the
+        // parser must yield None — never hang, never error.
+        let started = std::time::Instant::now();
+        let out = run_lsof_bounded(1);
+        // Whether lsof produced output or not, the call must return promptly.
+        assert!(
+            started.elapsed() < LSOF_TIMEOUT + std::time::Duration::from_secs(1),
+            "lsof probe must respect its timeout"
+        );
+        if let Some(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+            assert!(parse_lsof_command_for_peer(&text, peer).is_none());
+        }
     }
 }
