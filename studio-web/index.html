@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Saffev — local ai studio</title>
+
+  <!-- Google Fonts (a later task will self-host these woff2 for offline/privacy). -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Canonical design tokens (copied from design/tokens.css) — single colour source. -->
+  <link rel="stylesheet" href="/tokens.css" />
+  <!-- Component styles lifted from design/option-a-calm-instrument.html (token-driven). -->
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 2 4 5.5v6c0 5 3.4 8.8 8 10.5 4.6-1.7 8-5.5 8-10.5v-6L12 2Z" fill="#fff" opacity=".95"/>
+            <path d="M9 12.2 11 14.2 15.2 9.8" stroke="#6C4FE0" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="wm"><span id="wmName">Saffev</span><small id="wmSub">local ai studio</small></div>
+      </div>
+
+      <div class="navlabel">Observe</div>
+      <nav class="nav" id="navObserve">
+        <a data-route="live" href="#/live">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h4l3 8 4-16 3 8h6"/></svg> Live
+        </a>
+        <a data-route="history" href="#/history">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> History
+        </a>
+        <a data-route="privacy" href="#/privacy">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 5 6v5c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6l-7-3Z"/></svg> Privacy
+          <span class="badge" id="navPiiBadge" hidden>0</span>
+        </a>
+      </nav>
+
+      <div class="navlabel">Manage</div>
+      <nav class="nav" id="navManage">
+        <a data-route="engines" href="#/engines">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg> Engines
+        </a>
+        <a data-route="settings" href="#/settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.7-1l-.3-2.5h-4l-.3 2.5a7 7 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.6a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-1a7 7 0 0 0 1.7 1l.3 2.5h4l.3-2.5a7 7 0 0 0 1.7-1l2.3 1 2-3.4-2-1.6a7 7 0 0 0 .1-1Z"/></svg> Settings
+        </a>
+      </nav>
+
+      <div class="foot">Everything stays on this device. <b>Encrypted</b> · no telemetry.</div>
+    </aside>
+
+    <!-- MAIN -->
+    <main class="main" id="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">Live</h1>
+          <div class="sub" id="pageSub">What your apps are doing with local models — right now.</div>
+        </div>
+        <div class="spacer"></div>
+        <span class="pill" id="enginePill"><span class="dot"></span> <span id="enginePillText">connecting…</span></span>
+        <button class="iconbtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">
+          <svg id="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+        </button>
+      </header>
+
+      <!-- Connection banner (token / fetch errors) -->
+      <div class="banner" id="banner" hidden></div>
+
+      <!-- View root — pages render here -->
+      <section id="view"></section>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,118 @@
+/* =============================================================================
+   Studio Design Tokens — "Calm Instrument"
+   Source of truth for the web Studio. Canonical; spec in 05-design-system.md.
+   Mirrors the Rust CLI palette in design/cli_palette.rs (same token names).
+
+   Behavior:
+   - Default follows the OS color scheme (prefers-color-scheme).
+   - Setting [data-theme="light"] or [data-theme="dark"] on <html> forces a mode.
+   - Light uses soft shadows; dark uses hairline borders (shadows resolve to none).
+
+   Fonts: replace the @import with self-hosted woff2 for offline / privacy
+   (the tool ships on-device; production should not call a font CDN).
+   ============================================================================= */
+@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+/* ---- LIGHT (default) ------------------------------------------------------ */
+:root {
+  /* surfaces & lines */
+  --bg:            #F6F1EA;  /* app canvas — warm cream */
+  --surface:       #FFFFFF;  /* cards, panels */
+  --surface-2:     #FBF7F1;  /* nested surface, inputs, terminal chrome */
+  --surface-3:     #F3ECE2;  /* hover/pressed tint */
+  --border:        #E9E3DA;  /* card/input borders */
+  --divider:       #F1EBE3;  /* hairline separators, list rows */
+
+  /* brand — primary (violet) */
+  --brand:         #6C4FE0;  /* primary actions, active nav, brand, CLI prompt */
+  --brand-soft:    #ECE7FB;  /* active-nav fill, soft chips, tints */
+  --brand-press:   #5A3FD0;  /* pressed / emphasis */
+  --on-brand:      #FFFFFF;  /* text/icon on a filled brand surface */
+
+  /* semantic status (strong + soft) */
+  --safe:          #1F9D63;  --safe-soft:   #DDF2E7;  /* clean·on-device·not-exposed·healthy */
+  --warn:          #C5821E;  --warn-soft:   #F8E9CD;  /* caution·approaching·exposed-warning */
+  --danger:        #CE4B47;  --danger-soft: #F7DBD9;  /* PII flagged·error·blocked */
+  --gold:          #D99E2B;  --gold-soft:   #F8EBCD;  /* secondary accent·API-key·highlight */
+
+  /* text */
+  --text:          #221F1B;  /* primary content, headings, values */
+  --text-2:        #6F685E;  /* supporting text, labels */
+  --text-3:        #A99F92;  /* metadata, placeholders, disabled, CLI comments */
+
+  /* shape */
+  --r-sm:  10px;  --r-md: 14px;  --r-lg: 20px;  --r-xl: 28px;  --r-full: 999px;
+
+  /* spacing (6-step scale) */
+  --space-xs: 4px;  --space-sm: 8px;  --space-md: 16px;
+  --space-lg: 24px; --space-xl: 32px; --space-xxl: 48px;
+
+  /* elevation (light only) + focus */
+  --shadow:    0 1px 2px rgba(48,36,22,.04), 0 10px 30px rgba(48,36,22,.06);
+  --shadow-sm: 0 1px 2px rgba(48,36,22,.05);
+  --ring:      0 0 0 4px rgba(108,79,224,.16);
+
+  /* type */
+  --font-display: "Bricolage Grotesque", ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+  --font-body:    "Hanken Grotesk", ui-rounded, system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* type scale (rem @ 15px base) */
+  --fs-display-xl: 2.30rem;  --fs-display: 2.05rem;  --fs-h3: 1.18rem;
+  --fs-body: 0.95rem;        --fs-small: 0.82rem;    --fs-data: 0.86rem;
+  --fs-label: 0.62rem;       /* mono, uppercase, .16em tracking */
+
+  /* atmosphere washes (apply on body bg-image; subtle, must not lower contrast) */
+  --wash-brand: color-mix(in srgb, var(--brand) 12%, transparent);
+  --wash-gold:  color-mix(in srgb, var(--gold)  14%, transparent);
+
+  color-scheme: light;
+}
+
+/* ---- DARK (auto via OS, unless [data-theme="light"] forces light) --------- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
+    --border:    #38322A;  --divider:    #2C2720;
+    --brand:     #B7A6F2;  --brand-soft: #2C2446;  --brand-press:#C9BBF6;  --on-brand:  #1A1410;
+    --safe:      #57C98C;  --safe-soft:  #1E3F2E;
+    --warn:      #E7B25A;  --warn-soft:  #3D3115;
+    --danger:    #E27875;  --danger-soft:#3E2422;
+    --gold:      #E9C064;  --gold-soft:  #3B2F14;
+    --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
+    --shadow: none;  --shadow-sm: none;
+    --ring:   0 0 0 4px rgba(183,166,242,.22);
+    color-scheme: dark;
+  }
+}
+
+/* ---- DARK (forced) -------------------------------------------------------- */
+:root[data-theme="dark"] {
+  --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
+  --border:    #38322A;  --divider:    #2C2720;
+  --brand:     #B7A6F2;  --brand-soft: #2C2446;  --brand-press:#C9BBF6;  --on-brand:  #1A1410;
+  --safe:      #57C98C;  --safe-soft:  #1E3F2E;
+  --warn:      #E7B25A;  --warn-soft:  #3D3115;
+  --danger:    #E27875;  --danger-soft:#3E2422;
+  --gold:      #E9C064;  --gold-soft:  #3B2F14;
+  --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
+  --shadow: none;  --shadow-sm: none;
+  --ring:   0 0 0 4px rgba(183,166,242,.22);
+  color-scheme: dark;
+}
+
+/* ---- minimal base (optional — delete if your reset handles it) ------------ */
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  transition: background .4s ease, color .4s ease;
+  background-image:
+    radial-gradient(1100px 520px at 88% -8%, var(--wash-brand), transparent 70%),
+    radial-gradient(900px 480px at -6% 8%, var(--wash-gold),  transparent 70%);
+}
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.num  { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+:where(a, button, input, [tabindex]):focus-visible { outline: none; box-shadow: var(--ring); }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
