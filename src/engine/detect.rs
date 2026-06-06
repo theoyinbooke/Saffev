@@ -37,6 +37,25 @@ fn probe_client() -> reqwest::Client {
 /// port, fall back to the other engine's endpoint, and finally report
 /// [`EngineKind::Unknown`] if *something* is listening but is unrecognized.
 pub async fn probe_port(port: u16) -> Result<Option<EngineInfo>> {
+    // Detection only — adoption decisions happen later, against the store.
+    probe_port_as(port, AdoptionState::Detected).await
+}
+
+/// Probe the configured upstream the proxy forwards to in Cooperative mode and,
+/// if an engine answers there, surface it as a [`EngineInfo`] tagged
+/// [`AdoptionState::Cooperative`].
+///
+/// In Cooperative mode Saffev never adopts the engine, so it has no `engines`
+/// row of its own; without this the Studio "Engines" panel renders empty even
+/// though the proxy is happily forwarding to a live engine. Probing the
+/// upstream lets us show the engine Saffev actually proxies to. Best-effort and
+/// loopback-only like the rest of detection: a silent port just yields `None`.
+pub async fn probe_upstream(port: u16) -> Result<Option<EngineInfo>> {
+    probe_port_as(port, AdoptionState::Cooperative).await
+}
+
+/// Probe one port, tagging any engine found with `adoption_state`.
+async fn probe_port_as(port: u16, adoption_state: AdoptionState) -> Result<Option<EngineInfo>> {
     let client = probe_client();
     let kind = identify_with(&client, port).await;
 
@@ -53,9 +72,17 @@ pub async fn probe_port(port: u16) -> Result<Option<EngineInfo>> {
         version,
         port,
         how_it_starts,
-        // Detection only — adoption decisions happen later, against the store.
-        adoption_state: AdoptionState::Detected,
+        adoption_state,
     }))
+}
+
+/// Canonical lowercase engine name for the `engines` table / wire DTOs.
+pub fn engine_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Ollama => "ollama",
+        EngineKind::LmStudio => "lmstudio",
+        EngineKind::Unknown => "unknown",
+    }
 }
 
 /// Identify the engine answering on `port` by calling its identifying endpoint.
@@ -324,6 +351,61 @@ mod tests {
         let res = probe_port(1).await;
         assert!(res.is_ok());
         assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_upstream_dead_port_returns_none() {
+        // No engine on a dead upstream → fail-soft None, never an error.
+        let res = probe_upstream(1).await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_upstream_against_live_engine_tags_cooperative() {
+        // Spin up a tiny loopback HTTP server that answers Ollama's identifying
+        // and version endpoints, then assert that probing it as the upstream
+        // surfaces an engine on that exact port, tagged Cooperative.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Serve a couple of requests (identify, then version) for one probe.
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/api/version") {
+                    "{\"version\":\"9.9.9\"}"
+                } else {
+                    // /api/tags identifying response.
+                    "{\"models\":[]}"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let info = probe_upstream(port)
+            .await
+            .expect("probe must not error")
+            .expect("a live engine must be detected on the upstream port");
+
+        assert_eq!(info.port, port, "detection must include the upstream port");
+        assert_eq!(info.engine, EngineKind::Ollama);
+        assert_eq!(info.adoption_state, AdoptionState::Cooperative);
     }
 
     #[tokio::test]

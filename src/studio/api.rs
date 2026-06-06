@@ -112,6 +112,20 @@ fn engine_view(rec: &EngineRecord, health: &str) -> dto::EngineView {
     }
 }
 
+/// Project a freshly-detected [`EngineInfo`] (e.g. the Cooperative upstream that
+/// has no store row yet) into the wire [`dto::EngineView`]. The probed port is
+/// the engine's real port, so it maps to `public_port` with no shadow.
+fn detected_engine_view(info: &crate::engine::EngineInfo, health: &str) -> dto::EngineView {
+    dto::EngineView {
+        engine: crate::engine::detect::engine_name(info.engine).to_string(),
+        version: info.version.clone(),
+        public_port: info.port,
+        shadow_port: None,
+        adoption_state: info.adoption_state,
+        health: health.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -358,6 +372,26 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
             "down"
         };
         views.push(engine_view(rec, health));
+    }
+
+    // Cooperative mode never adopts the engine, so it has no `engines` row of
+    // its own and the panel would otherwise read "No engine detected". Probe
+    // the configured upstream the proxy forwards to and surface that engine
+    // here, unless a store record already covers the same port. Fail-soft: a
+    // silent upstream just adds nothing.
+    let upstream = state.config.ports.upstream;
+    let already_known = records
+        .iter()
+        .any(|r| r.shadow_port.unwrap_or(r.public_port) == upstream || r.public_port == upstream);
+    if !already_known {
+        if let Ok(Some(info)) = crate::engine::detect::probe_upstream(upstream).await {
+            let health = if probe_loopback(info.port).await {
+                "healthy"
+            } else {
+                "down"
+            };
+            views.push(detected_engine_view(&info, health));
+        }
     }
 
     // Exposure doctor verdict against the public proxy port. Fail-soft to a
@@ -755,6 +789,29 @@ mod tests {
     fn api_error_serializes_envelope() {
         let resp = api_error(StatusCode::NOT_FOUND, "not_found", "nope");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn detected_engine_view_surfaces_upstream_cooperative() {
+        // The Cooperative upstream the proxy forwards to must show up in the
+        // Engines panel with its real port and a cooperative adoption state.
+        use crate::engine::{EngineInfo, EngineKind, StartMode};
+        use crate::store::AdoptionState;
+
+        let info = EngineInfo {
+            engine: EngineKind::Ollama,
+            version: Some("0.5.0".to_string()),
+            port: 11434,
+            how_it_starts: StartMode::Launchd,
+            adoption_state: AdoptionState::Cooperative,
+        };
+        let view = detected_engine_view(&info, "healthy");
+        assert_eq!(view.engine, "ollama");
+        assert_eq!(view.public_port, 11434, "must surface the upstream port");
+        assert_eq!(view.shadow_port, None);
+        assert_eq!(view.adoption_state, AdoptionState::Cooperative);
+        assert_eq!(view.version.as_deref(), Some("0.5.0"));
+        assert_eq!(view.health, "healthy");
     }
 
     #[test]
