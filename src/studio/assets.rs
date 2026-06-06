@@ -148,4 +148,70 @@ mod tests {
         let out = inject_token("<head><title>x</title></head><body></body>", "abc");
         assert!(out.contains("window.__SAFFEV_TOKEN__=\"abc\";</script></head>"));
     }
+
+    /// The Studio must be fully offline: no embedded HTML/CSS may reference a
+    /// font CDN (Google Fonts / gstatic). This guards the "nothing leaves the
+    /// device" invariant against a regression that reintroduces a CDN link.
+    #[test]
+    fn no_font_cdn_references_in_embedded_assets() {
+        let needles = ["fonts.googleapis", "gstatic", "googleapis"];
+        for path in ["index.html", "tokens.css", "fonts.css", "styles.css"] {
+            let asset =
+                StudioAssets::get(path).unwrap_or_else(|| panic!("missing embedded asset: {path}"));
+            let text = String::from_utf8_lossy(&asset.data).to_lowercase();
+            for needle in needles {
+                assert!(
+                    !text.contains(needle),
+                    "{path} references a font CDN ({needle}) — Studio must stay offline"
+                );
+            }
+        }
+    }
+
+    /// The self-hosted woff2 files are embedded and serve as woff2 with the
+    /// correct content-type, so the binary ships its own fonts.
+    #[tokio::test]
+    async fn self_hosted_fonts_are_embedded_and_served() {
+        for file in [
+            "fonts/bricolage-grotesque.woff2",
+            "fonts/hanken-grotesk.woff2",
+            "fonts/jetbrains-mono.woff2",
+        ] {
+            let asset =
+                StudioAssets::get(file).unwrap_or_else(|| panic!("missing embedded font: {file}"));
+            // woff2 files start with the "wOF2" magic signature.
+            assert_eq!(&asset.data[..4], b"wOF2", "{file} is not a valid woff2");
+
+            let uri: Uri = format!("/{file}").parse().unwrap();
+            let resp = serve(uri, tok()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{file} did not serve OK");
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ct.contains("woff2"),
+                "{file} served wrong content-type: {ct}"
+            );
+        }
+    }
+
+    /// `fonts.css` declares an @font-face for each of the three families the
+    /// Studio's design tokens reference.
+    #[test]
+    fn fonts_css_declares_all_three_families() {
+        let asset = StudioAssets::get("fonts.css").expect("missing fonts.css");
+        let css = String::from_utf8_lossy(&asset.data);
+        for family in ["Bricolage Grotesque", "Hanken Grotesk", "JetBrains Mono"] {
+            assert!(
+                css.contains(family),
+                "fonts.css missing @font-face for {family}"
+            );
+        }
+        assert!(
+            css.contains("font-display: swap") || css.contains("font-display:swap"),
+            "fonts.css should use font-display: swap"
+        );
+    }
 }

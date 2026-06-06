@@ -8,10 +8,9 @@
    - Setting [data-theme="light"] or [data-theme="dark"] on <html> forces a mode.
    - Light uses soft shadows; dark uses hairline borders (shadows resolve to none).
 
-   Fonts: replace the @import with self-hosted woff2 for offline / privacy
-   (the tool ships on-device; production should not call a font CDN).
+   Fonts: self-hosted woff2 via studio-web/fonts.css (no CDN) for offline /
+   privacy — the tool ships on-device and never calls a font CDN.
    ============================================================================= */
-@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
 
 /* ---- LIGHT (default) ------------------------------------------------------ */
 :root {

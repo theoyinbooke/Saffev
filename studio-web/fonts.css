@@ -1,0 +1,37 @@
+/* =============================================================================
+   Self-hosted Studio fonts — ZERO network calls.
+   Replaces the former Google Fonts CDN <link>/@import. The .woff2 files in
+   studio-web/fonts/ ship inside the binary via rust-embed, so the Studio is
+   fully offline: nothing leaves the device.
+
+   Each file is the upstream variable font (latin subset) fetched once from the
+   Google Fonts static host at build time; the font-weight range lets one file
+   cover every weight the Studio uses (styles.css: 400/500/600/700, plus 800).
+   ============================================================================= */
+
+/* Display — Bricolage Grotesque (used at weight 700) */
+@font-face {
+  font-family: "Bricolage Grotesque";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/fonts/bricolage-grotesque.woff2") format("woff2");
+}
+
+/* Body — Hanken Grotesk (used at 400/500/600/700) */
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/hanken-grotesk.woff2") format("woff2");
+}
+
+/* Mono — JetBrains Mono (used at 400/500/600/700) */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono.woff2") format("woff2");
+}
