@@ -16,11 +16,14 @@ name = "saffev"
 path = "src/lib.rs"
 
 [features]
-default = []
-# At-rest encryption for the SQLite store via SQLCipher. OFF by default so the
-# stock build is guaranteed-green (plain bundled SQLite). When this is enabled,
-# `store` opens the database with a key pulled from the OS keyring and issues the
-# `PRAGMA key` handshake. See `src/store/mod.rs`.
+# At-rest encryption is ON by default (v1 acceptance §10.5). The stock build
+# links bundled SQLCipher and opens the database with a key pulled from the OS
+# keyring (or the `SAFFEV_DB_KEY` env override) via the `PRAGMA key` handshake.
+# See `src/store/mod.rs`.
+default = ["sqlcipher"]
+# At-rest encryption for the SQLite store via SQLCipher (bundled — compiles C, no
+# system crypto deps). Enabled in `default`; opt out with `--no-default-features`
+# for a plain bundled-SQLite build.
 sqlcipher = ["rusqlite/bundled-sqlcipher"]
 
 [dependencies]
@@ -44,8 +47,9 @@ serde_json = "1.0"
 toml = "0.8"
 
 # --- storage / secrets ---
-# NB: plain bundled SQLite by default. The `sqlcipher` cargo feature swaps in
-# `bundled-sqlcipher` for at-rest encryption (OFF by default — see [features]).
+# NB: at-rest encryption is ON by default — the `sqlcipher` feature (in the
+# default set) adds `bundled-sqlcipher`. `--no-default-features` falls back to
+# plain bundled SQLite (the `bundled` feature here). See [features].
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 keyring = "2.3"
 

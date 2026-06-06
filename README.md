@@ -41,24 +41,29 @@ source "$HOME/.cargo/env"
 ### Build
 
 ```sh
-cargo build              # debug; guaranteed-green, plain bundled SQLite
+cargo build              # debug; encrypted-at-rest (bundled SQLCipher, default)
 cargo build --release    # optimized
 ```
 
-At-rest DB encryption (SQLCipher) is **off by default** so the stock build needs
-no system crypto deps. Enable it with:
+At-rest DB encryption (SQLCipher) is **on by default** (acceptance §10.5). The
+stock build links bundled SQLCipher and opens the database with a key pulled from
+the OS keyring (Keychain on macOS, Secret Service / libsecret on Linux) via a
+`PRAGMA key` handshake that runs before any other statement.
+
+Set `SAFFEV_DB_KEY` to override the keyring (headless/CI/dev) — when present it is
+used verbatim as the SQLCipher key instead of the keyring entry. The same key
+must be supplied on every open, or the database cannot be decrypted.
+
+For a plain, unencrypted build with no system-crypto compile step:
 
 ```sh
-cargo build --features sqlcipher
+cargo build --no-default-features
 ```
-
-With the feature on, the DB is opened with a key pulled from the OS keyring via a
-`PRAGMA key` handshake. (Acceptance §10.5 requires this for release builds.)
 
 ### Test
 
 ```sh
-cargo test               # 152 unit tests across all modules
+cargo test               # 207 unit tests across all modules
 ```
 
 ### Run
@@ -174,9 +179,6 @@ unreliable model signal.
 
 **Deferred (not in this build):**
 
-- **At-rest encryption is gated behind the `sqlcipher` cargo feature** (OFF by
-  default). The default build's DB is plain bundled SQLite. v1's acceptance bar
-  requires the feature on for release; flipping the default to on is a v1 item.
 - **macOS Gateway adoption** — Homebrew/CLI, only if it passes the reversibility
   bar (v2). macOS today runs Cooperative.
 - **LM Studio Gateway** — Cooperative only later; LM Studio's Auto-Evict and
@@ -250,7 +252,7 @@ kill "$(cat "$SMOKE/pid")"
 
 **Result of this run:**
 
-- Build green; all 152 unit tests pass.
+- Build green; all 207 unit tests pass.
 - The streaming response proxied through `:8088` from Ollama on `:11434`,
   verbatim, token-by-token (NDJSON).
 - One `requests` row logged (`source_app=curl`, `model=qwen3.5:2b`,

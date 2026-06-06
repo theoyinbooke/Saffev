@@ -1,19 +1,23 @@
 //! Encrypted SQLite storage — single-writer model.
 //!
-//! ## Build note (guaranteed-green default)
+//! ## At-rest encryption (ON by default — acceptance §10.5)
 //!
-//! By default this crate links **plain bundled SQLite** (`rusqlite/bundled`), so
-//! `cargo build` is always green with no system crypto deps. At-rest encryption
-//! is wired behind the **`sqlcipher` cargo feature** (OFF by default), which
-//! swaps in `rusqlite/bundled-sqlcipher` and issues the `PRAGMA key` handshake
-//! with a key pulled from the OS keyring. Enable with:
+//! By default this crate links **bundled SQLCipher** (`rusqlite/bundled-sqlcipher`
+//! via the `sqlcipher` cargo feature, which is in the `default` set). Every
+//! connection — writer and readers alike — issues the `PRAGMA key` handshake
+//! **before any other statement** ([`apply_key`]), so the on-disk database is
+//! encrypted at rest. The key comes from the OS keyring (Keychain on macOS,
+//! Secret Service / libsecret on Linux), or from the `SAFFEV_DB_KEY` env var
+//! when set (headless/CI/dev — overrides the keyring; see [`keys`]).
+//!
+//! For a plain, unencrypted build (no system crypto, no key handshake) opt out:
 //!
 //! ```text
-//! cargo build --features sqlcipher
+//! cargo build --no-default-features
 //! ```
 //!
-//! Until that feature is enabled, the database is **not** encrypted at rest.
-//! Acceptance §10.5 (encrypted DB) requires the feature on for release builds.
+//! In that case the database is **not** encrypted at rest — but the stock build
+//! (and every release build) is, as §10.5 requires.
 //!
 //! ## Single-writer model
 //!
@@ -278,8 +282,9 @@ struct StoreInner {
 
 impl Store {
     /// Open (creating if needed) the database at `path`, run migrations, and
-    /// spawn the single writer thread. With the `sqlcipher` feature on, this
-    /// also performs the keyring-key `PRAGMA key` handshake.
+    /// spawn the single writer thread. With the `sqlcipher` feature on (the
+    /// default), this first performs the keyring/env-key `PRAGMA key` handshake
+    /// — before migrations or any other statement touch the file.
     pub async fn open(path: &Path) -> Result<Self> {
         let path = path.to_path_buf();
 
@@ -493,9 +498,12 @@ fn open_read_connection(path: &Path) -> Result<Connection> {
     open_connection(path)
 }
 
-/// SQLCipher key handshake. No-op unless the `sqlcipher` feature is enabled —
-/// in the default build the DB is plain bundled SQLite (documented in the module
-/// header; acceptance §10.5 requires `--features sqlcipher` for encryption).
+/// SQLCipher key handshake. Active in the default build (`sqlcipher` feature on);
+/// a no-op only under `--no-default-features`, where the DB is plain bundled
+/// SQLite (acceptance §10.5 requires the encrypted default for release builds).
+///
+/// The key is read from the OS keyring, or the `SAFFEV_DB_KEY` env var when set
+/// (headless/CI/dev override — see [`keys::get_or_create_db_key`]).
 #[cfg(feature = "sqlcipher")]
 fn apply_key(conn: &Connection) -> Result<()> {
     let key = keys::get_or_create_db_key()?;
@@ -1088,7 +1096,29 @@ mod tests {
     use super::*;
     use crate::config::Retention;
 
+    /// Ensure a DB key is available for every test in this binary.
+    ///
+    /// With the `sqlcipher` feature on (the default), `Store::open` runs the
+    /// `PRAGMA key` handshake using [`keys::get_or_create_db_key`], which would
+    /// otherwise hit the OS keyring. Tests must not depend on the keyring, so we
+    /// pin a fixed key via the `SAFFEV_DB_KEY` env override exactly once,
+    /// process-wide, before any `Store::open`. Idempotent and parallel-safe (the
+    /// value never changes once set, so a benign race just writes the same key).
+    fn ensure_test_db_key() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if std::env::var(keys::DB_KEY_ENV)
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+            {
+                std::env::set_var(keys::DB_KEY_ENV, "test-db-key-0123456789abcdef");
+            }
+        });
+    }
+
     fn tmp_db() -> std::path::PathBuf {
+        ensure_test_db_key();
         let mut p = std::env::temp_dir();
         p.push(format!("saffev-store-test-{}.db", uuid::Uuid::new_v4()));
         p
@@ -1342,6 +1372,110 @@ mod tests {
         assert!(store.payload("old").await.unwrap().is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Encryption-at-rest proof (only meaningful with the `sqlcipher` feature,
+    /// which is the default): a known plaintext secret written through the store
+    /// must NOT appear in any on-disk byte (main DB + WAL/SHM sidecars), and
+    /// opening the same file with a wrong or empty key must fail.
+    #[cfg(feature = "sqlcipher")]
+    #[tokio::test]
+    async fn data_is_encrypted_at_rest_and_wrong_key_fails() {
+        const SECRET: &str = "topsecret@example.com";
+
+        let path = tmp_db();
+        {
+            let store = Store::open(&path).await.unwrap();
+            // Persist the secret as raw payload text so it would land on disk
+            // verbatim if the file were not encrypted.
+            store.enqueue(WriteOp::Request(req("r1", 1000)));
+            store.enqueue(WriteOp::Payload(Payload {
+                request_id: "r1".into(),
+                prompt: Some(format!("please email {SECRET} now")),
+                response: Some(SECRET.into()),
+            }));
+            store.flush().await.unwrap();
+
+            // Force everything out of the WAL into the main DB file so we also
+            // exercise the encrypted main-file path (sidecars are checked too).
+            let p = path.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = open_connection(&p).unwrap();
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        // Scan the main DB file and any -wal/-shm sidecars: the plaintext secret
+        // must not appear anywhere on disk.
+        let secret_bytes = SECRET.as_bytes();
+        let mut scanned_any = false;
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = if suffix.is_empty() {
+                path.clone()
+            } else {
+                let mut s = path.as_os_str().to_os_string();
+                s.push(suffix);
+                std::path::PathBuf::from(s)
+            };
+            if let Ok(raw) = std::fs::read(&candidate) {
+                scanned_any = true;
+                assert!(
+                    !contains_subslice(&raw, secret_bytes),
+                    "plaintext secret leaked into {} ({} bytes)",
+                    candidate.display(),
+                    raw.len()
+                );
+            }
+        }
+        assert!(scanned_any, "expected at least the main DB file to exist");
+
+        // Sanity: the file is non-trivial (it really has our data, encrypted).
+        let main_len = std::fs::metadata(&path).unwrap().len();
+        assert!(main_len > 0, "DB file should be non-empty");
+
+        // Opening with a WRONG key must fail (decryption error on first read).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", "the-wrong-key-deadbeef")
+                .unwrap();
+            let res = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            });
+            assert!(res.is_err(), "wrong key must not decrypt the database");
+        }
+
+        // Opening with an EMPTY key (i.e. treating it as plain SQLite) must fail
+        // to read the encrypted header.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let res = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            });
+            assert!(res.is_err(), "no key must not read the encrypted database");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+        let mut shm = path.as_os_str().to_os_string();
+        shm.push("-shm");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
+    }
+
+    /// Naive substring search over raw bytes (no `str` assumptions — the DB file
+    /// is binary).
+    #[cfg(feature = "sqlcipher")]
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[test]
