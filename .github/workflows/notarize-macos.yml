@@ -33,13 +33,13 @@ on:
         required: true
         type: string
     secrets:
-      # App Store Connect API key path: the robust, non-interactive credential
-      # set for notarytool. All three are required together.
-      APPLE_API_KEY_ID:
+      # Apple-ID notarytool auth (what the maintainer provisioned). All three are
+      # required together; passed via `secrets: inherit` from the release workflow.
+      APPLE_ID:
         required: false
-      APPLE_API_ISSUER_ID:
+      APPLE_APP_PASSWORD:
         required: false
-      APPLE_API_KEY_P8:
+      APPLE_TEAM_ID:
         required: false
 
 jobs:
@@ -49,20 +49,20 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ inputs.plan }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - name: Check for notarization credentials
         id: creds
         shell: bash
         run: |
-          if [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER_ID:-}" ] && [ -n "${APPLE_API_KEY_P8:-}" ]; then
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
             echo "have_creds=true" >> "$GITHUB_OUTPUT"
-            echo "Apple App Store Connect API credentials present — will notarize."
+            echo "Apple-ID notarization credentials present — will notarize."
           else
             echo "have_creds=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Notarization skipped::Apple notarization secrets are not set (APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8). Skipping notarization. See README 'Releasing / macOS signing'."
+            echo "::notice title=Notarization skipped::Apple notarization secrets are not set (APPLE_ID / APPLE_APP_PASSWORD / APPLE_TEAM_ID). Skipping notarization. See README 'Releasing / macOS signing'."
           fi
 
       - name: Resolve release tag + macOS archive names from plan
@@ -91,22 +91,6 @@ jobs:
             echo "$NAMES"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Write App Store Connect API key
-        if: steps.creds.outputs.have_creds == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          KEYDIR="$RUNNER_TEMP/asc"
-          mkdir -p "$KEYDIR"
-          # The secret may be raw .p8 PEM, or base64 of the .p8 — accept either.
-          if printf '%s' "$APPLE_API_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
-            printf '%s' "$APPLE_API_KEY_P8" > "$KEYDIR/key.p8"
-          else
-            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEYDIR/key.p8"
-          fi
-          echo "ASC_KEY_PATH=$KEYDIR/key.p8" >> "$GITHUB_ENV"
 
       - name: Download, zip, and notarize each macOS archive
         if: steps.creds.outputs.have_creds == 'true'
@@ -170,9 +154,9 @@ jobs:
             # Submit and wait. This registers a notarization ticket with Apple;
             # it does NOT modify our published archive. Gatekeeper verifies online.
             xcrun notarytool submit "$zip" \
-              --key "$ASC_KEY_PATH" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
               --wait \
               --timeout 30m
           done

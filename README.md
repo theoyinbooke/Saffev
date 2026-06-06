@@ -443,17 +443,18 @@ last three are set.
 | `CODESIGN_CERTIFICATE` | Your **Developer ID Application** certificate exported from Keychain Access as a `.p12`, then base64-encoded: `base64 -i DeveloperID.p12 \| pbcopy`. Paste the base64 string. |
 | `CODESIGN_CERTIFICATE_PASSWORD` | The password you set when exporting the `.p12`. |
 | `CODESIGN_IDENTITY` | The signing identity string, e.g. `Developer ID Application: Your Name (TEAMID)`. Find it with `security find-identity -v -p codesigning`. |
-| `APPLE_API_KEY_ID` | App Store Connect **API key ID** (the `Key ID` column). Create the key at App Store Connect → Users and Access → Integrations → App Store Connect API, with the **Developer** role (sufficient for notarization). |
-| `APPLE_API_ISSUER_ID` | The **Issuer ID** shown above the keys list on that same page (one per team). |
-| `APPLE_API_KEY_P8` | The downloaded `AuthKey_<KEYID>.p8` (downloadable **once**). Paste its contents directly, or base64-encode it — the workflow accepts either. |
+| `APPLE_ID` | Your Apple Developer account email (the Apple ID used for notarization). |
+| `APPLE_APP_PASSWORD` | An **app-specific password** for that Apple ID — appleid.apple.com → Sign-In & Security → App-Specific Passwords. |
+| `APPLE_TEAM_ID` | Your 10-character Apple Developer **Team ID** (developer.apple.com → Membership). |
 
 Notes:
 
 - Export the `.p12` with the **private key** included (select both the cert and
   its key in Keychain Access before exporting), or `codesign` can't use it.
-- The App Store Connect API key is preferred over an Apple-ID + app-specific
-  password because it is non-interactive and not tied to a personal account; the
-  notarization job is written to read the API-key triple.
+- Notarization authenticates with your Apple ID + an app-specific password +
+  Team ID (`notarytool --apple-id --password --team-id`). An App Store Connect
+  API key is a more robust alternative (not tied to a personal account) — switch
+  by editing `.github/workflows/notarize-macos.yml` if you prefer it later.
 - After adding the secrets, the next tagged release signs + notarizes
   automatically. Verify a downloaded build with
   `codesign --verify --strict --verbose=2 ./saffev` and
