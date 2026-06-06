@@ -72,6 +72,11 @@
       <!-- Connection banner (token / fetch errors) -->
       <div class="banner" id="banner" hidden></div>
 
+      <!-- Update banner (in-app auto-update). Populated by app.js after a
+           GET /api/update on load. Contacts GitHub release metadata only —
+           nothing about the user leaves the device. -->
+      <div class="upbanner" id="updateBanner" hidden></div>
+
       <!-- View root — pages render here -->
       <section id="view"></section>
     </main>

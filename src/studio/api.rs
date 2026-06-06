@@ -466,6 +466,71 @@ pub async fn exposure(
     Ok(Json(report))
 }
 
+/// `GET /api/update`
+///
+/// Reports the current vs latest released version + whether an update is
+/// available. **Fail-soft**: any network error degrades to `updateAvailable =
+/// false` with a null `latestVersion` (the SPA then just shows no banner). Safe
+/// to call on every Studio load.
+///
+/// PRIVACY: this is the ONE outbound call the Studio makes besides the local
+/// engine, and it contacts **GitHub release metadata only** — it sends no user
+/// or content data. Consistent with the on-device / no-telemetry invariant. The
+/// `_state` is unused (the check needs no store/config) but kept for a uniform
+/// handler signature + future auth context.
+pub async fn update_get(State(_state): State<StudioState>) -> Json<dto::UpdateStatus> {
+    let status = crate::update::check().await;
+    Json(dto::UpdateStatus {
+        current_version: status.current_version,
+        latest_version: status.latest_version,
+        update_available: status.available,
+    })
+}
+
+/// `POST /api/update`
+///
+/// Applies an available update via the shipped installer and reports the result.
+/// The no-receipt case (a dev / `cargo install` binary) is **not** a 500 — it is
+/// a 200 with `updated = false` and a clear guidance message, so the SPA can tell
+/// the user how to enable updates without treating it as an error. A genuine
+/// apply failure (download/installer) maps to a 500 envelope.
+///
+/// PRIVACY: contacts GitHub release metadata + the installer asset only.
+pub async fn update_post(
+    State(_state): State<StudioState>,
+) -> Result<Json<dto::UpdateResult>, Response> {
+    match crate::update::apply().await {
+        Ok(outcome) => {
+            let message = if outcome.updated {
+                format!(
+                    "v{} installed — restart Saffev to run the new version",
+                    outcome.new_version
+                )
+            } else {
+                format!("already on the latest version (v{})", outcome.new_version)
+            };
+            Ok(Json(dto::UpdateResult {
+                updated: outcome.updated,
+                new_version: outcome.new_version,
+                message,
+            }))
+        }
+        // No install receipt (dev build): a 200 with guidance, NOT an error —
+        // the UI shows "use the installer" rather than a failure toast.
+        Err(crate::update::UpdateError::NoReceipt(msg)) => Ok(Json(dto::UpdateResult {
+            updated: false,
+            new_version: crate::update::CURRENT_VERSION.to_string(),
+            message: msg,
+        })),
+        // A real apply failure — surface it as a 500 envelope.
+        Err(crate::update::UpdateError::Failed(msg)) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_failed",
+            &msg,
+        )),
+    }
+}
+
 /// `GET /api/settings`
 ///
 /// Reads the **live** config snapshot (`state.config.load()`), so it reflects any

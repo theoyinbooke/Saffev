@@ -78,6 +78,22 @@ a{color:inherit}
 .banner .grow{flex:1}
 .banner a,.banner button.link{color:inherit;text-decoration:underline;cursor:pointer;background:none;border:none;font:inherit}
 
+/* ---------- update banner (on-brand, Calm Instrument) ---------- */
+/* A quiet, brand-tinted strip — not an alarm. Shown only when a newer release
+   is available; carries the version delta + a single primary Update action. */
+.upbanner{
+  display:flex;align-items:center;gap:12px;margin-bottom:18px;padding:12px 15px;
+  border-radius:var(--r-md);font-size:.85rem;font-weight:600;
+  background:var(--brand-soft);color:var(--brand);
+  border:1px solid color-mix(in srgb,var(--brand) 26%, transparent);
+}
+.upbanner svg{width:18px;height:18px;flex:none}
+.upbanner .grow{flex:1}
+.upbanner .ver{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-weight:700}
+.upbanner .arr{opacity:.6;margin:0 2px}
+.upbanner .btn{flex:none;min-height:36px;padding:7px 16px}
+.upbanner .msg{font-weight:600;opacity:.92}
+
 /* ---------- cards ---------- */
 .grid{display:grid;gap:16px}
 .kpis{grid-template-columns:repeat(4,1fr);margin-bottom:16px}

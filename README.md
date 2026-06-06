@@ -24,6 +24,17 @@ self-contained — SQLCipher is bundled, so there are no other dependencies. Re-
 the same command to update. (Prebuilt targets: macOS arm64 + x86_64, Linux
 x86_64. Build from source for others — see **Build / run / test**.)
 
+**Updating in place.** Installer installs can update themselves: run `saffev
+update` (or `saffev update --check` to just look), or click **Update** in the
+Studio banner when a newer release is out. Both apply the same installer in
+place. **Privacy:** the update check contacts **GitHub release metadata only**
+(the latest version number + the installer script) — it sends **no** user or
+content data, nothing about what you run through Saffev. This is the one
+deliberate outbound call besides the local engine, and it is consistent with the
+on-device invariant below. (A dev / `cargo install` build has no install receipt,
+so it can't self-update — it reports the current version and points you at the
+installer instead, never erroring.)
+
 > **macOS, first run:** the binary is not yet code-signed, so Gatekeeper may say
 > it "cannot be verified". Allow it once via **System Settings → Privacy &
 > Security → Open Anyway**, or `xattr -d com.apple.quarantine "$(which saffev)"`.
@@ -68,8 +79,11 @@ front of your inference path:
 - **Privacy true by default.** The database stores **metadata only**; raw
   prompt/response text is written only behind an explicit, logged opt-in
   (`payload_storage`). Detected PII is **hashed**, never stored raw.
-- **Nothing leaves the device.** The only outbound network call is to the local
-  engine on loopback.
+- **Nothing leaves the device.** The only outbound network calls are to the local
+  engine on loopback and — only when you ask for it (or on Studio load) — an
+  anonymous check of **GitHub release metadata** for the in-app updater. That
+  check sends nothing about you or your traffic; it just asks "what's the latest
+  version?" See **Updating in place** above.
 - **Observe by default.** Traffic is never mutated unless you explicitly opt in
   to PII masking *and* leave dry-run. Masking is fail-open: any error forwards the
   original request untouched.
@@ -180,6 +194,8 @@ cargo test               # 207 unit tests across all modules
 ./target/debug/saffev start --foreground # run attached (Ctrl-C to stop)
 ./target/debug/saffev stop              # graceful SIGTERM, drain, remove PID file
 ./target/debug/saffev logs -f           # stream recorded activity
+./target/debug/saffev update            # check + install a newer release (installer installs only)
+./target/debug/saffev update --check    # just report whether one is available
 ```
 
 `saffev start` re-execs a detached `--foreground` copy of itself, writes a PID
@@ -254,7 +270,7 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 
 | Module            | Responsibility |
 |-------------------|----------------|
-| `main.rs` / `cli` | Entry point; `clap` CLI: `adopt status start stop doctor revert logs`. Handlers wire config → store → engine → proxy → studio, rendered with the calm status-dot palette. |
+| `main.rs` / `cli` | Entry point; `clap` CLI: `adopt status start stop doctor revert logs update`. Handlers wire config → store → engine → proxy → studio, rendered with the calm status-dot palette. |
 | `config`          | The single TOML config: load/save/validate, per-OS data dir, ports, mode, privacy + retention. |
 | `proxy`           | The transparent reverse-proxy spine. `proxy/handlers.rs` mirrors `/api/*` (NDJSON) + `/v1/*` (SSE) with a verbatim catch-all; `proxy/upstream.rs` is the streaming forwarder + tee; `proxy/mod.rs` runs the async logger that assembles records, scans PII, and enqueues writes off the request path. |
 | `store`           | Encrypted-capable SQLite, **single-writer** model (one thread owns the connection; WAL; readers concurrent). Metadata/payload split. `store/schema.rs` owns migrations. `store::keys` manages keyring secrets (DB key + per-install Studio token). |
@@ -262,6 +278,7 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 | `engine`          | The only per-OS code. `engine/detect.rs` finds running engines; `engine/cooperative.rs` is the everywhere-impl (no system changes); `engine/systemd.rs` is Linux-only reversible Gateway adoption; `engine/adopt.rs` orchestrates detect → adopt → journal; `engine/supervise.rs` supervises a Gateway-managed engine with handover policy. |
 | `studio`          | The local web UI server. `studio/assets.rs` serves the `rust-embed`'d SPA (`studio-web/`); `studio/api.rs` is the JSON API + SSE stream; `studio/auth.rs` enforces bearer-token + Host allowlist + CORS on `/api/*`; `studio/dto.rs` is the wire contract. |
 | `exposure`        | The "is your engine exposed to the network?" doctor (the acquisition hook). |
+| `update`          | In-app auto-update over `axoupdater`: reads the cargo-dist install receipt, queries the latest GitHub release, applies it via the shipped installer. Powers `saffev update` + the Studio `/api/update` routes. **Contacts GitHub release metadata only — no user/content data leaves the device.** No-receipt (dev) builds degrade gracefully, never panic. |
 | `attribution`     | Source-app attribution (PID lookup → header fallback), computed off the tee. |
 | `tokens`          | Token/usage accounting: trust engine `usage` (exact) else estimate off-path (`~`). |
 | `ui`              | The CLI palette (status dots, alignment, color detection). |

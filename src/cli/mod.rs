@@ -1,6 +1,6 @@
 //! CLI surface (04 §7.7) — mirrors `lms`/`ollama` ergonomics.
 //!
-//! `saffev adopt | status | start | stop | doctor | revert | logs`. Parsing is
+//! `saffev adopt | status | start | stop | doctor | revert | logs | update`. Parsing is
 //! `clap` derive; each subcommand dispatches to a thin handler in [`commands`].
 //! Output uses [`crate::ui::palette`] for the calm, status-dot-prefixed voice.
 
@@ -81,6 +81,17 @@ pub enum Command {
         #[arg(long, short)]
         follow: bool,
     },
+    /// Check for and install a newer Saffev release (installer installs only).
+    ///
+    /// Contacts GitHub release metadata ONLY — no user or content data leaves the
+    /// device (consistent with the on-device invariant). A binary not installed
+    /// via the installer (dev / `cargo install`) has no receipt: the command
+    /// reports the current version and how to enable updates, never panics.
+    Update {
+        /// Only check whether an update is available; do not install it.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// Parse argv and dispatch to the matching command handler.
@@ -102,5 +113,6 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Doctor => commands::doctor(&cli).await,
         Command::Revert { engine } => commands::revert(&cli, engine).await,
         Command::Logs { follow } => commands::logs(&cli, follow).await,
+        Command::Update { check } => commands::update(&cli, check).await,
     }
 }

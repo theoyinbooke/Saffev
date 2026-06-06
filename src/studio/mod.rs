@@ -25,6 +25,8 @@
 //! | GET    | `/api/exposure`     | —                        | [`crate::exposure::ExposureReport`] |
 //! | GET    | `/api/settings`     | —                        | [`dto::SettingsView`]         |
 //! | PUT    | `/api/settings`     | [`dto::SettingsUpdate`]  | [`dto::SettingsView`]         |
+//! | GET    | `/api/update`       | —                        | [`dto::UpdateStatus`]         |
+//! | POST   | `/api/update`       | —                        | [`dto::UpdateResult`]         |
 //! | GET    | `/api/stream`       | — (SSE)                  | `text/event-stream` of [`dto::StreamEvent`] |
 //!
 //! Errors use [`dto::ApiError`] with the appropriate HTTP status (401 missing/
@@ -98,6 +100,11 @@ impl StudioServer {
             .route("/engines/revert", post(api::engines_revert))
             .route("/exposure", get(api::exposure))
             .route("/settings", get(api::settings_get).put(api::settings_put))
+            // In-app auto-update. GET is fail-soft (contacts GitHub release
+            // metadata only — no user/content data leaves the device). POST
+            // applies via the shipped installer (axoupdater). Token-gated like
+            // every other control route by the layers below.
+            .route("/update", get(api::update_get).post(api::update_post))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
             // Host checked first (cheapest reject), then token, then CORS

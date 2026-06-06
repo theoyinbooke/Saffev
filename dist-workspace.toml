@@ -15,3 +15,9 @@ installers = ["shell"]
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path-style install: drop the binary on PATH (no extra prompts).
 install-path = "CARGO_HOME"
+# Write the install receipt the in-app updater (axoupdater) reads to find the
+# current install + its release source, and ship a standalone updater alongside
+# the binary. This is what powers `saffev update` and the Studio "Update" button.
+# PRIVACY: the receipt is a local file; the updater only ever contacts GitHub
+# release metadata — no user/content data ever leaves the device.
+install-updater = true

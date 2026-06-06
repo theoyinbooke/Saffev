@@ -62,6 +62,15 @@ mime_guess = "2.0"
 # --- cli ---
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# --- in-app auto-update ---
+# Reads the cargo-dist install receipt (written when `install-updater = true`,
+# see dist-workspace.toml), queries the latest GitHub release for this repo, and
+# applies the update by re-running the shipped installer. PRIVACY: the ONLY thing
+# this ever contacts is GitHub release metadata + the installer asset — it sends
+# no user or content data, consistent with the on-device invariant. Used by the
+# `saffev update` CLI and the Studio `/api/update` routes (see src/update.rs).
+axoupdater = "0.10"
+
 # --- misc / cross-cutting ---
 # Lock-free, atomically-swappable Arc — the live-reloadable config handle shared
 # by the proxy + Studio so Settings changes apply without a restart. `.load()` is

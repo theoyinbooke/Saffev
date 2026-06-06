@@ -39,6 +39,7 @@ pub mod store;
 pub mod studio;
 pub mod tokens;
 pub mod ui;
+pub mod update;
 
 pub use error::{Error, Result};
 

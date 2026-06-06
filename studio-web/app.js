@@ -16,6 +16,8 @@
      GET  /api/exposure -> ExposureReport
      GET  /api/settings -> SettingsView
      PUT  /api/settings { mode?, payloadStorage?, retention?, handover?, maskingEnabled?, maskingDryRun? } -> SettingsView
+     GET  /api/update   -> { currentVersion, latestVersion, updateAvailable }  (GitHub release metadata only — nothing about the user leaves the device)
+     POST /api/update   -> { updated, newVersion, message }
      GET  /api/stream   SSE of StreamEvent (tagged by `type`)
 
    Every /api/* call needs `Authorization: Bearer <install-token>` + an
@@ -160,6 +162,7 @@
     restart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v5h-5"/></svg>',
     revert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 1 3 6.7M3 20v-5h5"/></svg>',
     alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 9v4M12 17h.01"/></svg>',
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 4 5-4M5 20h14"/></svg>',
   };
   function piiIcon(kind) {
     return { email: ICON.mail, api_key: ICON.key, credit_card: ICON.card, phone: ICON.phone, ip_address: ICON.globe }[kind] || ICON.shieldAlert;
@@ -207,6 +210,98 @@
     b.hidden = false;
   }
   function hideBanner() { const b = $('#banner'); if (b) b.hidden = true; }
+
+  /* -------------------------------------------------------------------------
+     Update banner (in-app auto-update).
+
+     On load we GET /api/update; if an update is available we render a quiet,
+     on-brand strip ("Update available — vX → vY  [Update]"). The Update button
+     POSTs /api/update, shows progress, and on success tells the user the new
+     version is installed and to restart Saffev.
+
+     PRIVACY: GET /api/update contacts GitHub release metadata only — nothing
+     about the user leaves the device (the on-device invariant). It is fail-soft:
+     any error simply leaves the banner hidden.
+     ------------------------------------------------------------------------- */
+  async function checkForUpdate() {
+    const b = $('#updateBanner');
+    if (!b) return;
+    let st;
+    try {
+      st = await api('/update'); // { currentVersion, latestVersion, updateAvailable }
+    } catch (e) {
+      // Fail-soft: never surface the update check as an error (it's optional).
+      return;
+    }
+    if (!st || !st.updateAvailable || !st.latestVersion) { b.hidden = true; return; }
+    renderUpdateAvailable(b, st);
+  }
+
+  function renderUpdateAvailable(b, st) {
+    b.innerHTML = '';
+    b.className = 'upbanner';
+    b.hidden = false;
+    const txt = el('span', { class: 'grow' });
+    txt.appendChild(document.createTextNode('Update available — '));
+    txt.appendChild(el('span', { class: 'ver', text: 'v' + st.currentVersion }));
+    txt.appendChild(el('span', { class: 'arr', text: '→' }));
+    txt.appendChild(el('span', { class: 'ver', text: 'v' + st.latestVersion }));
+    const btn = el('button', { class: 'btn primary', html: ICON.download + '<span>Update</span>' });
+    btn.addEventListener('click', () => applyUpdate(b, btn));
+    b.appendChild(el('span', { html: ICON.download }));
+    b.appendChild(txt);
+    b.appendChild(btn);
+  }
+
+  async function applyUpdate(b, btn) {
+    setBusy(btn, true);
+    // Replace the version delta with a calm progress note while it runs.
+    let note = b.querySelector('.grow');
+    if (note) { note.className = 'grow msg'; note.textContent = 'Downloading and installing…'; }
+    let res;
+    try {
+      res = await api('/update', { method: 'POST' }); // { updated, newVersion, message }
+    } catch (e) {
+      setBusy(btn, false);
+      if (note) { note.className = 'grow msg'; note.textContent = (e && e.message) ? ('Update failed: ' + e.message) : 'Update failed.'; }
+      b.className = 'banner danger';
+      return;
+    }
+    // Success (or graceful no-op / no-receipt guidance): show the message and
+    // swap the Update button for a Restart hint when an install actually ran.
+    renderUpdateDone(b, res);
+  }
+
+  function renderUpdateDone(b, res) {
+    b.innerHTML = '';
+    b.className = 'upbanner';
+    b.hidden = false;
+    b.appendChild(el('span', { html: res && res.updated ? ICON.check : ICON.alert }));
+    const msg = el('span', { class: 'grow msg', text: (res && res.message) || 'Update complete.' });
+    b.appendChild(msg);
+    if (res && res.updated) {
+      // Offer a restart of the running daemon: a tasteful, single primary action.
+      const btn = el('button', { class: 'btn primary', html: ICON.restart + '<span>Restart Saffev</span>' });
+      btn.addEventListener('click', () => restartAfterUpdate(b, btn));
+      b.appendChild(btn);
+    }
+  }
+
+  async function restartAfterUpdate(b, btn) {
+    // We cannot restart the daemon from the browser (no such endpoint by design),
+    // so we guide the user with the exact CLI. Keep it calm + on-brand.
+    setBusy(btn, true);
+    const note = b.querySelector('.grow');
+    if (note) {
+      note.textContent = '';
+      note.appendChild(document.createTextNode('Run '));
+      note.appendChild(el('span', { class: 'ver', text: BRAND.command + ' stop && ' + BRAND.command + ' start' }));
+      note.appendChild(document.createTextNode(' to run the new version.'));
+    }
+    setBusy(btn, false);
+    btn.remove();
+  }
+
   function handleApiError(e) {
     if (e && e.status === 401) {
       showBanner('Not authorized — the Studio token is missing or invalid. Run `' + BRAND.command + ' status` for the local URL with a token, or open Settings.', 'danger');
@@ -1176,6 +1271,10 @@
     // Surface a friendly hint if no token is present at all.
     if (!TOKEN) {
       showBanner('No Studio token found. The desktop app opens with one automatically; if you opened this URL by hand, append ?token=<your-install-token>.', 'danger');
+    } else {
+      // Auto-check for a newer release (GitHub release metadata only — nothing
+      // about the user leaves the device). Fail-soft: never blocks the UI.
+      checkForUpdate();
     }
   }
 

@@ -305,6 +305,36 @@ pub enum StreamEvent {
     },
 }
 
+/// `GET /api/update` — in-app update availability.
+///
+/// PRIVACY: producing this contacts GitHub release metadata ONLY — no user or
+/// content data leaves the device (the on-device invariant). Fail-soft: on any
+/// network error `latestVersion` is null and `updateAvailable` is false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    /// The version this Studio's binary currently is (`CARGO_PKG_VERSION`).
+    pub current_version: String,
+    /// The latest released version, or null if it couldn't be determined
+    /// (offline / no release / not installed via the installer).
+    pub latest_version: Option<String>,
+    /// Whether a newer release than `currentVersion` is available. Always false
+    /// when `latestVersion` is null (never claim an update we can't confirm).
+    pub update_available: bool,
+}
+
+/// `POST /api/update` — result of applying an update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateResult {
+    /// Whether an update was actually installed (false = already current).
+    pub updated: bool,
+    /// The version now installed (or current, if already up to date).
+    pub new_version: String,
+    /// A human-readable note for the UI to display (success or guidance).
+    pub message: String,
+}
+
 /// Uniform error envelope for any failed `/api/*` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

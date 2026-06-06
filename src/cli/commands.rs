@@ -1436,6 +1436,145 @@ fn format_clock(ts_millis: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// update — in-app auto-update (axoupdater)
+// ---------------------------------------------------------------------------
+
+/// `saffev update` — check for and install a newer release.
+///
+/// Drives [`crate::update`], which reads the cargo-dist install receipt, queries
+/// the latest GitHub release, and (re-)runs the shipped installer. With `--check`
+/// it only reports availability.
+///
+/// PRIVACY: this contacts GitHub release metadata ONLY — no user or content data
+/// leaves the device, consistent with the on-device invariant.
+///
+/// NO-RECEIPT (dev / `cargo install` builds): we print the current version and a
+/// clear message that updates are available for installs done via the installer.
+/// We never panic — the check is wrapped in [`guard_infallible`] for belt-and-
+/// braces isolation, and the apply path returns a typed error we render calmly.
+pub async fn update(cli: &Cli, check_only: bool) -> Result<()> {
+    let p = painter(cli);
+
+    println!(
+        "{} {}",
+        p.prompt("~"),
+        p.value(if check_only {
+            "saffev update --check"
+        } else {
+            "saffev update"
+        })
+    );
+
+    // The check is fail-soft and never errors; still isolate it on a task so an
+    // unexpected panic in a dependency can never abort the command.
+    let status = guard_infallible("update check", crate::update::check())
+        .await
+        .unwrap_or_else(|| crate::update::UpdateStatus {
+            current_version: crate::update::CURRENT_VERSION.to_string(),
+            latest_version: None,
+            available: false,
+        });
+
+    println!(
+        "{} {} {}",
+        p.dot(Level::Ok),
+        p.label("current"),
+        p.value(&format!("v{}", status.current_version)),
+    );
+
+    match (&status.latest_version, status.available) {
+        // A newer release exists.
+        (Some(latest), true) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("latest"),
+                p.warn(&format!("v{latest} available")),
+            );
+            if check_only {
+                println!(
+                    "{} run {} to install",
+                    p.muted("·"),
+                    p.value("saffev update"),
+                );
+                return Ok(());
+            }
+            apply_update(&p, &status.current_version).await;
+        }
+        // Up to date (latest known and equal/older).
+        (Some(latest), false) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("latest"),
+                p.success(&format!("v{latest} — up to date")),
+            );
+        }
+        // Couldn't determine the latest version (offline / no release / etc.).
+        (None, _) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("latest"),
+                p.warn("couldn't check (offline or no release found)"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply an available update, rendering progress + the no-receipt guidance.
+/// Never panics: the typed [`crate::update::UpdateError`] is matched and printed.
+async fn apply_update(p: &Painter, current: &str) {
+    println!("{} {}", p.muted("·"), p.muted("downloading + installing…"));
+
+    match crate::update::apply().await {
+        Ok(outcome) if outcome.updated => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("updated"),
+                p.success(&format!("v{current} → v{} installed", outcome.new_version)),
+            );
+            println!(
+                "{} restart Saffev to run the new version ({})",
+                p.muted("·"),
+                p.value("saffev stop && saffev start"),
+            );
+        }
+        // Apply ran but found nothing to do (raced with the check, or already
+        // current). Report calmly rather than implying a failure.
+        Ok(outcome) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("update"),
+                p.success(&format!("already on v{}", outcome.new_version)),
+            );
+        }
+        // Dev / cargo-install build: no receipt. Friendly guidance, never a crash.
+        Err(crate::update::UpdateError::NoReceipt(msg)) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("update"),
+                p.warn(&msg),
+            );
+        }
+        // A genuine apply failure — surface it (the operator asked to update).
+        Err(crate::update::UpdateError::Failed(msg)) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("update"),
+                p.error(&format!("update failed: {msg}")),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // small shared bits
 // ---------------------------------------------------------------------------
 
