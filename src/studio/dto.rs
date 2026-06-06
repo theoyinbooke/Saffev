@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::brain::{Confidence, PiiKind, Side};
 use crate::config::{HandoverPolicy, Mode, Retention};
-use crate::store::{AdoptionState, SourceConfidence, TokenSource};
+use crate::store::{AdoptionState, PiiAction, SourceConfidence, TokenSource};
 
 /// `GET /api/health` — liveness + identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +108,10 @@ pub struct PiiFindingView {
     pub end: usize,
     /// Confidence.
     pub confidence: Confidence,
+    /// What masking did with this span: `observed` (logged only), `would_mask`
+    /// (dry-run preview, traffic unchanged), or `masked` (redacted before
+    /// forwarding). Lets the Studio/Privacy view show the masking outcome (§7.6).
+    pub action: PiiAction,
 }
 
 /// `GET /api/history/:id` — full detail for one exchange.

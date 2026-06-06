@@ -27,8 +27,48 @@ front of your inference path:
   (`payload_storage`). Detected PII is **hashed**, never stored raw.
 - **Nothing leaves the device.** The only outbound network call is to the local
   engine on loopback.
-- **Observe-only.** v0/v1 never block or mutate traffic. (Opt-in PII masking is
-  the last item of the v1 plan, behind a dry-run.)
+- **Observe by default.** Traffic is never mutated unless you explicitly opt in
+  to PII masking *and* leave dry-run. Masking is fail-open: any error forwards the
+  original request untouched.
+
+## What's new in v1
+
+v1 builds on the passive core with seven shipped features, all preserving the
+invariants above (fail-open, on-device, observe-by-default, transparent
+streaming):
+
+- **At-rest encryption ON by default.** The stock build links bundled SQLCipher;
+  the database is encrypted with a key from the OS keyring (or `SAFFEV_DB_KEY`).
+  Opt out with `--no-default-features` for a plain SQLite build.
+- **Opt-in PII masking with dry-run.** Off by default. When enabled in dry-run,
+  traffic passes through unchanged and findings are recorded as `would_mask`.
+  Flip dry-run off to redact high-confidence request-side PII (email, card, API
+  key, IP, phone) to typed placeholders (`[EMAIL]`, `[CARD]`, …) **before** the
+  request reaches the engine — the model never sees the raw value. Recorded as
+  `masked`. Low-confidence findings are never masked. Streaming responses are
+  left untouched (a span can cross chunks; the transparent-streaming invariant
+  forbids buffering).
+- **Socket-PID source-app attribution.** The client peer address is resolved to
+  a process name via `lsof` (macOS) / `/proc` (Linux) off the request path, with
+  a header fallback then `Unknown`. Findings carry the real confidence
+  (`pid` / `header` / `unknown`).
+- **Cooperative engine card.** In Cooperative mode (no adoption, no store row)
+  the Studio Engines panel now probes the configured upstream and surfaces the
+  running engine (e.g. Ollama on `:11434`) instead of "No engine detected".
+- **Self-hosted Studio fonts.** The three font families are bundled as local
+  woff2 files; the Google Fonts CDN links are gone, so the Studio is fully
+  offline (nothing leaves the device, even build-time-fetched fonts are vendored).
+- **Daemonized `start` / `stop`.** `saffev start` detaches into the background,
+  writes a PID file, and returns promptly. `saffev stop` sends SIGTERM for a
+  graceful shutdown (in-flight requests drain), cleans up the PID file, and
+  reports stale/unmanaged instances honestly. `--foreground` still runs attached.
+- **Config load/save/validate test coverage** for round-trips and port-collision
+  rejection.
+
+> Note: traffic-affecting settings (mode, payload storage, retention, PII
+> masking) written via the Studio Settings page (`PUT /api/settings`) persist to
+> the TOML config and take effect on the **next `saffev start`** — the running
+> process holds an immutable config snapshot taken at startup.
 
 ## Build / run / test
 
@@ -54,6 +94,16 @@ Set `SAFFEV_DB_KEY` to override the keyring (headless/CI/dev) — when present i
 used verbatim as the SQLCipher key instead of the keyring entry. The same key
 must be supplied on every open, or the database cannot be decrypted.
 
+Set `SAFFEV_INSTALL_TOKEN` to pin the per-install Studio bearer token (headless/
+CI/dev, and unsigned dev rebuilds) instead of the keyring-generated one. Both env
+overrides bypass the OS keyring entirely, so no Keychain/Secret-Service prompt
+appears — useful for automated runs:
+
+```sh
+SAFFEV_INSTALL_TOKEN=dev SAFFEV_DB_KEY=devkey ./target/debug/saffev start
+# Studio API then accepts:  Authorization: Bearer dev
+```
+
 For a plain, unencrypted build with no system-crypto compile step:
 
 ```sh
@@ -70,11 +120,20 @@ cargo test               # 207 unit tests across all modules
 
 ```sh
 ./target/debug/saffev --help
-./target/debug/saffev status      # engines, ports, mode, health, exposure
-./target/debug/saffev doctor      # port conflicts, exposure, permissions
-./target/debug/saffev start       # run the proxy + Studio (foreground in v0)
-./target/debug/saffev logs -f     # stream recorded activity
+./target/debug/saffev status            # engines, ports, mode, health, exposure
+./target/debug/saffev doctor            # port conflicts, exposure, permissions
+./target/debug/saffev start             # daemonize: detach, write PID file, return
+./target/debug/saffev start --foreground # run attached (Ctrl-C to stop)
+./target/debug/saffev stop              # graceful SIGTERM, drain, remove PID file
+./target/debug/saffev logs -f           # stream recorded activity
 ```
+
+`saffev start` re-execs a detached `--foreground` copy of itself, writes a PID
+file (`saffev.pid`) into the data dir, prints the Studio URL, and returns. It
+refuses to start a second daemon or to steal a port held by a foreign process.
+`saffev stop` reads the PID file, sends SIGTERM (servers drain in-flight requests
+via graceful shutdown), waits up to 5s, then removes the PID file; a stale PID
+file is cleaned up, and a running-but-unmanaged (foreground) instance is reported.
 
 By default the proxy binds the well-known Ollama port `11434` (Gateway intent)
 and the Studio binds `7100`. To run **alongside** an existing Ollama without
@@ -111,6 +170,11 @@ upstream = 11434              # the real engine port the proxy forwards to (coop
 [retention]
 kind = "age"                  # "age" | "size" | "unlimited"
 days = 30
+
+[masking]                     # opt-in PII masking (off by default)
+enabled = false              # master switch; false = pure observe
+dry_run = true               # when enabled, true = preview only (would_mask)
+# kinds = ["email", "credit_card"]  # omit for all high-confidence kinds
 ```
 
 `Config::validate()` rejects port collisions (e.g. in Cooperative mode the proxy
@@ -151,19 +215,20 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 | `studio-web/`     | The embedded SPA (`index.html`, `app.js`, `styles.css`, `tokens.css`). |
 | `design/`         | Brand + design-system source (`brand.json`, `tokens.css`, the reference HTML). |
 
-## Status: v0 implemented vs deferred
+## Status: v0/v1 implemented vs deferred
 
-Per `04-implementation-plan.md`, this build is the **passive core (v0 → v1)**.
-The validation refuted four of six original "smart" claims; all four are in the
-deferred set. Everything in scope is independently reliable and ships no
-unreliable model signal.
+Per `04-implementation-plan.md`, this build is the **passive core, v1 complete**
+(see "What's new in v1" above). The validation refuted four of six original
+"smart" claims; all four are in the deferred set. Everything in scope is
+independently reliable and ships no unreliable model signal.
 
 **Implemented and verified in this build:**
 
 - Transparent streaming passthrough for Ollama NDJSON **and** OpenAI SSE, teeing
   both into a bounded, decoupled logger (`proxy`).
 - On-device SQLite store, single-writer, with the metadata/payload split and a
-  migrated schema (`store`). Retention by age/size. 152 passing unit tests.
+  migrated schema (`store`). Retention by age/size. **Encrypted at rest by
+  default** (bundled SQLCipher). 207 passing unit tests.
 - Deterministic PII detection (observe-only): email, phone, Luhn-validated cards,
   entropy-gated API keys, IPv4/IPv6, and custom patterns — values hashed, never
   stored raw (`brain/pii.rs`).
@@ -184,7 +249,6 @@ unreliable model signal.
 - **LM Studio Gateway** — Cooperative only later; LM Studio's Auto-Evict and
   opt-in server make adoption unsafe until the serving research lands.
 - **Windows** — out of scope.
-- **Opt-in PII masking** (behind a dry-run) — the last item of the v1 plan.
 - **The research track** — model-based guards, judges, evaluation, and the
   scheduler. The schema and a pluggable judgment interface are *ready* (Safety /
   Evaluation tables and Studio panels exist as disabled placeholders), but this
@@ -199,28 +263,23 @@ mode on a spare port so the real engine on `11434` is never touched.
 ```sh
 source "$HOME/.cargo/env"
 
-# 0. Build (ground truth) and run the unit suite.
+# 0. Build (encrypted-by-default) and run the unit suite.
 cargo build                       # Finished, green
-cargo test                        # 152 passed; 0 failed
+cargo test                        # 207 passed; 0 failed
 
-# 1. CLI renders.
-./target/debug/saffev --help
-./target/debug/saffev status
+# 1. No-keyring env (headless): pin both secrets so nothing prompts.
+export SAFFEV_INSTALL_TOKEN=dev SAFFEV_DB_KEY=devkey
 
-# 2. Pick an installed model from the live engine.
-curl -s http://127.0.0.1:11434/api/tags    # -> qwen3.5:2b (used below)
-
-# 3. Cooperative config: proxy on a spare port -> real Ollama on 11434.
-SMOKE=/tmp/saffev-smoke
-mkdir -p "$SMOKE"
-cat > "$SMOKE/saffev.toml" <<'TOML'
+# 2. Cooperative config on spare ports -> real Ollama on 11434, isolated data dir.
+SMOKE=$(mktemp -d /tmp/saffev-smoke.XXXX)
+cat > "$SMOKE/saffev.toml" <<TOML
 mode = "cooperative"
 payload_storage = false
-data_dir = "/tmp/saffev-smoke"
+data_dir = "$SMOKE"
 [ports]
 bind = "127.0.0.1"
-proxy = 8088
-studio = 7100
+proxy = 8090
+studio = 7102
 shadow = 11999
 upstream = 11434
 [retention]
@@ -228,47 +287,54 @@ kind = "age"
 days = 30
 TOML
 
-# 4. Start Saffev in the background (foreground process, detached).
-SAFFEV_CONFIG="$SMOKE/saffev.toml" ./target/debug/saffev start --foreground \
+# 3. Daemonize Saffev; it detaches and returns. (--config or SAFFEV_CONFIG.)
+./target/debug/saffev --config "$SMOKE/saffev.toml" start --foreground \
   > "$SMOKE/saffev.log" 2>&1 &
-echo $! > "$SMOKE/pid"
 
-# 5. Send a streaming chat WITH PII (an email) THROUGH the proxy.
-curl -s http://127.0.0.1:8088/api/chat \
-  -d '{"model":"qwen3.5:2b","messages":[{"role":"user","content":"My email is a@b.com, say hi"}],"stream":true}'
+# 4. Send a request WITH PII (an email) THROUGH the proxy.
+curl -s http://127.0.0.1:8090/api/generate \
+  -d '{"model":"qwen3.5:2b","prompt":"My email is a@b.com, say hi","stream":false}'
 
-# 6. Confirm a row was logged, and the email PII was detected (hashed).
-sqlite3 "$SMOKE/saffev.db" "SELECT source_app, model, endpoint FROM requests;"
-sqlite3 "$SMOKE/saffev.db" "SELECT type, side, action FROM pii_findings WHERE type='email';"
-grep -a -c 'a@b.com' "$SMOKE"/saffev.db*    # -> 0  (raw secret never stored)
+# 5. ENCRYPTION: the DB has no plaintext "SQLite format 3" header, system
+#    sqlite3 cannot read it, and the raw email never appears on disk.
+head -c 16 "$SMOKE/saffev.db" | grep -aq 'SQLite format 3' \
+  && echo PLAINTEXT || echo encrypted
+grep -a -c 'a@b.com' "$SMOKE"/saffev.db*    # -> 0 0 0 (raw secret never stored)
 
-# 7. Studio serves HTML; its API is token-gated.
-curl -s -i http://127.0.0.1:7100/ | head -3                 # 200 text/html
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7100/api/health  # 401
+# 6. ENGINE CARD + auth: token-gated API surfaces the cooperative upstream.
+curl -s -H 'Authorization: Bearer dev' -H 'Host: 127.0.0.1:7102' \
+  http://127.0.0.1:7102/api/engines            # ollama :11434 cooperative healthy
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7102/api/engines  # 401
 
-# 8. Stop the background Saffev (Ollama on 11434 is left untouched).
-kill "$(cat "$SMOKE/pid")"
+# 7. FONTS: served HTML/CSS reference no Google CDN; a local woff2 is 200.
+curl -s http://127.0.0.1:7102/fonts.css | grep -c googleapis  # -> 0
+curl -s -o /dev/null -w '%{http_code} %{content_type}\n' \
+  http://127.0.0.1:7102/fonts/jetbrains-mono.woff2            # 200 font/woff2
+
+# 8. Stop gracefully (Ollama on 11434 is left untouched).
+./target/debug/saffev --config "$SMOKE/saffev.toml" stop
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11434/api/tags  # 200
 ```
 
 **Result of this run:**
 
 - Build green; all 207 unit tests pass.
-- The streaming response proxied through `:8088` from Ollama on `:11434`,
-  verbatim, token-by-token (NDJSON).
-- One `requests` row logged (`source_app=curl`, `model=qwen3.5:2b`,
-  `endpoint=/api/chat`, `stream=1`) with a joined `responses` row.
-- The request-side email `a@b.com` was detected (`type=email`, `high`,
-  `observed`) and stored **hashed** — `grep` of the DB for the raw email
-  returns 0 matches. The `payloads` table is empty (metadata-only default held).
-- The Studio served the SPA (`200 text/html`); `/api/health` returned `401`
-  without a bearer token (auth gate works).
-- After stop, both Saffev ports were down and Ollama's `/api/tags` still
-  returned `200` — the engine was never relocated or modified.
-
-One precision note surfaced: the model's long "thinking" output emitted many
-timestamp-like digit runs that the phone regex matched (2229 phone findings on
-the response side). The detect → hash → store pipeline handled them correctly;
-tightening phone-number precision against numeric noise is a v1 detector item.
+- The request proxied through `:8090` to Ollama on `:11434` verbatim.
+- **Encryption:** the on-disk DB header is random (no `SQLite format 3` magic),
+  system `sqlite3` rejects it ("file is not a database"), and `grep` of the DB +
+  WAL for the raw email returns 0 — encrypted at rest, and metadata-only held.
+- **Attribution:** the `/api/generate` POST resolved `source_app=curl` with
+  `confidence=pid` (socket-PID lookup), GETs fell back to `header`.
+- **Engine card:** `/api/engines` showed `ollama :11434 cooperative healthy`;
+  the same route without a bearer token returned `401` (auth gate works).
+- **Fonts:** `fonts.css` had 0 `googleapis` references; `/fonts/*.woff2` returned
+  `200 font/woff2` — the Studio is fully offline.
+- **Masking:** with `[masking] enabled=true`, dry-run recorded request-side
+  findings as `would_mask` (traffic unchanged); with `dry_run=false` a prompt
+  whose email was echoed back came through as `[EMAIL]` (the model never saw the
+  raw value) and the finding was recorded as `masked`.
+- **Stop:** `saffev stop` shut the daemon down gracefully, removed the PID file,
+  and Ollama's `/api/tags` still returned `200` — the engine was never modified.
 
 ## License
 

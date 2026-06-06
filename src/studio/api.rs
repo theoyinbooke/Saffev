@@ -96,6 +96,7 @@ fn finding_view(rec: &PiiFindingRecord) -> dto::PiiFindingView {
         start: rec.start_off,
         end: rec.end_off,
         confidence: rec.confidence,
+        action: rec.action,
     }
 }
 
@@ -471,6 +472,13 @@ pub async fn settings_get(
 }
 
 /// `PUT /api/settings`
+///
+/// Note: this write-through persists to the TOML config, but the running proxy
+/// and Studio hold an immutable `Arc<Config>` snapshot taken at startup, so
+/// changes to traffic-affecting toggles (mode, payload storage, retention, and
+/// PII masking) take effect on the **next `saffev start`**, not mid-process. The
+/// returned [`dto::SettingsView`] reflects the just-saved file; a subsequent
+/// `GET /api/settings` reflects the still-running snapshot until restart.
 pub async fn settings_put(
     State(state): State<StudioState>,
     Json(body): Json<dto::SettingsUpdate>,
