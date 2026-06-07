@@ -91,6 +91,53 @@ saffev start --config ~/.config/saffev/saffev.toml
 
 Full details in **Build / run / test** and **Configuration** below.
 
+## Point your apps at Saffev (Cooperative mode)
+
+**This is the step people miss.** In Cooperative mode (the default) Saffev is a
+proxy — it only sees requests **sent to its port**. It does **not** silently
+sniff everything hitting Ollama on `:11434`. So an app that calls Ollama
+*directly* is invisible to Saffev. To trace an app, point its **Ollama base URL
+(or OpenAI base URL) at Saffev's proxy** — Saffev records the call and forwards
+it to your real engine, unchanged:
+
+```text
+your app ──▶ Saffev proxy (:8088) ──▶ Ollama (:11434)
+                  └─ records it → Studio (Live / History / Privacy)
+```
+
+Change the base URL wherever your app sets it — replace the engine port
+(`…:11434`) with the **proxy port Saffev printed** (`…:8088` by default):
+
+| If your app uses… | Set it to |
+|---|---|
+| An env var (`OLLAMA_HOST` / `OLLAMA_BASE_URL`) | `http://localhost:8088` |
+| **Ollama SDK** (JS / Python) | `new Ollama({ host: 'http://localhost:8088' })` · `Client(host='http://localhost:8088')` |
+| **LangChain** `ChatOllama` | `baseUrl: 'http://localhost:8088'` |
+| **Vercel AI SDK** (`ollama-ai-provider`) | `createOllama({ baseURL: 'http://localhost:8088/api' })` |
+| **OpenAI SDK** pointed at Ollama | `baseURL: 'http://localhost:8088/v1'` |
+| **Raw `fetch` / HTTP** | the URL string `http://localhost:11434` → `http://localhost:8088` |
+
+Then **restart your app** so it picks up the new URL, trigger an action, and
+watch the call appear in the Studio. Concrete example — an app that reads
+`OLLAMA_BASE_URL` (Node ≥ 20.6 loads a `.env` with `--env-file`):
+
+```sh
+# .env  — route this app's Ollama traffic through Saffev
+OLLAMA_BASE_URL=http://localhost:8088
+```
+```jsonc
+// package.json — load it on start
+"scripts": { "start": "node --env-file-if-exists=.env server.js" }
+```
+
+To bypass Saffev again, point the app back at `http://localhost:11434`.
+
+> **Want app-transparent capture with no per-app change?** That's **Gateway
+> mode** — Saffev owns the engine's well-known port and supervises the real
+> engine behind it, so it sees *all* local traffic automatically. It's clean on
+> Linux (systemd); on macOS the Ollama app resists it, so Cooperative mode
+> (above) is the supported path there.
+
 ## Hard invariants
 
 These are enforced throughout the codebase and are the reason to trust it in
