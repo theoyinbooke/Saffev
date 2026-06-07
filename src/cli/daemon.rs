@@ -159,7 +159,11 @@ pub fn daemon_state(path: &Path) -> Result<Option<bool>> {
 /// loads the identical config the parent resolved. stdio is detached
 /// (`null`) so the daemon never writes to the parent's terminal and the parent
 /// can return immediately.
-pub fn spawn_background(config_path: Option<&Path>, no_color: bool) -> Result<u32> {
+///
+/// `no_open` is forwarded for symmetry; the detached child runs under
+/// `--foreground`, which never opens a browser regardless, so this is belt-and-
+/// braces (the parent is the one that opens the Studio).
+pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: bool) -> Result<u32> {
     let exe = std::env::current_exe()
         .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
 
@@ -171,6 +175,9 @@ pub fn spawn_background(config_path: Option<&Path>, no_color: bool) -> Result<u3
         cmd.arg("--no-color");
     }
     cmd.arg("start").arg("--foreground");
+    if no_open {
+        cmd.arg("--no-open");
+    }
 
     // Fully detach: no inherited stdio, no controlling terminal coupling.
     cmd.stdin(std::process::Stdio::null())

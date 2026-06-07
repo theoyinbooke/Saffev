@@ -567,21 +567,76 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
 // start / stop — proxy + studio + supervisor
 // ---------------------------------------------------------------------------
 
+/// Resolve the config path `start` will use, matching `load_config`'s rules:
+/// an explicit `--config` wins; otherwise the default data dir's `saffev.toml`.
+fn start_config_path(cli: &Cli) -> std::path::PathBuf {
+    match &cli.config {
+        Some(path) => path.clone(),
+        None => Config::default().config_path(),
+    }
+}
+
+/// The config `start` should run with, plus whether this was a true first run.
+///
+/// First run = no config file exists yet at the resolved path. We then
+/// auto-configure a working Cooperative layout (free proxy/studio ports,
+/// upstream kept on the well-known engine port) and **persist** it so later
+/// runs are stable. When a config file already exists we honor it exactly,
+/// loading via the normal path (falling back to defaults only if the loader is
+/// unavailable, consistent with the rest of the CLI's fail-open posture).
+async fn resolve_start_config(cli: &Cli) -> (Config, bool) {
+    let path = start_config_path(cli);
+
+    // True first run: no file on disk. Build a working layout and write it.
+    if !Config::config_file_exists(&path) {
+        let data_dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(Config::default_data_dir);
+
+        match Config::resolve_first_run(data_dir) {
+            Ok(cfg) => {
+                // Persist so subsequent runs are stable + fast. Best-effort: a
+                // failed write just means the next run re-resolves (still works).
+                if let Err(e) = cfg.save_to(&path) {
+                    tracing::debug!("could not persist first-run config {}: {e}", path.display());
+                }
+                return (cfg, true);
+            }
+            Err(e) => {
+                // Could not resolve a working layout (improbable). Fall through to
+                // the normal loader, which preserves the prior behavior.
+                tracing::debug!("first-run resolution failed, using loader: {e}");
+            }
+        }
+    }
+
+    (load_config(cli).await, false)
+}
+
 /// `saffev start` — run the proxy + Studio (+ supervisor in Gateway mode).
 ///
 /// In the foreground (`--foreground`) it binds both servers and blocks until
 /// Ctrl-C or SIGTERM, writing a PID file so `saffev stop` can find it. Without
 /// `--foreground` it re-execs itself detached into the background, prints the
 /// Studio URL, and returns promptly (the backgrounded child writes the PID file).
-pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
+///
+/// **Zero-config first run.** When no config file exists yet, `start` does not
+/// error on the well-known engine port; it auto-configures a working Cooperative
+/// setup (free proxy/studio ports, upstream left on the engine) and persists it.
+/// An existing user config is honored exactly. After a successful background
+/// start the Studio is opened in the default browser (best-effort; suppressed by
+/// `--no-open`, and never attempted under `--foreground` for CI/headless safety).
+pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
     let p = painter(cli);
-    let cfg = load_config(cli).await;
+    let (cfg, first_run) = resolve_start_config(cli).await;
 
     // Background path: detach a `--foreground` copy of ourselves, record its pid
     // + URL, print the URL, and return. The child then runs the foreground flow
     // below (which also writes the PID file, authoritative for the running pid).
     if !foreground {
-        return start_background(cli, &cfg, &p).await;
+        return start_background(cli, &cfg, &p, first_run, no_open).await;
     }
 
     println!("{} {}", p.prompt("~"), p.value("saffev start"));
@@ -590,8 +645,11 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
     let studio_addr = SocketAddr::new(cfg.ports.bind, cfg.ports.studio);
 
     // Refuse to start if the proxy port is already taken by a foreign process.
+    // On a first run the proxy port was just chosen to be free, so this never
+    // fires there; it remains the guard for an existing user config whose proxy
+    // port is now held (we keep the current "port in use / run doctor" message).
     let proxy_port = cfg.ports.proxy;
-    if port_listening(cfg.ports.bind, proxy_port).await {
+    if !first_run && port_listening(cfg.ports.bind, proxy_port).await {
         // Identify what holds the port so the operator can act. Capture only the
         // port value so `cfg` stays available for the messages below.
         let holder = guard("port diagnosis", async move {
@@ -622,23 +680,10 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{} {} {} {} {}",
-        p.dot(Level::Ok),
-        p.label("proxy"),
-        p.value(&proxy_addr.to_string()),
-        p.muted("·"),
-        p.label("studio"),
-    );
-    println!(
-        "{} studio at {}",
-        p.muted("·"),
-        p.value(&format!(
-            "http://{}:{}",
-            display_host(cfg.ports.bind),
-            cfg.ports.studio
-        )),
-    );
+    // The user-facing welcome summary (Studio URL, proxy base, engine status).
+    // Under `--foreground` this prints to the live terminal; in the background
+    // case the parent prints it instead (the child's stdio is detached).
+    print_start_summary(&p, &cfg, first_run).await;
 
     // Record our pid + Studio URL so `saffev stop` can find and signal us. This
     // is the authoritative running pid (the foreground process actually serving),
@@ -703,7 +748,13 @@ pub async fn start(cli: &Cli, foreground: bool) -> Result<()> {
 /// We write a provisional PID file here too (child pid + URL) so a `stop` issued
 /// immediately after start can still find the daemon before the child has
 /// rewritten it; the child overwrites it with the same pid on startup.
-async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
+async fn start_background(
+    cli: &Cli,
+    cfg: &Config,
+    p: &Painter,
+    first_run: bool,
+    no_open: bool,
+) -> Result<()> {
     println!("{} {}", p.prompt("~"), p.value("saffev start"));
 
     // Refuse to start a second daemon if one is already running (live PID file).
@@ -724,8 +775,11 @@ async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
     }
 
     // Refuse to start if the proxy port is already taken by a foreign process.
+    // Skipped on first run: the proxy port was just chosen to be free, and an
+    // engine already holding the well-known port is the expected Cooperative
+    // case — not a conflict.
     let proxy_port = cfg.ports.proxy;
-    if port_listening(cfg.ports.bind, proxy_port).await {
+    if !first_run && port_listening(cfg.ports.bind, proxy_port).await {
         println!(
             "{} {} {}",
             p.dot(Level::Err),
@@ -747,8 +801,11 @@ async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
     );
 
     // Re-exec ourselves detached, carrying the same global flags so the child
-    // resolves the identical config.
-    let pid = match daemon::spawn_background(cli.config.as_deref(), cli.no_color) {
+    // resolves the identical config. The child re-resolves config too, but since
+    // we already persisted the first-run config above, the child sees a
+    // present-and-valid file (no longer a first run for it). We carry `--no-open`
+    // for completeness, though the detached child never opens a browser anyway.
+    let pid = match daemon::spawn_background(cli.config.as_deref(), cli.no_color, no_open) {
         Ok(pid) => pid,
         Err(e) => {
             tracing::debug!("daemonize failed: {e}");
@@ -784,10 +841,127 @@ async fn start_background(cli: &Cli, cfg: &Config, p: &Painter) -> Result<()> {
         p.muted("·"),
         p.muted("background"),
     );
-    println!("{} studio at {}", p.muted("·"), p.value(&url));
+
+    // The full welcome summary: Studio URL, proxy base URL, engine status.
+    print_start_summary(p, cfg, first_run).await;
     println!("{} run {} to stop", p.muted("·"), p.value("saffev stop"),);
 
+    // Best-effort: open the Studio in the default browser. Suppressed by
+    // `--no-open`; any failure is ignored (the URL is already printed above).
+    if !no_open {
+        open_in_browser(&url);
+    }
+
     Ok(())
+}
+
+/// Print the friendly post-start summary in the calm palette: the **Studio URL**
+/// (prominent), the **proxy base URL** apps point at (with the OpenAI `/v1`
+/// note), and the **engine status** (detected via [`crate::engine::detect`], or
+/// "not yet running"). On a first run we add a short note that a config was
+/// written.
+async fn print_start_summary(p: &Painter, cfg: &Config, first_run: bool) {
+    let host = display_host(cfg.ports.bind);
+    let studio_url = format!("http://{}:{}", host, cfg.ports.studio);
+    let proxy_url = format!("http://{}:{}", host, cfg.ports.proxy);
+
+    if first_run {
+        println!(
+            "{} {} {}",
+            p.dot(Level::Ok),
+            p.label("first run"),
+            p.muted("auto-configured cooperative mode · config saved"),
+        );
+    }
+
+    // Studio URL — the prominent line the user clicks.
+    println!(
+        "{} {}      {}",
+        p.dot(Level::Ok),
+        p.label("studio"),
+        p.value(&studio_url),
+    );
+
+    // Proxy base — where apps point. Note the OpenAI-compatible base is /v1.
+    println!(
+        "{} {}       {} {} {}",
+        p.dot(Level::Ok),
+        p.label("proxy"),
+        p.value(&proxy_url),
+        p.muted("·"),
+        p.muted("OpenAI base: /v1"),
+    );
+
+    // Engine status — detect on the configured upstream so the line reflects the
+    // engine Saffev actually proxies to. Best-effort: never blocks the summary.
+    let upstream_port = match cfg.mode {
+        Mode::Gateway => cfg.ports.shadow,
+        Mode::Cooperative => cfg.ports.upstream,
+    };
+    let engine = guard("engine detect", async move {
+        crate::engine::detect::probe_upstream(upstream_port).await
+    })
+    .await
+    .flatten();
+
+    match engine {
+        Some(info) => {
+            let kind = match info.engine {
+                crate::engine::EngineKind::Ollama => "ollama",
+                crate::engine::EngineKind::LmStudio => "lmstudio",
+                crate::engine::EngineKind::Unknown => "engine",
+            };
+            let version = info
+                .version
+                .as_deref()
+                .map(|v| format!(" v{v}"))
+                .unwrap_or_default();
+            println!(
+                "{} {}      {} {} {}",
+                p.dot(Level::Ok),
+                p.label("engine"),
+                p.success(&format!("{kind}{version}")),
+                p.muted("·"),
+                p.value(&format!(":{upstream_port}")),
+            );
+        }
+        None => {
+            println!(
+                "{} {}      {} {} {}",
+                p.dot(Level::Warn),
+                p.label("engine"),
+                p.warn("not yet running"),
+                p.muted("·"),
+                p.muted(&format!("expected on :{upstream_port}")),
+            );
+        }
+    }
+}
+
+/// Best-effort: open `url` in the OS default browser. Never blocks (spawns and
+/// detaches), never propagates an error — opening the Studio is a convenience,
+/// not a requirement. macOS uses `open`; other Unix uses `xdg-open`.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+    #[cfg(not(unix))]
+    let opener = "";
+
+    if opener.is_empty() {
+        return;
+    }
+
+    let result = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = result {
+        tracing::debug!("could not open browser ({opener} {url}): {e}");
+    }
 }
 
 /// Build state and run the proxy + Studio servers concurrently until shutdown

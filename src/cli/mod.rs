@@ -64,6 +64,9 @@ pub enum Command {
         /// Run in the foreground (do not daemonize).
         #[arg(long)]
         foreground: bool,
+        /// Do not open the Studio in the default browser after a successful start.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Stop the proxy + Studio + supervisor.
     Stop,
@@ -108,7 +111,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             cooperative,
         } => commands::adopt(&cli, engine, cooperative).await,
         Command::Status => commands::status(&cli).await,
-        Command::Start { foreground } => commands::start(&cli, foreground).await,
+        Command::Start {
+            foreground,
+            no_open,
+        } => commands::start(&cli, foreground, no_open).await,
         Command::Stop => commands::stop(&cli).await,
         Command::Doctor => commands::doctor(&cli).await,
         Command::Revert { engine } => commands::revert(&cli, engine).await,

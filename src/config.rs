@@ -6,7 +6,7 @@
 //!
 //! Privacy default: [`Config::payload_storage`] is `false` — metadata only.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,6 +50,20 @@ pub const DEFAULT_UPSTREAM_PORT: u16 = 11434;
 pub const CONFIG_FILE_NAME: &str = "saffev.toml";
 /// Database file name within the data dir.
 pub const DB_FILE_NAME: &str = "saffev.db";
+
+/// Candidate proxy ports tried (in order) during first-run auto-configuration.
+///
+/// The well-known engine port (11434) is deliberately *not* here — in
+/// Cooperative mode the proxy cannot share the engine's port. We prefer a few
+/// memorable "app" ports, then fall back to the range just above the engine.
+pub const FIRST_RUN_PROXY_CANDIDATES: &[u16] =
+    &[8088, 8090, 8092, 8181, 11435, 11436, 11437, 11438];
+
+/// Where the first-run Studio port scan starts (scans upward from here).
+pub const FIRST_RUN_STUDIO_SCAN_START: u16 = DEFAULT_STUDIO_PORT; // 7100
+
+/// How many consecutive ports the upward Studio scan will try before giving up.
+const FIRST_RUN_SCAN_SPAN: u16 = 64;
 
 /// Interception mode. See 04 §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +326,11 @@ impl Config {
     }
 
     /// Persist this config to an explicit path, creating parent dirs as needed.
-    fn save_to(&self, path: &std::path::Path) -> Result<()> {
+    ///
+    /// Public so the zero-config first-run path in `saffev start` can write the
+    /// resolved config to the exact path it resolved (which may be an explicit
+    /// `--config` whose filename differs from the default `saffev.toml`).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -387,6 +405,99 @@ fn default_data_dir_impl() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("saffev")
+}
+
+// ---------------------------------------------------------------------------
+// Free-port discovery + first-run auto-configuration
+// ---------------------------------------------------------------------------
+
+/// Is `port` free to bind on the loopback interface?
+///
+/// We test by attempting an actual `bind(127.0.0.1:port)`: if the bind succeeds
+/// the port is free (the listener is dropped immediately, releasing it). Port 0
+/// is never "free" in the sense we want here (it asks the OS to pick one), so we
+/// reject it outright. This is the authoritative, race-light check — a held
+/// engine port (e.g. Ollama on 11434) fails to bind and is correctly skipped.
+pub fn port_is_free(addr: IpAddr, port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    TcpListener::bind((addr, port)).is_ok()
+}
+
+/// Find the first free port from an explicit candidate list, then (if none of
+/// those bind) by scanning upward from `scan_from` for up to [`FIRST_RUN_SCAN_SPAN`]
+/// ports. Returns `None` only if absolutely nothing in either set binds.
+fn first_free_port(addr: IpAddr, candidates: &[u16], scan_from: u16) -> Option<u16> {
+    for &p in candidates {
+        if port_is_free(addr, p) {
+            return Some(p);
+        }
+    }
+    let mut p = scan_from;
+    for _ in 0..FIRST_RUN_SCAN_SPAN {
+        if port_is_free(addr, p) {
+            return Some(p);
+        }
+        p = p.checked_add(1)?;
+    }
+    None
+}
+
+impl Config {
+    /// Does a user-authored config file already exist at the resolved path?
+    ///
+    /// `start` uses this to decide between honoring an existing config exactly
+    /// (returns `true`) and the zero-config first-run path (returns `false`).
+    /// Note: we check *before* anything materializes a default, so this reflects
+    /// a true first run.
+    pub fn config_file_exists(path: &std::path::Path) -> bool {
+        path.exists()
+    }
+
+    /// Resolve a working **first-run** Cooperative config and anchor it at
+    /// `data_dir` (the parent of the config path).
+    ///
+    /// First run = no config file on disk yet. We pick a working layout instead
+    /// of erroring on the well-known engine port:
+    /// - mode = Cooperative (engine untouched; the app points at the proxy),
+    /// - upstream = the well-known engine port (11434), kept as the default,
+    /// - proxy = the first *free* TCP port from [`FIRST_RUN_PROXY_CANDIDATES`]
+    ///   (the engine's own 11434 is deliberately excluded so the proxy never
+    ///   collides with it),
+    /// - studio = the first free port scanning up from [`FIRST_RUN_STUDIO_SCAN_START`].
+    ///
+    /// Returns the resolved (validated) config. Does **not** persist it — the
+    /// caller decides when to write so a dry/probe path can resolve without
+    /// touching disk.
+    pub fn resolve_first_run(data_dir: PathBuf) -> Result<Config> {
+        let mut cfg = Config::default();
+        cfg.mode = Mode::Cooperative;
+        cfg.data_dir = data_dir;
+
+        let bind = cfg.ports.bind;
+        // Upstream stays at the well-known engine port (the whole point of
+        // Cooperative: leave the engine exactly where it is).
+        cfg.ports.upstream = DEFAULT_UPSTREAM_PORT;
+
+        // Proxy: first free candidate. Excludes 11434 by construction so it can
+        // never land on the engine's port. Fall back to a non-colliding default
+        // if (improbably) nothing binds.
+        cfg.ports.proxy = first_free_port(bind, FIRST_RUN_PROXY_CANDIDATES, 11435)
+            .unwrap_or(FIRST_RUN_PROXY_CANDIDATES[0]);
+
+        // Studio: scan upward from 7100, skipping the proxy port if it lands there.
+        let studio =
+            first_free_port(bind, &[], FIRST_RUN_STUDIO_SCAN_START).unwrap_or(DEFAULT_STUDIO_PORT);
+        cfg.ports.studio = if studio == cfg.ports.proxy {
+            first_free_port(bind, &[], studio.saturating_add(1)).unwrap_or(DEFAULT_STUDIO_PORT)
+        } else {
+            studio
+        };
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
 }
 
 #[cfg(test)]
@@ -689,5 +800,127 @@ days = 14
             cfg.validate().is_err(),
             "stock cooperative defaults collide proxy == upstream"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // free-port helper + first-run resolution
+    // -----------------------------------------------------------------------
+
+    /// `port_is_free` rejects port 0 (it means "OS picks one", not "free") and
+    /// returns a sensible answer for a real port: a port we are actively holding
+    /// is NOT free; the same port after we drop the listener is free again.
+    #[test]
+    fn port_is_free_skips_an_already_bound_port() {
+        let loop_back = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(!port_is_free(loop_back, 0), "port 0 is never 'free'");
+
+        // Bind an ephemeral port and learn its number; while held, it must read
+        // as not-free. After dropping the listener it must read as free again.
+        let listener = TcpListener::bind((loop_back, 0)).expect("bind ephemeral");
+        let held = listener.local_addr().unwrap().port();
+        assert!(
+            !port_is_free(loop_back, held),
+            "a port we are actively holding must not be reported free"
+        );
+        drop(listener);
+        assert!(
+            port_is_free(loop_back, held),
+            "the port must be free again once the listener is dropped"
+        );
+    }
+
+    /// `first_free_port` skips a held candidate and returns the next free one.
+    #[test]
+    fn first_free_port_skips_held_candidate() {
+        let loop_back = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Hold two ephemeral ports; offer them as the first candidates, with a
+        // known-free third candidate last. The scan must skip the held ones.
+        let l1 = TcpListener::bind((loop_back, 0)).unwrap();
+        let l2 = TcpListener::bind((loop_back, 0)).unwrap();
+        let held1 = l1.local_addr().unwrap().port();
+        let held2 = l2.local_addr().unwrap().port();
+        // A free port to recover after the held ones (bind+drop to learn a number
+        // that is, at this instant, free).
+        let free = {
+            let probe = TcpListener::bind((loop_back, 0)).unwrap();
+            let p = probe.local_addr().unwrap().port();
+            drop(probe);
+            p
+        };
+
+        let picked =
+            first_free_port(loop_back, &[held1, held2, free], 0).expect("a free candidate exists");
+        assert_ne!(picked, held1, "must skip the first held candidate");
+        assert_ne!(picked, held2, "must skip the second held candidate");
+
+        drop(l1);
+        drop(l2);
+    }
+
+    /// First-run resolution yields a Cooperative config with upstream pinned to
+    /// the well-known engine port (11434), and distinct, free proxy/studio
+    /// ports that pass validation. The proxy must never be 11434 (the proxy
+    /// cannot forward to itself in Cooperative mode).
+    #[test]
+    fn first_run_resolves_cooperative_with_distinct_free_ports() {
+        let dir = unique_temp_dir("firstrun-resolve");
+        let cfg = Config::resolve_first_run(dir.clone()).expect("first-run resolves");
+
+        assert_eq!(cfg.mode, Mode::Cooperative);
+        assert_eq!(cfg.data_dir, dir);
+        assert_eq!(
+            cfg.ports.upstream, DEFAULT_UPSTREAM_PORT,
+            "upstream must stay on the well-known engine port"
+        );
+        assert_ne!(
+            cfg.ports.proxy, DEFAULT_UPSTREAM_PORT,
+            "proxy must not collide with the engine/upstream port"
+        );
+        assert_ne!(
+            cfg.ports.proxy, cfg.ports.studio,
+            "proxy and studio must be distinct"
+        );
+        // The resolved layout must be internally valid (this is exactly what the
+        // stock defaults fail — see defaults_are_cooperative_and_fail_validation).
+        cfg.validate().expect("resolved first-run config validates");
+    }
+
+    /// An existing user-authored config is left untouched: `config_file_exists`
+    /// reports the file present, and loading it returns the user's exact ports —
+    /// the first-run resolver is never consulted for an existing file.
+    #[test]
+    fn existing_user_config_is_left_untouched() {
+        let dir = unique_temp_dir("existing-untouched");
+        let path = dir.join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user-authored cooperative config that happens to keep proxy on a
+        // distinct port from upstream.
+        std::fs::write(
+            &path,
+            format!(
+                "mode = \"cooperative\"\ndata_dir = {:?}\n[ports]\nproxy = 9191\nstudio = 9292\nupstream = 11434\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            Config::config_file_exists(&path),
+            "an authored config file must be detected as existing"
+        );
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let cfg = Config::load_from(&path).expect("existing config loads");
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(cfg.ports.proxy, 9191, "user's proxy port is honored");
+        assert_eq!(cfg.ports.studio, 9292, "user's studio port is honored");
+        assert_eq!(cfg.ports.upstream, 11434);
+        assert_eq!(
+            before, after,
+            "loading an existing config must not rewrite it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
