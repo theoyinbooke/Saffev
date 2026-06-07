@@ -361,8 +361,16 @@ async fn collect_stats(cfg: &Config) -> Option<Stats> {
     let requests_today = today.len() as u64;
     let pii_today: u64 = today.iter().map(|r| r.pii_count as u64).sum();
 
-    // p50 latency over today's completed exchanges.
-    let mut latencies: Vec<u32> = today.iter().filter_map(|r| r.request.latency_ms).collect();
+    // p50 latency over today's completed exchanges. The request row never carries
+    // its own end-to-end time, so fall back to the response's measured total.
+    let mut latencies: Vec<u32> = today
+        .iter()
+        .filter_map(|r| {
+            r.request
+                .latency_ms
+                .or_else(|| r.response.as_ref().and_then(|x| x.total_ms))
+        })
+        .collect();
     latencies.sort_unstable();
     let p50 = if latencies.is_empty() {
         None
@@ -1024,6 +1032,9 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         tee,
         detector,
         upstream,
+        // Same broadcast channel the Studio SSE endpoint subscribes to, so live
+        // exchanges from the proxy reach the Live page in real time.
+        events: events.clone(),
     };
     let studio_state = crate::studio::StudioState {
         config,

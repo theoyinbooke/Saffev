@@ -130,6 +130,18 @@
     if (d < 86400000) return Math.floor(d / 3600000) + 'h ago';
     return new Date(ms).toLocaleDateString();
   }
+  // Absolute timestamp for the traffic table. Today → HH:MM:SS (precise, since
+  // live traffic is all "today"); older → "MMM D, HH:MM". Full date+time on hover.
+  function fmtStamp(ms) {
+    const d = new Date(ms);
+    const now = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    const hms = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    if (sameDay) return hms;
+    const mon = d.toLocaleString(undefined, { month: 'short' });
+    return mon + ' ' + d.getDate() + ', ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  }
   // human label for a PiiKind (snake_case on wire)
   const PII_LABEL = {
     email: 'Email address', phone: 'Phone number', credit_card: 'Credit card',
@@ -163,6 +175,16 @@
     revert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 1 3 6.7M3 20v-5h5"/></svg>',
     alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 9v4M12 17h.01"/></svg>',
     download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 4 5-4M5 20h14"/></svg>',
+    chevL: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 6 9 12l6 6"/></svg>',
+    chevR: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m9 6 6 6-6 6"/></svg>',
+    chevD: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>',
+    copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+    link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>',
+    bolt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z"/></svg>',
+    plug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2v6M15 2v6M7 8h10v3a5 5 0 0 1-10 0V8ZM12 16v6"/></svg>',
+    eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
+    sparkles: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v4M12 17v4M5 12H1M23 12h-4M6.3 6.3 3.5 3.5M20.5 20.5l-2.8-2.8M17.7 6.3l2.8-2.8M3.5 20.5l2.8-2.8"/></svg>',
   };
   function piiIcon(kind) {
     return { email: ICON.mail, api_key: ICON.key, credit_card: ICON.card, phone: ICON.phone, ip_address: ICON.globe }[kind] || ICON.shieldAlert;
@@ -212,94 +234,85 @@
   function hideBanner() { const b = $('#banner'); if (b) b.hidden = true; }
 
   /* -------------------------------------------------------------------------
-     Update banner (in-app auto-update).
+     In-app auto-update (bottom-left).
 
-     On load we GET /api/update; if an update is available we render a quiet,
-     on-brand strip ("Update available — vX → vY  [Update]"). The Update button
-     POSTs /api/update, shows progress, and on success tells the user the new
-     version is installed and to restart Saffev.
+     On load we GET /api/update; if a newer release exists we show a compact card
+     in the sidebar foot: "Update available · vX → vY  [Update & restart]". One
+     click installs it (POST /api/update), then relaunches the daemon
+     (POST /api/restart) and reloads the Studio once it's back — no terminal.
 
      PRIVACY: GET /api/update contacts GitHub release metadata only — nothing
-     about the user leaves the device (the on-device invariant). It is fail-soft:
-     any error simply leaves the banner hidden.
+     about the user leaves the device. Fail-soft: any error leaves the slot hidden.
      ------------------------------------------------------------------------- */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   async function checkForUpdate() {
-    const b = $('#updateBanner');
-    if (!b) return;
+    const foot = $('#updateFoot');
+    if (!foot) return;
     let st;
-    try {
-      st = await api('/update'); // { currentVersion, latestVersion, updateAvailable }
-    } catch (e) {
-      // Fail-soft: never surface the update check as an error (it's optional).
-      return;
-    }
-    if (!st || !st.updateAvailable || !st.latestVersion) { b.hidden = true; return; }
-    renderUpdateAvailable(b, st);
+    try { st = await api('/update'); } // { currentVersion, latestVersion, updateAvailable }
+    catch (e) { return; } // optional — never surface as an error
+    if (!st || !st.updateAvailable || !st.latestVersion) { foot.hidden = true; return; }
+    renderFootUpdate(foot, st);
   }
 
-  function renderUpdateAvailable(b, st) {
-    b.innerHTML = '';
-    b.className = 'upbanner';
-    b.hidden = false;
-    const txt = el('span', { class: 'grow' });
-    txt.appendChild(document.createTextNode('Update available — '));
-    txt.appendChild(el('span', { class: 'ver', text: 'v' + st.currentVersion }));
-    txt.appendChild(el('span', { class: 'arr', text: '→' }));
-    txt.appendChild(el('span', { class: 'ver', text: 'v' + st.latestVersion }));
-    const btn = el('button', { class: 'btn primary', html: ICON.download + '<span>Update</span>' });
-    btn.addEventListener('click', () => applyUpdate(b, btn));
-    b.appendChild(el('span', { html: ICON.download }));
-    b.appendChild(txt);
-    b.appendChild(btn);
+  function renderFootUpdate(foot, st) {
+    foot.hidden = false;
+    foot.innerHTML = '';
+    foot.appendChild(el('div', { class: 'ut', html: ICON.download + '<span>Update available</span>' }));
+    const ver = el('div', { class: 'uv' });
+    ver.appendChild(el('span', { text: 'v' + st.currentVersion }));
+    ver.appendChild(document.createTextNode(' → '));
+    ver.appendChild(el('span', { text: 'v' + st.latestVersion }));
+    foot.appendChild(ver);
+    const btn = el('button', { class: 'btn primary', html: ICON.download + '<span>Update &amp; restart</span>' });
+    btn.addEventListener('click', () => applyAndRestart(foot, btn, st));
+    foot.appendChild(btn);
   }
 
-  async function applyUpdate(b, btn) {
+  function footMsg(foot, icon, title, detail) {
+    foot.hidden = false;
+    foot.innerHTML = '';
+    foot.appendChild(el('div', { class: 'ut', html: icon + '<span>' + esc(title) + '</span>' }));
+    if (detail) foot.appendChild(el('div', { class: 'umsg', text: detail }));
+  }
+
+  async function applyAndRestart(foot, btn, st) {
     setBusy(btn, true);
-    // Replace the version delta with a calm progress note while it runs.
-    let note = b.querySelector('.grow');
-    if (note) { note.className = 'grow msg'; note.textContent = 'Downloading and installing…'; }
+    footMsg(foot, ICON.download, 'Updating', 'Downloading & installing v' + st.latestVersion + '…');
     let res;
     try {
       res = await api('/update', { method: 'POST' }); // { updated, newVersion, message }
     } catch (e) {
-      setBusy(btn, false);
-      if (note) { note.className = 'grow msg'; note.textContent = (e && e.message) ? ('Update failed: ' + e.message) : 'Update failed.'; }
-      b.className = 'banner danger';
+      footMsg(foot, ICON.alert, 'Update failed', (e && e.message) || 'Could not install the update.');
+      const retry = el('button', { class: 'btn', html: ICON.restart + '<span>Try again</span>' });
+      retry.addEventListener('click', () => renderFootUpdate(foot, st));
+      foot.appendChild(retry);
       return;
     }
-    // Success (or graceful no-op / no-receipt guidance): show the message and
-    // swap the Update button for a Restart hint when an install actually ran.
-    renderUpdateDone(b, res);
+    if (!res || !res.updated) {
+      // Already current, or a dev build with no install receipt — show guidance.
+      footMsg(foot, ICON.shield, 'Update', (res && res.message) || 'Already on the latest version.');
+      return;
+    }
+    // Installed — relaunch the daemon and reload the Studio once it's back.
+    footMsg(foot, ICON.restart, 'Restarting Saffev', 'Installed v' + res.newVersion + '. Relaunching…');
+    try { await api('/restart', { method: 'POST' }); } catch (e) { /* server may drop mid-call — expected */ }
+    await waitForRestartThenReload(foot);
   }
 
-  function renderUpdateDone(b, res) {
-    b.innerHTML = '';
-    b.className = 'upbanner';
-    b.hidden = false;
-    b.appendChild(el('span', { html: res && res.updated ? ICON.check : ICON.alert }));
-    const msg = el('span', { class: 'grow msg', text: (res && res.message) || 'Update complete.' });
-    b.appendChild(msg);
-    if (res && res.updated) {
-      // Offer a restart of the running daemon: a tasteful, single primary action.
-      const btn = el('button', { class: 'btn primary', html: ICON.restart + '<span>Restart Saffev</span>' });
-      btn.addEventListener('click', () => restartAfterUpdate(b, btn));
-      b.appendChild(btn);
+  async function waitForRestartThenReload(foot) {
+    // The daemon goes down (~1–3s) then back up on the same port. Wait out the
+    // down window, then poll /api/health until it answers, then reload.
+    await sleep(2500);
+    for (let i = 0; i < 40; i++) {
+      try {
+        const r = await fetch('/api/health', { headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}, cache: 'no-store' });
+        if (r.ok) { location.reload(); return; }
+      } catch (e) { /* still down — keep polling */ }
+      await sleep(1000);
     }
-  }
-
-  async function restartAfterUpdate(b, btn) {
-    // We cannot restart the daemon from the browser (no such endpoint by design),
-    // so we guide the user with the exact CLI. Keep it calm + on-brand.
-    setBusy(btn, true);
-    const note = b.querySelector('.grow');
-    if (note) {
-      note.textContent = '';
-      note.appendChild(document.createTextNode('Run '));
-      note.appendChild(el('span', { class: 'ver', text: BRAND.command + ' stop && ' + BRAND.command + ' start' }));
-      note.appendChild(document.createTextNode(' to run the new version.'));
-    }
-    setBusy(btn, false);
-    btn.remove();
+    footMsg(foot, ICON.check, 'Update installed', 'Saffev was relaunched — reload this page to continue.');
   }
 
   function handleApiError(e) {
@@ -313,48 +326,69 @@
   }
 
   /* -------------------------------------------------------------------------
-     Shared row renderer (Live + History share the "traffic row" look).
+     Shared request TABLE (Live + History).
+     One single-line, clickable row per request. Columns are config-driven so
+     Live can show a compact subset and History the full set while staying
+     perfectly aligned: the header (reqHead) and every row (reqRow) read the
+     same `--gtc` grid-template + identical gap/padding. Set `--gtc` on the
+     enclosing `.ttable` wrapper (see gtcFor) so both inherit it.
      ------------------------------------------------------------------------- */
+  const REQ_COLS = {
+    app:      { label: 'Source',   w: 'minmax(110px,1.3fr)', r: false },
+    model:    { label: 'Model',    w: 'minmax(78px,1fr)',    r: false },
+    endpoint: { label: 'Endpoint', w: 'minmax(86px,1.1fr)',  r: false },
+    lat:      { label: 'Latency',  w: '68px',                r: true },
+    tokens:   { label: 'Tokens',   w: 'minmax(86px,auto)',   r: true },
+    time:     { label: 'Time',     w: '92px',                r: true },
+  };
+  const LIVE_COLS = ['app', 'model', 'endpoint', 'lat', 'tokens', 'time'];
+  const HIST_COLS = ['app', 'model', 'endpoint', 'lat', 'tokens', 'time'];
+  function gtcFor(cols) { return cols.map((k) => REQ_COLS[k].w).join(' '); }
+
+  // Column header strip. Lives ABOVE the scrolling body so it stays fixed.
+  function reqHead(cols) {
+    const head = el('div', { class: 'thead' });
+    cols.forEach((k) => head.appendChild(el('div', { class: 'th' + (REQ_COLS[k].r ? ' r' : ''), text: REQ_COLS[k].label })));
+    return head;
+  }
+
+  // One cell for `key`, populated from `item`.
+  function reqCell(key, item) {
+    if (key === 'app') {
+      const cell = el('div', { class: 'tcell cell-app' });
+      cell.appendChild(el('span', { class: 'nm', text: item.sourceApp || 'Unknown' }));
+      // Collapse multiple PII kinds to "first + N" so the source column stays tidy.
+      const kinds = item.piiKinds || [];
+      if (kinds.length) {
+        cell.appendChild(el('span', { class: 'piibadge' + (kinds[0] === 'api_key' ? ' key' : ''), 'data-k': kinds[0], text: piiShort(kinds[0]) }));
+        if (kinds.length > 1) cell.appendChild(el('span', { class: 'piibadge more', title: kinds.slice(1).map(piiShort).join(', '), text: '+' + (kinds.length - 1) }));
+      }
+      return cell;
+    }
+    if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '—' });
+    if (key === 'endpoint') return el('div', { class: 'tcell cell-endpoint', title: item.endpoint || '', text: item.endpoint || '—' });
+    if (key === 'lat') return el('div', { class: 'tcell r cell-lat', text: item.latencyMs != null ? item.latencyMs + 'ms' : '' });
+    if (key === 'tokens') {
+      const up = item.inputTokens != null ? (item.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.inputTokens) + '↑' : '';
+      const down = item.outputTokens != null ? (item.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.outputTokens) + '↓' : '';
+      return el('div', { class: 'tcell r cell-tokens', text: [up, down].filter(Boolean).join('  ') || '—' });
+    }
+    if (key === 'time') return el('div', { class: 'tcell r cell-time', title: item.ts ? new Date(item.ts).toLocaleString() : '', text: item.ts ? fmtStamp(item.ts) : '' });
+    return el('div', { class: 'tcell' });
+  }
+
+  // One clickable row. opts: { columns, streaming, enter }.
   function reqRow(item, opts) {
     opts = opts || {};
-    const streaming = !!opts.streaming;
-    const node = el('div', {
-      class: 'req' + (streaming ? ' streaming' : '') + (opts.enter ? ' enter' : ''),
-      'data-id': item.id,
+    const cols = opts.columns || HIST_COLS;
+    const row = el('div', {
+      class: 'trow' + (opts.streaming ? ' streaming' : '') + (opts.enter ? ' enter' : ''),
+      'data-id': item.id, role: 'button', tabindex: '0',
     });
-
-    const lead = el('div', { class: 'lead', text: initials(item.sourceApp) });
-
-    const appLine = el('div', { class: 'app' });
-    appLine.appendChild(document.createTextNode(item.sourceApp || 'Unknown'));
-    if (item.sourceConfidence === 'pid' && !item.sourceApp) {
-      appLine.appendChild(el('span', { class: 'det', style: 'display:inline;margin:0', text: 'by pid' }));
-    }
-    // PII badges
-    (item.piiKinds || []).forEach((k) => {
-      appLine.appendChild(el('span', { class: 'piibadge' + (k === 'api_key' ? ' key' : ''), text: piiShort(k) }));
-    });
-
-    const detBits = [];
-    if (item.model) detBits.push(esc(item.model));
-    const det = el('div', { class: 'det' });
-    det.innerHTML = (item.model ? esc(item.model) + ' · ' : '') +
-      '<span class="ep">' + esc(item.endpoint) + '</span>' +
-      (item.stream ? ' · streaming' : '');
-
-    const mid = el('div', { class: 'mid' }, [appLine, det]);
-
-    const right = el('div', { class: 'right' });
-    const lat = el('div', { class: 'lat' });
-    lat.textContent = item.latencyMs != null ? item.latencyMs + 'ms' : (streaming ? '' : '—');
-    const up = item.inputTokens != null ? (item.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.inputTokens) + ' ↑' : '';
-    const down = item.outputTokens != null ? (item.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.outputTokens) + ' ↓' : '';
-    const tk = el('div', { class: 'tk', text: [up, down].filter(Boolean).join(' · ') || ' ' });
-    right.appendChild(lat); right.appendChild(tk);
-
-    node.appendChild(lead); node.appendChild(mid); node.appendChild(right);
-    node.addEventListener('click', () => openDetail(item.id));
-    return node;
+    cols.forEach((k) => row.appendChild(reqCell(k, item)));
+    row.addEventListener('click', () => openDetail(item.id));
+    row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(item.id); } });
+    return row;
   }
 
   /* -------------------------------------------------------------------------
@@ -439,6 +473,194 @@
     return el('div', { class: 'card' }, [el('div', { class: 'state' }, [el('div', { class: 'big', text: big }), el('div', { class: 'sm', text: sm || '' })])]);
   }
 
+  /* -------------------------------------------------------------------------
+     Dropdown — design-system replacement for the native <select>. Follows the
+     ARIA listbox keyboard pattern (Enter/Space/↑/↓/Home/End/Esc), closes on
+     outside-click, one open at a time, fully token-themed. Used everywhere a
+     native select used to be (History page size, Settings mode/handover/retention).
+
+       dropdown(items, value, onChange, opts)
+         items    : [{ value, label }]
+         value    : current value (compared as String)
+         onChange : (newValue) => void
+         opts     : { ariaLabel, block, align: 'left'|'right' }
+     ------------------------------------------------------------------------- */
+  let _openDropdown = null;
+  function closeAllDropdowns() { if (_openDropdown) _openDropdown(); }
+  document.addEventListener('click', (e) => { if (_openDropdown && !(e.target.closest && e.target.closest('.dropdown'))) closeAllDropdowns(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && _openDropdown) closeAllDropdowns(); });
+  let _ddSeq = 0;
+
+  function dropdown(items, value, onChange, opts) {
+    opts = opts || {};
+    const id = 'dd' + (++_ddSeq);
+    const root = el('div', { class: 'dropdown' + (opts.block ? ' block' : '') });
+    const cur = () => items.find((it) => String(it.value) === String(value)) || items[0] || { label: '—' };
+    const labelSpan = el('span', { class: 'dd-label', text: cur().label });
+    const trigger = el('button', {
+      class: 'dd-trigger', type: 'button',
+      'aria-haspopup': 'listbox', 'aria-expanded': 'false', 'aria-controls': id,
+      'aria-label': opts.ariaLabel || 'Select',
+    }, [labelSpan, el('span', { class: 'dd-caret', html: ICON.chevD })]);
+    const menu = el('div', { class: 'dd-menu' + (opts.align === 'left' ? ' left' : ''), id: id, role: 'listbox', tabindex: '-1' });
+    menu.hidden = true;
+
+    let optEls = [];
+    function build() {
+      menu.innerHTML = '';
+      optEls = items.map((it, i) => {
+        const sel = String(it.value) === String(value);
+        const o = el('div', {
+          class: 'dd-opt' + (sel ? ' sel' : ''), role: 'option', id: id + '-o' + i,
+          'data-value': it.value, 'aria-selected': sel ? 'true' : 'false',
+        }, [el('span', { class: 'dd-check', html: sel ? ICON.check : '' }), el('span', { class: 'dd-opt-label', text: it.label })]);
+        o.addEventListener('click', (e) => { e.stopPropagation(); choose(it.value); });
+        o.addEventListener('mousemove', () => setActive(i));
+        return o;
+      });
+      optEls.forEach((o) => menu.appendChild(o));
+    }
+    let active = -1;
+    function setActive(i) {
+      if (!optEls.length) return;
+      active = (i + optEls.length) % optEls.length;
+      optEls.forEach((o, idx) => o.classList.toggle('active', idx === active));
+      trigger.setAttribute('aria-activedescendant', optEls[active].id);
+      optEls[active].scrollIntoView({ block: 'nearest' });
+    }
+    function open() {
+      if (!menu.hidden) return;
+      closeAllDropdowns();
+      build();
+      menu.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      root.classList.add('open');
+      const i = items.findIndex((it) => String(it.value) === String(value));
+      setActive(i < 0 ? 0 : i);
+      _openDropdown = close;
+    }
+    function close() {
+      if (menu.hidden) return;
+      menu.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.removeAttribute('aria-activedescendant');
+      root.classList.remove('open');
+      _openDropdown = null;
+    }
+    function choose(v) {
+      value = v;
+      labelSpan.textContent = cur().label;
+      close();
+      trigger.focus();
+      if (onChange) onChange(v);
+    }
+    trigger.addEventListener('click', (e) => { e.stopPropagation(); menu.hidden ? open() : close(); });
+    trigger.addEventListener('keydown', (e) => {
+      if (menu.hidden) {
+        if (['ArrowDown', 'ArrowUp', 'Enter', ' '].includes(e.key)) { e.preventDefault(); open(); }
+        return;
+      }
+      if (e.key === 'ArrowDown') { e.preventDefault(); setActive(active + 1); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(active - 1); }
+      else if (e.key === 'Home') { e.preventDefault(); setActive(0); }
+      else if (e.key === 'End') { e.preventDefault(); setActive(optEls.length - 1); }
+      else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (items[active]) choose(items[active].value); }
+      else if (e.key === 'Tab') { close(); }
+    });
+    root.appendChild(trigger);
+    root.appendChild(menu);
+    return root;
+  }
+
+  /* -------------------------------------------------------------------------
+     Clipboard + copyable code block (used by the About page).
+     ------------------------------------------------------------------------- */
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(text); return true; }
+    } catch (e) { /* fall through to legacy path */ }
+    try {
+      const ta = el('textarea', { style: 'position:fixed;opacity:0;top:0;left:0' });
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy'); ta.remove(); return ok;
+    } catch (e) { return false; }
+  }
+
+  // A code/pre block with a Copy button. `opts`: { title, lang }.
+  function copyBlock(text, opts) {
+    opts = opts || {};
+    const btn = el('button', { class: 'copybtn', type: 'button', 'aria-label': 'Copy to clipboard', html: ICON.copy + '<span>Copy</span>' });
+    btn.addEventListener('click', async () => {
+      const ok = await copyText(text);
+      btn.classList.toggle('done', ok);
+      btn.innerHTML = (ok ? ICON.check : ICON.copy) + '<span>' + (ok ? 'Copied' : 'Copy') + '</span>';
+      setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = ICON.copy + '<span>Copy</span>'; }, 1800);
+    });
+    const head = el('div', { class: 'codehead' }, [
+      el('span', { class: 'codetitle', text: opts.title || (opts.lang || 'snippet') }),
+      el('div', { class: 'spacer' }),
+      btn,
+    ]);
+    return el('div', { class: 'codeblock' }, [head, el('pre', {}, [el('code', { text: text })])]);
+  }
+
+  /* -------------------------------------------------------------------------
+     confirmModal — design-system confirmation dialog. Replaces the native
+     window.confirm() everywhere so every prompt matches the Studio's look and
+     theme (no browser chrome). Returns a Promise<boolean>.
+
+       await confirmModal({ title, body, confirmLabel, cancelLabel, danger })
+
+     Keyboard: Esc / backdrop = cancel, Enter = confirm. Body supports blank-line
+     separated paragraphs.
+     ------------------------------------------------------------------------- */
+  function confirmModal(opts) {
+    opts = opts || {};
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        document.removeEventListener('keydown', onKey, true);
+        bg.classList.add('closing');
+        setTimeout(() => bg.remove(), 120);
+        resolve(val);
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+        else if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        else if (e.key === 'Tab') {
+          // simple focus trap between the two buttons
+          const f = [cancelBtn, okBtn];
+          const i = f.indexOf(document.activeElement);
+          e.preventDefault();
+          f[(i + (e.shiftKey ? f.length - 1 : 1)) % f.length].focus();
+        }
+      };
+
+      const cancelBtn = el('button', { class: 'btn auto', type: 'button', text: opts.cancelLabel || 'Cancel' });
+      cancelBtn.addEventListener('click', () => finish(false));
+      const okBtn = el('button', { class: 'btn auto ' + (opts.danger ? 'danger' : 'primary'), type: 'button', text: opts.confirmLabel || 'Confirm' });
+      okBtn.addEventListener('click', () => finish(true));
+
+      const body = el('div', { class: 'modal-body' });
+      String(opts.body || '').split('\n\n').forEach((para) => { if (para.trim()) body.appendChild(el('p', { text: para.trim() })); });
+
+      const card = el('div', { class: 'modal', role: 'alertdialog', 'aria-modal': 'true' }, [
+        el('div', { class: 'modal-ic ' + (opts.danger ? 'danger' : 'brand'), html: opts.danger ? ICON.alert : ICON.shield }),
+        el('h2', { class: 'modal-title', text: opts.title || 'Are you sure?' }),
+        body,
+        el('div', { class: 'modal-actions' }, [cancelBtn, okBtn]),
+      ]);
+      const bg = el('div', { class: 'modal-bg' });
+      bg.addEventListener('click', (e) => { if (e.target === bg) finish(false); });
+      bg.appendChild(card);
+      document.body.appendChild(bg);
+      document.addEventListener('keydown', onKey, true);
+      setTimeout(() => okBtn.focus(), 30);
+    });
+  }
+
   /* =========================================================================
      PAGE: LIVE
      ========================================================================= */
@@ -452,6 +674,8 @@
     _streamRetry: 0,
     seen: {},             // id -> row element (for in-place updates)
     kpis: { requestsToday: 0, p50: null, pii: 0 },
+    masking: { enabled: false, dryRun: true },  // synced from /api/settings
+    _lastRecent: [],      // last recent window (for re-rendering the privacy lens)
 
     async render(view) {
       view.innerHTML = '';
@@ -472,7 +696,10 @@
           el('div', { class: 'spacer' }),
           el('span', { class: 'tag live off', id: 'liveTag', html: '<span class="blip"></span> Idle' }),
         ]),
-        el('div', { class: 'stream', id: 'stream' }),
+        el('div', { class: 'ttable', style: '--gtc:' + gtcFor(LIVE_COLS) }, [
+          reqHead(LIVE_COLS),
+          el('div', { class: 'stream', id: 'stream' }),
+        ]),
       ]);
 
       const side = el('div', { class: 'grid', style: 'align-content:start;gap:16px' }, [
@@ -485,7 +712,7 @@
         ]),
       ]);
 
-      const body = el('section', { class: 'body' }, [streamCard, side]);
+      const body = el('section', { class: 'body livebody' }, [streamCard, side]);
       view.appendChild(body);
       view.appendChild(cliBlock());
 
@@ -516,7 +743,7 @@
             stream.appendChild(el('div', { class: 'state sm', style: 'padding:24px 6px', text: 'Waiting for traffic… run a prompt in any local-LLM app.' }));
           } else {
             recent.forEach((it) => {
-              const row = reqRow(it, {});
+              const row = reqRow(it, { columns: LIVE_COLS });
               this.seen[it.id] = row;
               stream.appendChild(row);
             });
@@ -533,30 +760,67 @@
         this.renderExposureHero(ev.exposure);
         setEnginePill(ev);
       } catch (e) { /* banner already covers hard failures */ }
+
+      // masking state (best-effort) — keeps the Live toggle in sync with Settings.
+      try {
+        const s = await api('/settings');
+        this.masking = { enabled: !!s.maskingEnabled, dryRun: !!s.maskingDryRun };
+        this.renderMaskingBar();
+      } catch (e) { /* leave the bar at its last-known state */ }
     },
 
     renderPrivacyLens(recent) {
+      this._lastRecent = recent;
       const counts = {};
       recent.forEach((it) => (it.piiKinds || []).forEach((k) => { counts[k] = (counts[k] || 0) + 1; }));
       const body = $('#livePrivacyBody');
       if (!body) return;
       body.innerHTML = '';
-      const kinds = Object.keys(counts);
+      const kinds = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
       if (kinds.length === 0) {
         body.appendChild(el('div', { class: 'expnote', html: ICON.check + ' No PII observed in the recent window.' }));
       } else {
-        kinds.sort((a, b) => counts[b] - counts[a]).forEach((k) => {
+        // Keep the lens compact: show the top 2 kinds; link out for the rest so
+        // the card never grows tall enough to drag the right column down.
+        kinds.slice(0, 2).forEach((k) => {
           body.appendChild(el('div', { class: 'pii-row' }, [
             el('div', { class: 'swt ic ' + piiRole(k), html: piiIcon(k) }),
             el('div', {}, [el('div', { class: 'nm', text: piiLabel(k) }), el('div', { class: 'cf', text: 'observed' })]),
             el('div', { class: 'ct', text: String(counts[k]) }),
           ]));
         });
+        const extra = kinds.length - 2;
+        body.appendChild(el('a', { class: 'pii-more', href: '#/privacy', html: '<span>' + (extra > 0 ? '+' + extra + ' more · view full breakdown' : 'View full breakdown') + '</span>' + ICON.chevR }));
       }
-      body.appendChild(el('div', { class: 'modebar' }, [
-        el('div', { class: 't', html: 'Masking is <b>off</b> — observe only' }),
-        el('button', { class: 'switch', disabled: true, title: 'Masking is not available in this version', 'aria-label': 'Masking off (disabled)' }),
-      ]));
+      body.appendChild(el('div', { class: 'modebar', id: 'liveMaskBar' }));
+      this.renderMaskingBar();
+    },
+
+    // Functional masking toggle, reflecting the real /api/settings state and
+    // syncing with the Settings page. Masking is live-reloadable, so flipping it
+    // here applies immediately (no restart).
+    renderMaskingBar() {
+      const bar = $('#liveMaskBar');
+      if (!bar) return;
+      const on = this.masking.enabled;
+      const txt = on
+        ? 'Masking is <b>on</b> · ' + (this.masking.dryRun ? 'dry-run (observing)' : 'live (redacting)')
+        : 'Masking is <b>off</b> — observe only';
+      const sw = el('button', { class: 'switch' + (on ? ' on' : ''), 'aria-label': 'Toggle PII masking', title: on ? 'Masking on — click to turn off' : 'Masking off — click to turn on' });
+      sw.addEventListener('click', () => this.toggleMasking(!on, sw));
+      bar.innerHTML = '';
+      bar.appendChild(el('div', { class: 't', html: txt }));
+      bar.appendChild(sw);
+    },
+
+    async toggleMasking(next, sw) {
+      if (sw) sw.disabled = true;
+      try {
+        const updated = await api('/settings', { method: 'PUT', body: { maskingEnabled: next } });
+        this.masking = { enabled: !!updated.maskingEnabled, dryRun: !!updated.maskingDryRun };
+        hideBanner();
+      } catch (e) { handleApiError(e); }
+      this.renderMaskingBar();
     },
 
     renderEngine(ev) {
@@ -580,12 +844,8 @@
           el('div', { class: 'st', text: ev.mode + ' · ' + eng.adoptionState }),
         ]),
       ]));
-      const portsLine = el('div', { class: 'ports' });
-      portsLine.innerHTML = '<span class="muted">public</span> :' + esc(eng.publicPort) +
-        (eng.shadowPort != null ? ' <span class="arr">→</span> <span class="muted">shadow</span> :' + esc(eng.shadowPort) : '');
-      card.appendChild(portsLine);
-      const exp = ev.exposure;
-      card.appendChild(el('div', { class: 'expnote' + (exp.exposed ? ' danger' : ''), html: (exp.exposed ? ICON.alert : ICON.check) + ' ' + esc(exposureLine(exp)) }));
+      // Ports + exposure live on the Exposure KPI card and the Engines page;
+      // keep this card compact (engine identity + Manage).
       card.appendChild(el('div', { class: 'btnrow' }, [
         el('a', { class: 'btn', href: '#/engines', html: ICON.server + ' Manage' }),
       ]));
@@ -698,7 +958,7 @@
 
       if (msg.type === 'requestStarted') {
         const it = msg.item;
-        const row = reqRow(it, { streaming: it.stream, enter: true });
+        const row = reqRow(it, { columns: LIVE_COLS, streaming: it.stream, enter: true });
         this.seen[it.id] = row;
         stream.prepend(row);
         while (stream.children.length > 8) {
@@ -713,20 +973,14 @@
         if (row) row.classList.add('streaming');
       } else if (msg.type === 'finished') {
         const it = msg.item;
-        const fresh = reqRow(it, {});
+        const fresh = reqRow(it, { columns: LIVE_COLS });
         const old = this.seen[it.id];
         if (old && old.parentNode) { old.parentNode.replaceChild(fresh, old); }
         else { stream.prepend(fresh); }
         this.seen[it.id] = fresh;
       } else if (msg.type === 'pii') {
-        const row = this.seen[msg.id];
-        if (row) {
-          const appLine = row.querySelector('.app');
-          if (appLine && !appLine.querySelector('.piibadge[data-k="' + msg.finding.kind + '"]')) {
-            const b = el('span', { class: 'piibadge' + (msg.finding.kind === 'api_key' ? ' key' : ''), 'data-k': msg.finding.kind, text: piiShort(msg.finding.kind) });
-            appLine.appendChild(b);
-          }
-        }
+        // Badges render from the row item's piiKinds (collapsed to "first + N");
+        // the live finding event just advances the KPI + privacy lens.
         this.bumpPii();
       }
     },
@@ -779,14 +1033,25 @@
   /* =========================================================================
      PAGE: HISTORY
      ========================================================================= */
+  /* Paginated: instead of an endlessly-growing "Load older" list, History now
+     shows ONE page of results in a fixed, internally-scrolling card and moves
+     between pages with Prev/Next "tabs" + a rows-per-page drop-down. The API is
+     cursor-based (`beforeTs`), so we keep fetched pages in `pages[]` and walk a
+     `pageIndex`; going forward past the last fetched page fetches the next one. */
   const History = {
     title: 'History',
     sub: 'Every proxied exchange — searchable, filterable, on-device.',
-    q: '', piiOnly: false, items: [], loading: false, exhausted: false,
+    q: '', piiOnly: false, pageSize: 25,
+    pages: [],        // fetched pages: array of arrays of HistoryItem (each non-empty)
+    pageIndex: 0,     // which fetched page is currently shown (0-based)
+    exhausted: false, // true once the last fetch returned < pageSize (no more pages)
+    loading: false,
 
     async render(view) {
-      this.q = ''; this.piiOnly = false; this.items = []; this.exhausted = false;
+      this.q = ''; this.piiOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
       view.innerHTML = '';
+
+      // toolbar: search + PII-only + rows-per-page drop-down
       const search = el('input', { class: 'input', type: 'search', placeholder: 'Search app, model, or endpoint…', value: this.q });
       let t;
       search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
@@ -794,46 +1059,115 @@
         (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.piiOnly = c.checked; this.reload(); }); return c; })(),
         document.createTextNode('PII only'),
       ]);
-      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle]);
-      const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [el('div', { class: 'list', id: 'histList' })]);
-      const more = el('div', { style: 'margin-top:14px;text-align:center' }, [
-        el('button', { class: 'btn auto', id: 'histMore', style: 'display:none;margin:0 auto', text: 'Load older' }),
+      const sizeSel = dropdown(
+        [10, 25, 50, 100].map((n) => ({ value: n, label: n + ' / page' })),
+        this.pageSize,
+        (v) => { this.pageSize = parseInt(v, 10); this.reload(); },
+        { ariaLabel: 'Rows per page', align: 'right' }
+      );
+      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle, sizeSel]);
+
+      // bounded, internally-scrolling list card (columnar table; header fixed above the scroll body)
+      const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        el('div', { class: 'ttable', style: '--gtc:' + gtcFor(HIST_COLS) }, [
+          reqHead(HIST_COLS),
+          el('div', { class: 'list', id: 'histList' }),
+        ]),
       ]);
+
+      // pager: row-count + Prev / page indicator / Next
+      const prevBtn = el('button', { class: 'pgbtn', id: 'histPrev', html: ICON.chevL + '<span>Prev</span>' });
+      prevBtn.addEventListener('click', () => this.goPrev());
+      const nextBtn = el('button', { class: 'pgbtn', id: 'histNext', html: '<span>Next</span>' + ICON.chevR });
+      nextBtn.addEventListener('click', () => this.goNext());
+      const pager = el('div', { class: 'pager reveal', style: 'animation-delay:.1s' }, [
+        el('span', { class: 'count', id: 'histCount' }),
+        el('div', { class: 'grow' }),
+        el('div', { class: 'pgnav' }, [prevBtn, el('span', { class: 'pgind', id: 'histPgInd' }), nextBtn]),
+      ]);
+
       view.appendChild(toolbar);
       view.appendChild(listCard);
-      view.appendChild(more);
-      $('#histMore').addEventListener('click', () => this.loadMore());
+      view.appendChild(pager);
       await this.reload();
     },
 
     async reload() {
-      this.items = []; this.exhausted = false;
+      this.pages = []; this.pageIndex = 0; this.exhausted = false;
       const list = $('#histList');
       if (list) { list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Loading history…' })])); }
-      await this.loadMore(true);
+      this.setPagerDisabled(true);
+      await this.fetchNextPage();
+      this.renderPage();
     },
 
-    async loadMore(fresh) {
+    // Fetch the page after the last one we hold (cursor = ts of its last row).
+    async fetchNextPage() {
       if (this.loading || this.exhausted) return;
       this.loading = true;
       const params = new URLSearchParams();
       if (this.q) params.set('q', this.q);
       if (this.piiOnly) params.set('piiOnly', 'true');
-      params.set('limit', '50');
-      if (!fresh && this.items.length) params.set('beforeTs', String(this.items[this.items.length - 1].ts));
+      params.set('limit', String(this.pageSize));
+      const last = this.pages[this.pages.length - 1];
+      if (last && last.length) params.set('beforeTs', String(last[last.length - 1].ts));
       let rows;
       try { rows = await api('/history?' + params.toString()); hideBanner(); }
       catch (e) { handleApiError(e); this.loading = false; return; }
-      const list = $('#histList');
-      if (fresh && list) list.innerHTML = '';
-      if (rows.length < 50) this.exhausted = true;
-      if (fresh && rows.length === 0) {
-        if (list) list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'big', text: 'No matching exchanges' }), el('div', { class: 'sm', text: this.q || this.piiOnly ? 'Try clearing the filters.' : 'Traffic will appear here as your apps talk to local models.' })]));
-      }
-      rows.forEach((it) => { this.items.push(it); if (list) list.appendChild(reqRow(it, {})); });
+      if (rows.length < this.pageSize) this.exhausted = true;
+      if (rows.length > 0) this.pages.push(rows);
       this.loading = false;
-      const more = $('#histMore');
-      if (more) more.style.display = this.exhausted || rows.length === 0 ? 'none' : 'inline-flex';
+    },
+
+    async goNext() {
+      if (this.loading) return;
+      if (this.pageIndex < this.pages.length - 1) { this.pageIndex++; this.renderPage(); return; }
+      if (this.exhausted) return;
+      this.setPagerDisabled(true);
+      await this.fetchNextPage();
+      if (this.pageIndex < this.pages.length - 1) this.pageIndex++;
+      this.renderPage();
+    },
+
+    goPrev() {
+      if (this.loading || this.pageIndex === 0) return;
+      this.pageIndex--;
+      this.renderPage();
+    },
+
+    renderPage() {
+      const list = $('#histList');
+      if (!list) return;
+      const page = this.pages[this.pageIndex] || [];
+      list.innerHTML = '';
+      if (page.length === 0) {
+        list.appendChild(el('div', { class: 'state' }, [
+          el('div', { class: 'big', text: 'No matching exchanges' }),
+          el('div', { class: 'sm', text: (this.q || this.piiOnly) ? 'Try clearing the filters.' : 'Traffic will appear here as your apps talk to local models.' }),
+        ]));
+      } else {
+        page.forEach((it) => list.appendChild(reqRow(it, { columns: HIST_COLS })));
+        list.scrollTop = 0;
+      }
+
+      // pager labels + button state
+      const base = this.pageIndex * this.pageSize;
+      const count = $('#histCount');
+      if (count) {
+        const totalLoaded = this.pages.reduce((a, p) => a + p.length, 0);
+        count.textContent = page.length
+          ? 'Showing ' + (base + 1) + '–' + (base + page.length) + (this.exhausted ? ' of ' + totalLoaded : '')
+          : '';
+      }
+      const ind = $('#histPgInd');
+      if (ind) { ind.innerHTML = ''; ind.appendChild(document.createTextNode('Page ')); ind.appendChild(el('b', { text: String(this.pageIndex + 1) })); }
+      const prev = $('#histPrev'); if (prev) prev.disabled = this.pageIndex === 0;
+      const next = $('#histNext'); if (next) next.disabled = (this.pageIndex >= this.pages.length - 1) && this.exhausted;
+    },
+
+    setPagerDisabled(d) {
+      const prev = $('#histPrev'); if (prev) prev.disabled = d || this.pageIndex === 0;
+      const next = $('#histNext'); if (next) next.disabled = d;
     },
 
     teardown() {},
@@ -1045,6 +1379,7 @@
     title: 'Settings',
     sub: 'Local configuration — written to the on-device config file.',
     saving: false,
+    tab: 'general',  // preserved across re-draws so a toggle doesn't jump tabs
 
     async render(view) {
       view.innerHTML = '';
@@ -1058,78 +1393,93 @@
 
     draw(view, s) {
       view.innerHTML = '';
+      const TABS = [
+        { key: 'general', label: 'General', icon: ICON.server },
+        { key: 'privacy', label: 'Privacy & data', icon: ICON.shield },
+        { key: 'system', label: 'System', icon: ICON.terminal },
+      ];
+      const bar = el('div', { class: 'tabbar reveal', role: 'tablist', 'aria-label': 'Settings sections' });
+      TABS.forEach((t) => {
+        const sel = this.tab === t.key;
+        const b = el('button', { class: 'tab' + (sel ? ' active' : ''), type: 'button', role: 'tab', 'aria-selected': sel ? 'true' : 'false', html: t.icon + '<span>' + esc(t.label) + '</span>' });
+        b.addEventListener('click', () => { if (this.tab !== t.key) { this.tab = t.key; this.draw(view, s); } });
+        bar.appendChild(b);
+      });
+      view.appendChild(bar);
+
+      const panel = el('div', { class: 'tabpanel reveal', role: 'tabpanel' });
+      view.appendChild(panel);
+      if (this.tab === 'privacy') this.panelPrivacy(panel, view, s);
+      else if (this.tab === 'system') this.panelSystem(panel, view, s);
+      else this.panelGeneral(panel, view, s);
+    },
+
+    panelGeneral(panel, view, s) {
       const card = el('div', { class: 'card reveal' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Interception' })])]);
-
-      // mode
-      const modeSel = el('select', { class: 'select' });
-      [['cooperative', 'Cooperative'], ['gateway', 'Gateway']].forEach(([v, t]) => {
-        const o = el('option', { value: v, text: t }); if (s.mode === v) o.selected = true; modeSel.appendChild(o);
-      });
-      modeSel.addEventListener('change', () => this.save(view, { mode: modeSel.value }));
+      const modeSel = dropdown(
+        [{ value: 'cooperative', label: 'Cooperative' }, { value: 'gateway', label: 'Gateway' }],
+        s.mode, (v) => this.save(view, { mode: v }), { ariaLabel: 'Mode' }
+      );
       card.appendChild(setRow('Mode', 'Cooperative (universal) or Gateway (supervised, owns the port).', el('div', { class: 'ctl' }, [modeSel])));
-
-      // handover
-      const hoSel = el('select', { class: 'select' });
-      [['handover', 'Handover'], ['stop', 'Stop']].forEach(([v, t]) => {
-        const o = el('option', { value: v, text: t }); if (s.handover === v) o.selected = true; hoSel.appendChild(o);
-      });
-      hoSel.addEventListener('change', () => this.save(view, { handover: hoSel.value }));
+      const hoSel = dropdown(
+        [{ value: 'handover', label: 'Handover' }, { value: 'stop', label: 'Stop' }],
+        s.handover, (v) => this.save(view, { handover: v }), { ariaLabel: 'Handover policy' }
+      );
       card.appendChild(setRow('Handover policy', 'On shutdown in Gateway mode: hand the engine back, or stop it.', el('div', { class: 'ctl' }, [hoSel])));
+      panel.appendChild(card);
+    },
 
-      view.appendChild(card);
-
-      // Privacy card
-      const privCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Privacy & storage' })])]);
-
-      // payload storage toggle
+    panelPrivacy(panel, view, s) {
+      // Privacy & storage
+      const privCard = el('div', { class: 'card reveal' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Privacy & storage' })])]);
       const sw = el('button', { class: 'switch' + (s.payloadStorage ? ' on' : ''), 'aria-label': 'Toggle payload storage' });
-      sw.addEventListener('click', () => {
+      sw.addEventListener('click', async () => {
         const next = !sw.classList.contains('on');
-        if (next && !confirm('Store raw prompts & responses on this device?\n\nBy default Saffev keeps metadata only. Turning this on records full payloads (still on-device, encrypted). This is an explicit, logged action.')) return;
+        if (next) {
+          const ok = await confirmModal({
+            title: 'Store raw payloads?',
+            body: 'By default Saffev keeps metadata only.\n\nTurning this on records full prompts & responses on this device (still encrypted, on-device). This is an explicit, logged action.',
+            confirmLabel: 'Store payloads', danger: true,
+          });
+          if (!ok) return;
+        }
         this.save(view, { payloadStorage: next });
       });
-      const payCtl = el('div', { class: 'ctl' }, [sw]);
       const payHint = s.payloadStorage
         ? 'On — full prompts & responses are retained on this device.'
         : 'Off — metadata-only (default). Raw payloads are never stored.';
-      const payRow = setRow('Store raw payloads', payHint, payCtl);
+      const payRow = setRow('Store raw payloads', payHint, el('div', { class: 'ctl' }, [sw]));
       if (s.payloadStorage) payRow.querySelector('.hint').classList.add('danger-note');
       privCard.appendChild(payRow);
-
-      // retention
       const retVal = retentionText(s.retention);
-      const retSel = el('select', { class: 'select' });
-      [['age30', 'Age · 30 days'], ['age7', 'Age · 7 days'], ['age90', 'Age · 90 days'], ['size500', 'Size · 500 MB'], ['unlimited', 'Unlimited']].forEach(([v, t]) => {
-        const o = el('option', { value: v, text: t }); retSel.appendChild(o);
-      });
-      retSel.value = retentionKey(s.retention);
-      retSel.addEventListener('change', () => this.save(view, { retention: retentionFromKey(retSel.value) }));
+      const retSel = dropdown(
+        [['age30', 'Age · 30 days'], ['age7', 'Age · 7 days'], ['age90', 'Age · 90 days'], ['size500', 'Size · 500 MB'], ['unlimited', 'Unlimited']].map(([v, t]) => ({ value: v, label: t })),
+        retentionKey(s.retention), (v) => this.save(view, { retention: retentionFromKey(v) }), { ariaLabel: 'Retention' }
+      );
       privCard.appendChild(setRow('Retention', 'How long exchanges are kept before pruning. Currently: ' + retVal + '.', el('div', { class: 'ctl' }, [retSel])));
+      panel.appendChild(privCard);
 
-      view.appendChild(privCard);
-
-      // Masking card (opt-in PII redaction, dry-run by default).
-      const maskCard = el('div', { class: 'card reveal', style: 'animation-delay:.09s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'PII masking' })])]);
-
-      // master enable toggle
+      // PII masking (opt-in redaction, dry-run by default)
+      const maskCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'PII masking' })])]);
       const mEnable = el('button', { class: 'switch' + (s.maskingEnabled ? ' on' : ''), 'aria-label': 'Toggle PII masking' });
-      mEnable.addEventListener('click', () => {
-        const next = !mEnable.classList.contains('on');
-        this.save(view, { maskingEnabled: next });
-      });
+      mEnable.addEventListener('click', () => { const next = !mEnable.classList.contains('on'); this.save(view, { maskingEnabled: next }); });
       const enHint = s.maskingEnabled
         ? 'On — high-confidence PII detectors feed the masking pipeline.'
         : 'Off — observe-only (default). Traffic is never altered.';
       maskCard.appendChild(setRow('Enable masking', enHint, el('div', { class: 'ctl' }, [mEnable])));
-
-      // dry-run toggle (only meaningful when enabled)
       const mDry = el('button', { class: 'switch' + (s.maskingDryRun ? ' on' : ''), 'aria-label': 'Toggle masking dry-run' });
       if (!s.maskingEnabled) mDry.setAttribute('disabled', '');
-      mDry.addEventListener('click', () => {
+      mDry.addEventListener('click', async () => {
         if (!s.maskingEnabled) return;
         const next = !mDry.classList.contains('on');
-        // Leaving dry-run turns on real request redaction — confirm explicitly.
-        if (!next && !confirm('Turn OFF dry-run and start redacting requests?\n\nWith dry-run off, high-confidence PII (email, card, API key, IP, phone) is removed from request bodies BEFORE they reach the model. Responses and streaming are unaffected. Fail-open: any error forwards the original request.')) return;
+        if (!next) {
+          const ok = await confirmModal({
+            title: 'Turn off dry-run?',
+            body: 'With dry-run off, high-confidence PII (email, card, API key, IP, phone) is redacted from request bodies BEFORE they reach the model. Responses and streaming are unaffected.\n\nFail-open: any error forwards the original request unchanged.',
+            confirmLabel: 'Start redacting', danger: true,
+          });
+          if (!ok) return;
+        }
         this.save(view, { maskingDryRun: next });
       });
       const dryHint = !s.maskingEnabled
@@ -1140,17 +1490,17 @@
       const dryRow = setRow('Dry-run', dryHint, el('div', { class: 'ctl' }, [mDry]));
       if (s.maskingEnabled && !s.maskingDryRun) dryRow.querySelector('.hint').classList.add('danger-note');
       maskCard.appendChild(dryRow);
+      panel.appendChild(maskCard);
+    },
 
-      view.appendChild(maskCard);
-
-      // Read-only system card
-      const sysCard = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'System' })])]);
+    panelSystem(panel, view, s) {
+      const sysCard = el('div', { class: 'card reveal' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'System' })])]);
       sysCard.appendChild(setRow('Data directory', 'Config + encrypted database location.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: s.dataDir })])));
       sysCard.appendChild(setRow('Proxy port', 'Where apps send local-LLM traffic.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: ':' + s.proxyPort })])));
       sysCard.appendChild(setRow('Studio port', 'This control plane.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: ':' + s.studioPort })])));
       const patterns = (s.customPatterns && s.customPatterns.length) ? s.customPatterns.join(', ') : 'none';
       sysCard.appendChild(setRow('Custom PII patterns', 'User-defined detectors (configured in the config file).', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: patterns })])));
-      view.appendChild(sysCard);
+      panel.appendChild(sysCard);
     },
 
     async save(view, update) {
@@ -1162,6 +1512,446 @@
       } catch (e) { handleApiError(e); }
       this.saving = false;
     },
+    teardown() {},
+  };
+
+  /* =========================================================================
+     PAGE: ABOUT & INTEGRATE
+     A friendly, plain-language explainer + a developer integration guide,
+     including a copyable prompt you can hand to an AI coding agent so it can
+     wire any app's local-LLM traffic through Saffev.
+     ========================================================================= */
+  const REPO_URL = 'https://github.com/theoyinbooke/Saffev';
+  const INSTALL_CMD = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/theoyinbooke/Saffev/releases/latest/download/saffev-installer.sh | sh";
+
+  function aboutChip(icon, text) {
+    return el('span', { class: 'about-chip', html: icon + '<span>' + esc(text) + '</span>' });
+  }
+  function featureCard(icon, role, title, desc) {
+    return el('div', { class: 'feat' }, [
+      el('div', { class: 'feat-ic ic ' + role, html: icon }),
+      el('div', {}, [el('div', { class: 'feat-t', text: title }), el('div', { class: 'feat-d', text: desc })]),
+    ]);
+  }
+  function aboutSection(icon, title, kicker) {
+    const head = el('div', { class: 'about-sec-head' }, [
+      el('span', { class: 'about-sec-ic', html: icon }),
+      el('div', {}, [el('h3', { text: title }), kicker ? el('div', { class: 'about-sec-kicker', text: kicker }) : null]),
+    ]);
+    return head;
+  }
+
+  const About = {
+    title: 'About & integrate',
+    sub: 'What Saffev is, what it does, and how to point your apps — and AI agents — at it.',
+    tab: 'overview',
+    version: '', proxyPort: 8088, studioPort: 7100,
+    TABS: [
+      { k: 'overview', l: 'Overview', icon: ICON.eye },
+      { k: 'start', l: 'Quick start', icon: ICON.download },
+      { k: 'integrate', l: 'Integrate', icon: ICON.sparkles },
+    ],
+
+    async render(view) {
+      view.innerHTML = '';
+      // Best-effort live values; fail-soft to the documented defaults.
+      try { const h = await api('/health'); this.version = h.version || ''; } catch (e) {}
+      try { const s = await api('/settings'); this.proxyPort = s.proxyPort || this.proxyPort; this.studioPort = s.studioPort || this.studioPort; } catch (e) {}
+      hideBanner();
+
+      const bar = el('div', { class: 'tabbar reveal', role: 'tablist', 'aria-label': 'About sections' });
+      this.TABS.forEach((t) => {
+        const b = el('button', { class: 'tab' + (this.tab === t.k ? ' active' : ''), type: 'button', role: 'tab', 'data-k': t.k, html: t.icon + '<span>' + esc(t.l) + '</span>' });
+        b.addEventListener('click', () => { if (this.tab !== t.k) { this.tab = t.k; this.draw(); } });
+        bar.appendChild(b);
+      });
+      view.appendChild(bar);
+      view.appendChild(el('div', { class: 'tabpanel', id: 'aboutPanel' }));
+      this.draw();
+    },
+
+    draw() {
+      const panel = $('#aboutPanel');
+      if (!panel) return;
+      $$('.tabbar .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
+      panel.innerHTML = '';
+      const proxyUrl = 'http://localhost:' + this.proxyPort;
+      const studioUrl = (window.location && window.location.origin) || ('http://localhost:' + this.studioPort);
+      if (this.tab === 'start') {
+        panel.appendChild(this.quickStart(proxyUrl, studioUrl));
+        panel.appendChild(this.pointApp(proxyUrl));
+      } else if (this.tab === 'integrate') {
+        panel.appendChild(this.agentPrompt(proxyUrl, studioUrl));
+        panel.appendChild(this.footer(this.version));
+      } else {
+        panel.appendChild(this.hero(this.version));
+        panel.appendChild(this.features());
+        panel.appendChild(this.howItWorks(this.proxyPort));
+      }
+    },
+
+    hero(version) {
+      return el('div', { class: 'card reveal about-hero' }, [
+        el('span', { class: 'about-badge', html: ICON.eye + '<span>A glass box for local AI</span>' }),
+        el('h2', { class: 'about-h1', text: 'See exactly what your apps send to local models — and keep it on this device.' }),
+        el('p', { class: 'about-lead', text: 'Saffev is a transparent proxy that sits in front of your local LLM engine (like Ollama). Every request your apps make passes through it, so you can watch the traffic live, catch leaked personal data, and confirm nothing is exposed to the network — all on this device, encrypted, with no telemetry.' }),
+        el('div', { class: 'about-chips' }, [
+          aboutChip(ICON.shield, 'On-device only'),
+          aboutChip(ICON.check, 'Encrypted at rest'),
+          aboutChip(ICON.globe, 'No telemetry'),
+          version ? aboutChip(ICON.bolt, 'v' + version) : null,
+        ]),
+      ]);
+    },
+
+    features() {
+      const grid = el('div', { class: 'feat-grid' }, [
+        featureCard(ICON.pulse, 'brand', 'Live traffic', 'A real-time stream of every request your apps make to local models — app, model, endpoint, latency, tokens.'),
+        featureCard(ICON.clock, 'gold', 'History', 'Every proxied exchange, searchable and filterable, kept on-device with a retention policy you control.'),
+        featureCard(ICON.shieldAlert, 'danger', 'Privacy lens', 'Deterministic detection of PII — email, credit card, API keys, IP, phone — flagged as it flows by.'),
+        featureCard(ICON.globe, 'safe', 'Exposure doctor', 'Confirms the engine and Studio are bound to localhost only and not reachable from the network.'),
+        featureCard(ICON.eye, 'brand', 'PII masking', 'Optionally redact high-confidence PII from requests before they reach the model (dry-run first).'),
+        featureCard(ICON.server, 'gold', 'Cooperative & Gateway', 'Cooperative: apps point at Saffev (universal, zero-config). Gateway: Saffev supervises the engine port.'),
+      ]);
+      return el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        aboutSection(ICON.sparkles, 'What it does', 'Six things, all local'),
+        grid,
+      ]);
+    },
+
+    howItWorks(proxyPort) {
+      const flow = el('div', { class: 'flow' }, [
+        el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: 'Your app' }), el('div', { class: 'flow-d', text: 'set base URL → Saffev' })]),
+        el('div', { class: 'flow-arrow', html: ICON.chevR }),
+        el('div', { class: 'flow-node brandnode' }, [el('div', { class: 'flow-t', text: 'Saffev' }), el('div', { class: 'flow-d', text: ':' + proxyPort + ' · observes + guards' })]),
+        el('div', { class: 'flow-arrow', html: ICON.chevR }),
+        el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: 'Ollama' }), el('div', { class: 'flow-d', text: ':11434 · untouched' })]),
+      ]);
+      return el('div', { class: 'card reveal', style: 'animation-delay:.09s' }, [
+        aboutSection(ICON.plug, 'How it works', 'Cooperative mode — a transparent pass-through'),
+        flow,
+        el('p', { class: 'about-p', text: 'Your app talks to Saffev instead of the engine directly. Saffev forwards every request unchanged to the real engine and streams the response straight back — recording only metadata on-device (never the raw prompt or response unless you explicitly turn that on).' }),
+      ]);
+    },
+
+    quickStart(proxyUrl, studioUrl) {
+      const card = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [
+        aboutSection(ICON.download, 'Quick start', 'Install, run, open'),
+      ]);
+      card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '1' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Install (macOS / Linux)' }), copyBlock(INSTALL_CMD, { title: 'terminal' })])]));
+      card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '2' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Start it (zero-config — picks free ports, never grabs your engine)' }), copyBlock('saffev start', { title: 'terminal' })])]));
+      card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '3' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Open the Studio' }), el('p', { class: 'about-p', html: 'This dashboard, at <a class="about-link" href="' + esc(studioUrl) + '">' + esc(studioUrl) + '</a>. Run <span class="kv">saffev status</span> anytime to see the exact ports.' })])]));
+      return card;
+    },
+
+    pointApp(proxyUrl) {
+      return el('div', { class: 'card reveal', style: 'animation-delay:.15s' }, [
+        aboutSection(ICON.bolt, 'Point an app at Saffev', 'So its traffic shows up here'),
+        el('p', { class: 'about-p', text: 'Set your app’s local-LLM base URL to the Saffev proxy. It forwards to your real Ollama, so nothing else changes. Use an environment variable so it’s easy to revert.' }),
+        copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env  (Ollama-style)' }),
+        el('p', { class: 'about-p', text: 'If your app uses the OpenAI-compatible API instead:' }),
+        copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env  (OpenAI-compatible)' }),
+      ]);
+    },
+
+    agentPrompt(proxyUrl, studioUrl) {
+      const prompt =
+'You are integrating an existing app with "Saffev" — a local, on-device AI observability\n' +
+'& safety proxy that sits in front of a local LLM engine (e.g. Ollama). Saffev runs in\n' +
+'"cooperative" mode: it listens on a local proxy port and transparently forwards every\n' +
+'request to the real engine, recording only metadata on-device (no raw prompt/response\n' +
+'unless the user opts in). It is a pure pass-through: request/response shapes, headers,\n' +
+'model names, and streaming are unchanged.\n' +
+'\n' +
+'GOAL\n' +
+'Make THIS app send its local-LLM / Ollama traffic THROUGH Saffev’s proxy instead of\n' +
+'talking to the engine directly, without changing any app behavior.\n' +
+'\n' +
+'CONTEXT\n' +
+'- Saffev proxy URL: ' + proxyUrl + '   (forwards to the real Ollama on :11434)\n' +
+'- Saffev Studio (dashboard): ' + studioUrl + '\n' +
+'- The exact proxy URL is also printed by:  saffev status\n' +
+'\n' +
+'STEPS\n' +
+'1. Find where this app configures its model endpoint. Look for:\n' +
+'   - env vars: OLLAMA_HOST, OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENAI_API_BASE\n' +
+'   - hardcoded URLs containing :11434, "localhost:11434", or "127.0.0.1:11434"\n' +
+'   - SDK clients (ollama, openai, langchain, llamaindex, …) set with a base URL\n' +
+'2. Repoint the base URL at the Saffev proxy. Prefer an env var so it is reversible:\n' +
+'       OLLAMA_BASE_URL=' + proxyUrl + '\n' +
+'   If the app uses the OpenAI-compatible API, use:\n' +
+'       OPENAI_BASE_URL=' + proxyUrl + '/v1\n' +
+'   If the URL is hardcoded, replace ONLY the origin (host:port) with ' + proxyUrl + ';\n' +
+'   keep the path (e.g. /api/chat, /v1/chat/completions) exactly as-is.\n' +
+'3. Do NOT change request bodies, headers, model names, or streaming behavior.\n' +
+'4. Restart the app.\n' +
+'\n' +
+'VERIFY\n' +
+'- Open ' + studioUrl + ', go to "Live", and trigger an action that calls the model.\n' +
+'- A new row should appear in the Traffic stream. If it does, the integration works.\n' +
+'\n' +
+'RULES\n' +
+'- Only use the PROXY port (from ' + proxyUrl + '); never point the app at the Studio port.\n' +
+'- Keep a one-line way to revert (point the base URL back at http://localhost:11434).\n' +
+'- Nothing about the user or the traffic leaves the device.\n' +
+'\n' +
+'OUTPUT\n' +
+'Report the exact file and line you changed, and the one-line edit to revert.';
+      return el('div', { class: 'card reveal', style: 'animation-delay:.18s' }, [
+        aboutSection(ICON.sparkles, 'Give this to your AI coding agent', 'Copy → paste into Claude Code, Cursor, etc.'),
+        el('p', { class: 'about-p', text: 'Hand this prompt to an AI coding agent working in your app’s repo. It has everything needed to wire the app through Saffev and verify it worked.' }),
+        copyBlock(prompt, { title: 'prompt for your AI coding agent' }),
+      ]);
+    },
+
+    footer(version) {
+      const row = el('div', { class: 'about-foot' }, [
+        el('a', { class: 'btn auto', href: REPO_URL, target: '_blank', rel: 'noopener', html: ICON.link + '<span>GitHub repository</span>' }),
+        el('div', { class: 'spacer' }),
+        el('span', { class: 'about-foot-meta', text: (version ? 'Saffev v' + version + ' · ' : 'Saffev · ') + 'MIT / Apache-2.0 · on-device, no telemetry' }),
+      ]);
+      return el('div', { class: 'card reveal', style: 'animation-delay:.21s' }, [row]);
+    },
+
+    teardown() {},
+  };
+
+  /* =========================================================================
+     PAGE: ANALYTICS
+     Granular, on-device analytics. Fetches a single aggregated report from
+     /api/analytics for the selected window and renders it across tabs with the
+     SVG chart toolkit (window.SaffevCharts). Nothing leaves the device.
+     ========================================================================= */
+  function anCard(titleText, sub, node, wide) {
+    return el('div', { class: 'card reveal' + (wide ? ' span2' : '') }, [
+      el('div', { class: 'hrow' }, [el('h3', { text: titleText }), el('div', { class: 'spacer' }), sub ? el('span', { class: 'tag', text: sub }) : null]),
+      node,
+    ]);
+  }
+  function anKpi(role, icon, label, value, subNode, spark) {
+    return el('div', { class: 'card kpi reveal' }, [
+      el('div', { class: 'label' }, [el('span', { class: 'ic ' + role, html: icon }), document.createTextNode(' ' + label)]),
+      el('div', { class: 'val num', html: value }),
+      subNode || null,
+      spark ? el('div', { class: 'kpi-spark' }, [spark]) : null,
+    ]);
+  }
+  function miniStat(label, value) {
+    return el('div', { class: 'card kpi reveal' }, [el('div', { class: 'label', text: label }), el('div', { class: 'val num', html: value })]);
+  }
+  function deltaNode(cur, prev, goodUp) {
+    if (prev == null || prev === 0) return el('div', { class: 'meta', text: cur > 0 ? 'new this period' : '—' });
+    const pct = Math.round(((cur - prev) / prev) * 100);
+    if (pct === 0) return el('div', { class: 'meta', text: 'no change vs prev' });
+    const up = pct > 0;
+    return el('div', { class: 'delta ' + (up === goodUp ? 'up' : 'down'), text: (up ? '▲ ' : '▼ ') + Math.abs(pct) + '% vs prev' });
+  }
+  const actionLabel = (a) => ({ Observed: 'Observed', WouldMask: 'Would mask (dry-run)', Masked: 'Masked' }[a] || a);
+  function dataTable(headers, rows) {
+    const gtc = headers.map((h, i) => (i === 0 ? 'minmax(120px,1.4fr)' : '1fr')).join(' ');
+    const t = el('div', { class: 'ttable', style: '--gtc:' + gtc });
+    const head = el('div', { class: 'thead' });
+    headers.forEach((h, i) => head.appendChild(el('div', { class: 'th' + (i > 0 ? ' r' : ''), text: h })));
+    t.appendChild(head);
+    const body = el('div', { class: 'list', style: 'max-height:none' });
+    if (!rows.length) body.appendChild(el('div', { class: 'state sm', text: 'No data.' }));
+    rows.forEach((r) => {
+      const tr = el('div', { class: 'trow', style: 'cursor:default' });
+      r.forEach((c, i) => tr.appendChild(el('div', { class: 'tcell' + (i > 0 ? ' r' : ''), text: c })));
+      body.appendChild(tr);
+    });
+    t.appendChild(body);
+    return t;
+  }
+  function downloadFile(name, text, type) {
+    try {
+      const blob = new Blob([text], { type });
+      const url = URL.createObjectURL(blob);
+      const a = el('a', { href: url, download: name });
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (e) { /* ignore */ }
+  }
+
+  const Analytics = {
+    title: 'Analytics',
+    sub: 'Granular, on-device insight into your local-AI traffic — nothing leaves this device.',
+    tab: 'overview',
+    rangeMs: 24 * 60 * 60 * 1000,
+    data: null,
+    RANGES: [
+      { value: 3600000, label: 'Last hour' },
+      { value: 86400000, label: 'Last 24 hours' },
+      { value: 604800000, label: 'Last 7 days' },
+      { value: 2592000000, label: 'Last 30 days' },
+    ],
+    TABS: [
+      { k: 'overview', l: 'Overview' },
+      { k: 'usage', l: 'Usage' },
+      { k: 'performance', l: 'Performance' },
+      { k: 'privacy', l: 'Privacy' },
+      { k: 'explorer', l: 'Explorer' },
+    ],
+
+    async render(view) {
+      view.innerHTML = '';
+      const tabs = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Analytics sections' });
+      this.TABS.forEach((t) => {
+        const b = el('button', { class: 'tab' + (this.tab === t.k ? ' active' : ''), type: 'button', role: 'tab', 'data-k': t.k, text: t.l });
+        b.addEventListener('click', () => { if (this.tab !== t.k) { this.tab = t.k; this.renderTab(); } });
+        tabs.appendChild(b);
+      });
+      const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.reload(); }, { ariaLabel: 'Time range', align: 'right' });
+      view.appendChild(el('div', { class: 'an-head reveal' }, [tabs, el('div', { class: 'spacer' }), el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
+      view.appendChild(el('div', { class: 'an-panel', id: 'anPanel' }));
+      await this.reload();
+    },
+
+    async reload() {
+      const panel = $('#anPanel');
+      if (panel) { panel.innerHTML = ''; panel.appendChild(loadingState('Crunching analytics…')); }
+      try {
+        const tz = new Date().getTimezoneOffset();
+        this.data = await api('/analytics?rangeMs=' + this.rangeMs + '&tzOffsetMin=' + tz);
+        hideBanner();
+      } catch (e) {
+        handleApiError(e);
+        if (panel) { panel.innerHTML = ''; panel.appendChild(emptyState('Could not load analytics', e.message || '')); }
+        return;
+      }
+      this.renderTab();
+    },
+
+    renderTab() {
+      $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
+      const panel = $('#anPanel');
+      if (!panel || !this.data) return;
+      panel.innerHTML = '';
+      const d = this.data;
+      if (d.totalRequests === 0 && this.tab !== 'overview') {
+        panel.appendChild(emptyState('No traffic in this window', 'Try a longer window, or point an app at the proxy (see About & integrate).'));
+        return;
+      }
+      ({ overview: this.overview, usage: this.usage, performance: this.performance, privacy: this.privacy, explorer: this.explorer }[this.tab] || this.overview).call(this, panel, d);
+    },
+
+    xLabels(d) {
+      const daily = d.bucketMs >= 86400000;
+      return d.series.map((b) => {
+        const dt = new Date(b.ts);
+        const p2 = (n) => String(n).padStart(2, '0');
+        return daily ? dt.toLocaleString(undefined, { month: 'short' }) + ' ' + dt.getDate() : p2(dt.getHours()) + ':' + p2(dt.getMinutes());
+      });
+    },
+
+    overview(panel, d) {
+      const C = window.SaffevCharts;
+      const xl = this.xLabels(d);
+      const kpis = el('section', { class: 'grid kpis reveal' }, [
+        anKpi('brand', ICON.pulse, 'Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
+        anKpi('gold', ICON.bolt, 'Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'meta', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
+        anKpi('brand', ICON.clock, 'Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
+        anKpi('danger', ICON.shieldAlert, 'PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
+      ]);
+      panel.appendChild(kpis);
+      const cost = el('div', { class: 'card reveal an-cost' }, [
+        el('div', { class: 'label' }, [el('span', { class: 'ic safe', html: ICON.sparkles }), document.createTextNode(' Cloud cost avoided')]),
+        el('div', { class: 'an-cost-val', text: '$' + (d.estCostSavedUsd || 0).toFixed(2) }),
+        el('div', { class: 'meta', text: d.costBasis + ' · ' + fmtNum(d.totalInputTokens + d.totalOutputTokens) + ' tokens on-device' }),
+      ]);
+      const activity = anCard('Activity', 'requests over time', C.lineArea({ series: [{ name: 'Requests', values: d.series.map((b) => b.requests), color: 'var(--brand)' }], xLabels: xl }));
+      panel.appendChild(el('section', { class: 'an-grid' }, [activity, cost]));
+      panel.appendChild(this.insightsCard(d));
+    },
+
+    insightsCard(d) {
+      const list = el('div', { class: 'insights' });
+      if (!d.insights || !d.insights.length) list.appendChild(el('div', { class: 'state sm', style: 'padding:18px', text: 'No notable patterns yet — keep using local models and insights will appear.' }));
+      else d.insights.forEach((i) => {
+        const icon = i.severity === 'good' ? ICON.check : i.severity === 'warn' ? ICON.alert : ICON.sparkles;
+        const role = i.severity === 'good' ? 'safe' : i.severity === 'warn' ? 'warn' : 'brand';
+        list.appendChild(el('div', { class: 'insight' }, [
+          el('div', { class: 'swt ic ' + role, html: icon }),
+          el('div', {}, [el('div', { class: 'insight-t', text: i.title }), el('div', { class: 'insight-d', text: i.detail })]),
+        ]));
+      });
+      return anCard('Insights', 'auto-generated', list, true);
+    },
+
+    usage(panel, d) {
+      const C = window.SaffevCharts;
+      const xl = this.xLabels(d);
+      const grid = el('section', { class: 'an-grid' });
+      grid.appendChild(anCard('Tokens over time', 'input vs output', C.lineArea({ series: [
+        { name: 'Input', values: d.series.map((b) => b.inputTokens), color: 'var(--brand)' },
+        { name: 'Output', values: d.series.map((b) => b.outputTokens), color: 'var(--gold)' },
+      ], xLabels: xl }), true));
+      grid.appendChild(anCard('By model', 'requests', C.hbars({ items: d.byModel.map((m) => ({ label: m.name, value: m.requests, suffix: ' req' })) })));
+      grid.appendChild(anCard('By app', 'requests', C.hbars({ items: d.byApp.map((a) => ({ label: a.name, value: a.requests, suffix: ' req' })) })));
+      grid.appendChild(anCard('By endpoint', 'share', C.donut({ items: d.byEndpoint.map((e) => ({ label: e.name, value: e.requests })), centerLabel: 'requests' })));
+      grid.appendChild(anCard('Prompt size', 'input tokens / request', C.histogram({ bins: d.inputTokenHistogram, color: 'var(--brand)' })));
+      grid.appendChild(anCard('Busiest hours', 'local time', C.heatmap({ cells: d.heatmap }), true));
+      panel.appendChild(grid);
+    },
+
+    performance(panel, d) {
+      const C = window.SaffevCharts;
+      const xl = this.xLabels(d);
+      panel.appendChild(el('section', { class: 'grid kpis reveal' }, [
+        miniStat('p50 latency', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—'),
+        miniStat('p90 latency', d.p90LatencyMs != null ? d.p90LatencyMs + '<small>ms</small>' : '—'),
+        miniStat('p99 latency', d.p99LatencyMs != null ? d.p99LatencyMs + '<small>ms</small>' : '—'),
+        miniStat('avg TTFT', d.avgTtftMs != null ? d.avgTtftMs + '<small>ms</small>' : '—'),
+      ]));
+      const grid = el('section', { class: 'an-grid' });
+      grid.appendChild(anCard('Latency p50 over time', 'ms', C.lineArea({ series: [{ name: 'p50', values: d.series.map((b) => b.p50LatencyMs), color: 'var(--brand)' }], xLabels: xl }), true));
+      grid.appendChild(anCard('Throughput by model', 'decode tokens/sec', C.hbars({ items: d.byModel.filter((m) => m.tokensPerSec != null).map((m) => ({ label: m.name, value: m.tokensPerSec, suffix: ' tok/s' })), fmt: (v) => v.toFixed(0) })));
+      grid.appendChild(anCard('Time to first token', 'distribution', C.histogram({ bins: d.ttftHistogram, unit: 'ms', color: 'var(--brand)' })));
+      grid.appendChild(anCard('Latency vs output', 'does length explain slowness?', C.scatter({ points: d.latencyVsOutput, xLabel: 'output tokens', yLabel: 'latency ms' }), true));
+      const frColors = { stop: 'var(--safe)', length: 'var(--brand)', unknown: 'var(--text-3)', error: 'var(--danger)' };
+      grid.appendChild(anCard('Finish reasons', 'why responses ended', C.hbars({ items: d.finishReasons.map((f) => ({ label: f.name, value: f.count, suffix: ' resp', color: frColors[f.name] || 'var(--gold)' })) }), true));
+      panel.appendChild(grid);
+      const wrap = el('div', { class: 'ttable', style: '--gtc:' + gtcFor(HIST_COLS) }, [reqHead(HIST_COLS), (() => {
+        const b = el('div', { class: 'list', style: 'max-height:none' });
+        if (!d.slowest.length) b.appendChild(el('div', { class: 'state sm', text: 'No completed exchanges.' }));
+        else d.slowest.forEach((it) => b.appendChild(reqRow(it, { columns: HIST_COLS })));
+        return b;
+      })()]);
+      panel.appendChild(anCard('Slowest exchanges', 'click a row for detail', wrap, true));
+    },
+
+    privacy(panel, d) {
+      const C = window.SaffevCharts;
+      const xl = this.xLabels(d);
+      const grid = el('section', { class: 'an-grid' });
+      grid.appendChild(anCard('PII findings over time', 'observe-only', C.lineArea({ series: [{ name: 'PII', values: d.series.map((b) => b.pii), color: 'var(--danger)' }], xLabels: xl }), true));
+      grid.appendChild(anCard('By type', 'request + response', C.hbars({ items: d.piiByKind.map((k) => ({ label: piiLabel(k.kind), value: k.requestCount + k.responseCount, note: k.requestCount + ' req · ' + k.responseCount + ' resp' })), color: 'var(--danger)' })));
+      grid.appendChild(anCard('Where it appears', 'into vs out of the model', C.donut({ items: [{ label: 'On request (to model)', value: d.piiRequestSide, color: 'var(--danger)' }, { label: 'On response (from model)', value: d.piiResponseSide, color: 'var(--gold)' }], centerLabel: 'findings' })));
+      grid.appendChild(anCard('Top sources', 'apps sending PII', C.hbars({ items: d.piiByApp.map((a) => ({ label: a.name, value: a.count })), color: 'var(--danger)' })));
+      grid.appendChild(anCard('Masking action', 'observed / dry-run / masked', C.donut({ items: d.piiByAction.map((a) => ({ label: actionLabel(a.name), value: a.count })), centerLabel: 'findings' })));
+      panel.appendChild(grid);
+    },
+
+    explorer(panel, d) {
+      panel.appendChild(el('div', { class: 'an-export reveal' }, [
+        el('span', { class: 'muted', style: 'font-size:.86rem', text: 'Export the full report for this window:' }),
+        el('div', { class: 'spacer' }),
+        el('button', { class: 'btn auto', html: ICON.download + '<span>JSON</span>', onclick: () => downloadFile('saffev-analytics.json', JSON.stringify(d, null, 2), 'application/json') }),
+        el('button', { class: 'btn auto', html: ICON.download + '<span>CSV (models)</span>', onclick: () => downloadFile('saffev-models.csv', this.csv(['Model', 'Requests', 'Input tokens', 'Output tokens', 'p50 ms', 'TTFT ms', 'tok/s'], d.byModel.map((m) => [m.name, m.requests, m.inputTokens, m.outputTokens, m.p50LatencyMs, m.avgTtftMs, m.tokensPerSec])), 'text/csv') }),
+        el('button', { class: 'btn auto', html: ICON.download + '<span>CSV (apps)</span>', onclick: () => downloadFile('saffev-apps.csv', this.csv(['App', 'Requests', 'Input tokens', 'Output tokens', 'avg ms', 'PII'], d.byApp.map((a) => [a.name, a.requests, a.inputTokens, a.outputTokens, a.avgLatencyMs, a.pii])), 'text/csv') }),
+      ]));
+      const grid = el('section', { class: 'an-grid' });
+      grid.appendChild(anCard('Models', 'full breakdown', dataTable(['Model', 'Requests', 'Input', 'Output', 'p50', 'TTFT', 'tok/s'], d.byModel.map((m) => [m.name, fmtNum(m.requests), fmtNum(m.inputTokens), fmtNum(m.outputTokens), m.p50LatencyMs != null ? m.p50LatencyMs + 'ms' : '—', m.avgTtftMs != null ? m.avgTtftMs + 'ms' : '—', m.tokensPerSec != null ? m.tokensPerSec.toFixed(0) : '—'])), true));
+      grid.appendChild(anCard('Apps', 'full breakdown', dataTable(['App', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byApp.map((a) => [a.name, fmtNum(a.requests), fmtNum(a.inputTokens), fmtNum(a.outputTokens), a.avgLatencyMs != null ? a.avgLatencyMs + 'ms' : '—', fmtNum(a.pii)])), true));
+      grid.appendChild(anCard('Endpoints', 'full breakdown', dataTable(['Endpoint', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byEndpoint.map((e) => [e.name, fmtNum(e.requests), fmtNum(e.inputTokens), fmtNum(e.outputTokens), e.avgLatencyMs != null ? e.avgLatencyMs + 'ms' : '—', fmtNum(e.pii)])), true));
+      panel.appendChild(grid);
+    },
+
+    csv(headers, rows) {
+      const esc2 = (v) => { const s2 = v == null ? '' : String(v); return /[",\n]/.test(s2) ? '"' + s2.replace(/"/g, '""') + '"' : s2; };
+      return [headers.join(',')].concat(rows.map((r) => r.map(esc2).join(','))).join('\n');
+    },
+
     teardown() {},
   };
 
@@ -1231,7 +2021,7 @@
   /* =========================================================================
      ROUTER
      ========================================================================= */
-  const ROUTES = { live: Live, history: History, privacy: Privacy, engines: Engines, settings: Settings };
+  const ROUTES = { live: Live, history: History, privacy: Privacy, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {

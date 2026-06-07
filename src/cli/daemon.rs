@@ -304,6 +304,59 @@ pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: boo
     Ok(child.id())
 }
 
+/// Spawn a fully-detached helper that **stops this daemon and starts a fresh
+/// one** (the now-updated binary), so an in-app update can relaunch without the
+/// user touching the terminal. The helper sleeps briefly (so the triggering HTTP
+/// response can flush), runs `<exe> stop` (SIGTERMs us + waits for exit, freeing
+/// the ports), then `<exe> start --no-open` (the new binary binds them). The
+/// helper lives in its own process group/console so our own SIGTERM never reaches
+/// it. Used by `POST /api/restart`.
+pub fn spawn_restart_helper() -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
+    let exe = exe.to_string_lossy().to_string();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let script = format!("sleep 0.6; \"{exe}\" stop; \"{exe}\" start --no-open");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Own process group so the `stop` SIGTERM we send to ourselves can't
+            // reach this helper (safe CommandExt — respects forbid(unsafe_code)).
+            .process_group(0);
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow::anyhow!("failed to spawn restart helper: {e}")))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let line = format!("timeout /T 1 >NUL & \"{exe}\" stop & \"{exe}\" start --no-open");
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", &line])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.spawn()
+            .map_err(|e| Error::Other(anyhow::anyhow!("failed to spawn restart helper: {e}")))?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(Error::Other(anyhow::anyhow!(
+            "self-restart is not supported on this platform"
+        )))
+    }
+}
+
 /// Wait up to `timeout` for `pid` to exit, polling every `poll`. Returns `true`
 /// if the process is gone by the deadline, `false` if it's still alive.
 pub async fn wait_for_exit(pid: u32, timeout: Duration, poll: Duration) -> bool {

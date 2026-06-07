@@ -95,6 +95,7 @@ impl StudioServer {
             .route("/history", get(api::history))
             .route("/history/:id", get(api::history_detail))
             .route("/privacy", get(api::privacy))
+            .route("/analytics", get(api::analytics))
             .route("/engines", get(api::engines))
             .route("/engines/adopt", post(api::engines_adopt))
             .route("/engines/revert", post(api::engines_revert))
@@ -105,6 +106,7 @@ impl StudioServer {
             // applies via the shipped installer (axoupdater). Token-gated like
             // every other control route by the layers below.
             .route("/update", get(api::update_get).post(api::update_post))
+            .route("/restart", post(api::restart))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
             // Host checked first (cheapest reject), then token, then CORS

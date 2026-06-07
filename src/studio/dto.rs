@@ -335,6 +335,16 @@ pub struct UpdateResult {
     pub message: String,
 }
 
+/// `POST /api/restart` — acknowledgement that a relaunch was scheduled. The
+/// daemon stops + starts itself via a detached helper; the SPA then polls
+/// `/api/health` and reloads once it's back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartResult {
+    /// Always true when the relaunch helper was spawned successfully.
+    pub restarting: bool,
+}
+
 /// Uniform error envelope for any failed `/api/*` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -343,4 +353,163 @@ pub struct ApiError {
     pub error: String,
     /// Human-readable message.
     pub message: String,
+}
+
+// ===========================================================================
+// Analytics (`GET /api/analytics?rangeMs=...`)
+//
+// A single comprehensive report for the selected time window, computed entirely
+// on-device from the encrypted store. The SPA renders every chart from this.
+// ===========================================================================
+
+/// The full analytics report for one time window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsReport {
+    /// Window length requested (millis).
+    pub range_ms: i64,
+    /// Server clock when computed (unix millis) — the window is `[now-range, now]`.
+    pub generated_ts: i64,
+    /// Bucket width used for the time series (millis).
+    pub bucket_ms: i64,
+
+    // ---- headline KPIs ----
+    pub total_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub p50_latency_ms: Option<u32>,
+    pub p90_latency_ms: Option<u32>,
+    pub p99_latency_ms: Option<u32>,
+    pub avg_ttft_ms: Option<u32>,
+    pub pii_findings: u64,
+    pub active_apps: u64,
+    pub active_models: u64,
+    /// Estimated $ saved vs cloud pricing (see `cost_basis`).
+    pub est_cost_saved_usd: f64,
+    /// Label describing the pricing assumption (e.g. "GPT-4o pricing").
+    pub cost_basis: String,
+
+    // ---- deltas vs the immediately-preceding window of equal length ----
+    pub prev_total_requests: u64,
+    pub prev_total_tokens: u64,
+    pub prev_p50_latency_ms: Option<u32>,
+    pub prev_pii_findings: u64,
+
+    // ---- time series (one entry per bucket, ascending) ----
+    pub series: Vec<AnalyticsBucket>,
+
+    // ---- breakdowns ----
+    pub by_app: Vec<GroupStat>,
+    pub by_model: Vec<ModelStat>,
+    pub by_endpoint: Vec<GroupStat>,
+
+    // ---- performance ----
+    pub ttft_histogram: Vec<HistBin>,
+    pub input_token_histogram: Vec<HistBin>,
+    pub latency_vs_output: Vec<XYPoint>,
+    pub finish_reasons: Vec<NamedCount>,
+    pub slowest: Vec<HistoryItem>,
+
+    // ---- usage patterns ----
+    /// Local day-of-week (0=Sun..6=Sat) × hour (0..23) request counts.
+    pub heatmap: Vec<HeatCell>,
+
+    // ---- privacy ----
+    pub pii_by_kind: Vec<PiiKindStat>,
+    pub pii_by_action: Vec<NamedCount>,
+    pub pii_by_app: Vec<NamedCount>,
+    pub pii_request_side: u64,
+    pub pii_response_side: u64,
+
+    // ---- plain-english, actionable insights ----
+    pub insights: Vec<Insight>,
+}
+
+/// One time bucket of the activity series.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsBucket {
+    /// Bucket start (unix millis).
+    pub ts: i64,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub p50_latency_ms: Option<u32>,
+    pub pii: u64,
+}
+
+/// Aggregate stats for a named group (app or endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupStat {
+    pub name: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub avg_latency_ms: Option<u32>,
+    pub pii: u64,
+}
+
+/// Per-model performance + usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStat {
+    pub name: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub p50_latency_ms: Option<u32>,
+    pub avg_ttft_ms: Option<u32>,
+    /// Decode throughput (output tokens / second), median over the model's
+    /// completed streamed/non-streamed exchanges.
+    pub tokens_per_sec: Option<f64>,
+}
+
+/// A histogram bin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistBin {
+    /// Inclusive lower edge.
+    pub lo: u32,
+    /// Exclusive upper edge (or u32::MAX for the open last bin).
+    pub hi: u32,
+    pub count: u64,
+}
+
+/// A scatter point (output tokens vs latency).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XYPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// One heatmap cell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeatCell {
+    /// 0=Sunday .. 6=Saturday (local).
+    pub dow: u8,
+    /// 0..23 (local).
+    pub hour: u8,
+    pub count: u64,
+}
+
+/// PII findings for one kind, split by side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiiKindStat {
+    pub kind: PiiKind,
+    pub request_count: u64,
+    pub response_count: u64,
+}
+
+/// An actionable insight derived from the data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Insight {
+    /// `good` | `info` | `warn` — drives the icon/color.
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
 }

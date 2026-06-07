@@ -63,8 +63,20 @@ fn internal(err: impl std::fmt::Display) -> Response {
 /// Project a store [`HistoryRow`] (+ the distinct PII kinds present) into the
 /// wire [`dto::HistoryItem`].
 fn history_item(row: &HistoryRow, pii_kinds: Vec<PiiKind>) -> dto::HistoryItem {
-    let req: &RequestMeta = &row.request;
-    let resp: Option<&ResponseMeta> = row.response.as_ref();
+    item_from_parts(&row.request, row.response.as_ref(), row.pii_count, pii_kinds)
+}
+
+/// Build a wire [`dto::HistoryItem`] from request (+ optional response) metadata.
+/// Shared by the store-row projection AND the proxy's live SSE events so the two
+/// stay in lock-step. `latency_ms` falls back to the response's `total_ms` — the
+/// request row never carries its own end-to-end time, so without this the Live +
+/// History tables and the p50 KPI would always show a blank latency.
+pub(crate) fn item_from_parts(
+    req: &RequestMeta,
+    resp: Option<&ResponseMeta>,
+    pii_count: u32,
+    pii_kinds: Vec<PiiKind>,
+) -> dto::HistoryItem {
     dto::HistoryItem {
         id: req.id.clone(),
         ts: req.ts,
@@ -80,15 +92,24 @@ fn history_item(row: &HistoryRow, pii_kinds: Vec<PiiKind>) -> dto::HistoryItem {
         output_tokens_src: resp
             .map(|r| r.output_tokens_src)
             .unwrap_or(req.input_tokens_src),
-        latency_ms: req.latency_ms,
+        latency_ms: req.latency_ms.or_else(|| resp.and_then(|r| r.total_ms)),
         ttft_ms: resp.and_then(|r| r.ttft_ms),
-        pii_count: row.pii_count,
+        pii_count,
         pii_kinds,
     }
 }
 
+/// End-to-end latency for a stored row: the request's own value if set, else the
+/// response's measured `total_ms`. Mirrors [`item_from_parts`]'s latency rule so
+/// the p50 KPI matches the per-row latency shown in the table.
+fn row_latency_ms(row: &HistoryRow) -> Option<u32> {
+    row.request
+        .latency_ms
+        .or_else(|| row.response.as_ref().and_then(|r| r.total_ms))
+}
+
 /// Project a store [`PiiFindingRecord`] into the wire [`dto::PiiFindingView`].
-fn finding_view(rec: &PiiFindingRecord) -> dto::PiiFindingView {
+pub(crate) fn finding_view(rec: &PiiFindingRecord) -> dto::PiiFindingView {
     dto::PiiFindingView {
         kind: rec.kind,
         label: rec.label.clone(),
@@ -157,7 +178,12 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         .await
         .map_err(internal)?;
 
-    let recent: Vec<dto::HistoryItem> = rows.iter().map(|r| history_item(r, Vec::new())).collect();
+    // Populate PII kinds per row so badges show on seeded rows too (not just live).
+    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    let recent: Vec<dto::HistoryItem> = rows
+        .iter()
+        .map(|r| history_item(r, kinds.get(r.request.id.as_str()).cloned().unwrap_or_default()))
+        .collect();
 
     // KPIs computed off the privacy/finding + history reads. "Today" is the
     // trailing 24h window relative to the newest row's clock (server now).
@@ -181,7 +207,7 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
     for r in &window {
         if r.request.ts >= cutoff {
             requests_today += 1;
-            if let Some(ms) = r.request.latency_ms {
+            if let Some(ms) = row_latency_ms(r) {
                 latencies.push(ms);
             }
         }
@@ -229,7 +255,11 @@ pub async fn history(
         .await
         .map_err(internal)?;
 
-    let items: Vec<dto::HistoryItem> = rows.iter().map(|r| history_item(r, Vec::new())).collect();
+    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    let items: Vec<dto::HistoryItem> = rows
+        .iter()
+        .map(|r| history_item(r, kinds.get(r.request.id.as_str()).cloned().unwrap_or_default()))
+        .collect();
     Ok(Json(items))
 }
 
@@ -358,6 +388,613 @@ pub async fn privacy(
         // dry-run vs live via the Settings view; here we just expose enablement.
         masking_enabled: state.config.load().masking.enabled,
     }))
+}
+
+/// Query params for `GET /api/analytics`.
+#[derive(serde::Deserialize)]
+pub struct AnalyticsParams {
+    /// Window length in millis (defaults to 24h; clamped to [1h, 92d]).
+    #[serde(rename = "rangeMs")]
+    range_ms: Option<i64>,
+    /// Client timezone offset from `Date.getTimezoneOffset()` (minutes). Used to
+    /// bucket the day×hour heatmap in the user's local time. Defaults to UTC.
+    #[serde(rename = "tzOffsetMin")]
+    tz_offset_min: Option<i64>,
+}
+
+const ANALYTICS_DEFAULT_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
+const ANALYTICS_MIN_RANGE_MS: i64 = 60 * 60 * 1000;
+const ANALYTICS_MAX_RANGE_MS: i64 = 92 * 24 * 60 * 60 * 1000;
+/// Cloud price assumptions for the "cost saved" estimate (USD per 1M tokens).
+/// Honest + labeled in the report; not a precise bill, a motivating comparison.
+const CLOUD_IN_PER_M: f64 = 2.50; // ~GPT-4o input
+const CLOUD_OUT_PER_M: f64 = 10.0; // ~GPT-4o output
+const CLOUD_BASIS: &str = "vs GPT-4o cloud pricing";
+
+/// `GET /api/analytics` — comprehensive on-device analytics for a time window.
+pub async fn analytics(
+    State(state): State<StudioState>,
+    Query(params): Query<AnalyticsParams>,
+) -> Result<Json<dto::AnalyticsReport>, Response> {
+    use std::collections::BTreeMap;
+
+    let now = now_millis();
+    let range_ms = params
+        .range_ms
+        .unwrap_or(ANALYTICS_DEFAULT_RANGE_MS)
+        .clamp(ANALYTICS_MIN_RANGE_MS, ANALYTICS_MAX_RANGE_MS);
+    let tz_off = params.tz_offset_min.unwrap_or(0);
+    let start = now - range_ms;
+    let prev_start = start - range_ms;
+
+    // Gather all rows back to prev_start (covers current + previous window for
+    // deltas), paginating past the per-query 1000 clamp.
+    let mut all: Vec<HistoryRow> = Vec::new();
+    let mut cursor: Option<i64> = None;
+    loop {
+        let batch = state
+            .store
+            .history(HistoryQuery {
+                q: None,
+                pii_only: false,
+                limit: Some(1000),
+                before_ts: cursor,
+            })
+            .await
+            .map_err(internal)?;
+        if batch.is_empty() {
+            break;
+        }
+        let oldest = batch.last().map(|r| r.request.ts).unwrap_or(0);
+        let exhausted = batch.len() < 1000;
+        cursor = Some(oldest);
+        let reached = oldest < prev_start;
+        all.extend(batch);
+        if reached || exhausted || all.len() > 200_000 {
+            break;
+        }
+    }
+
+    let findings = state.store.privacy_summary().await.unwrap_or_default();
+
+    // Latency: request value or response total_ms (mirrors the table/p50).
+    let lat = |r: &HistoryRow| -> Option<u32> {
+        r.request
+            .latency_ms
+            .or_else(|| r.response.as_ref().and_then(|x| x.total_ms))
+    };
+
+    let cur: Vec<&HistoryRow> = all
+        .iter()
+        .filter(|r| r.request.ts >= start && r.request.ts <= now)
+        .collect();
+    let prev: Vec<&HistoryRow> = all
+        .iter()
+        .filter(|r| r.request.ts >= prev_start && r.request.ts < start)
+        .collect();
+
+    // ---- headline ----
+    let total_requests = cur.len() as u64;
+    let total_input_tokens: u64 = cur
+        .iter()
+        .filter_map(|r| r.request.input_tokens)
+        .map(|v| v as u64)
+        .sum();
+    let total_output_tokens: u64 = cur
+        .iter()
+        .filter_map(|r| r.response.as_ref().and_then(|x| x.output_tokens))
+        .map(|v| v as u64)
+        .sum();
+    let mut lats: Vec<u32> = cur.iter().filter_map(|r| lat(r)).collect();
+    let p50_latency_ms = percentile(&mut lats, 50);
+    let p90_latency_ms = percentile(&mut lats, 90);
+    let p99_latency_ms = percentile(&mut lats, 99);
+    let ttfts: Vec<u32> = cur
+        .iter()
+        .filter_map(|r| r.response.as_ref().and_then(|x| x.ttft_ms))
+        .collect();
+    let avg_ttft_ms = mean_u32(&ttfts);
+
+    let est_cost_saved_usd = (total_input_tokens as f64 / 1_000_000.0) * CLOUD_IN_PER_M
+        + (total_output_tokens as f64 / 1_000_000.0) * CLOUD_OUT_PER_M;
+
+    // in-range row lookup + finding attribution
+    let mut row_by_id: BTreeMap<&str, &HistoryRow> = BTreeMap::new();
+    for r in &cur {
+        row_by_id.insert(r.request.id.as_str(), r);
+    }
+    let in_findings: Vec<&PiiFindingRecord> = findings
+        .iter()
+        .filter(|f| row_by_id.contains_key(f.record_id.as_str()))
+        .collect();
+    let pii_findings = in_findings.len() as u64;
+
+    // ---- deltas (previous window) ----
+    let prev_total_requests = prev.len() as u64;
+    let prev_total_tokens: u64 = prev
+        .iter()
+        .map(|r| {
+            r.request.input_tokens.unwrap_or(0) as u64
+                + r.response
+                    .as_ref()
+                    .and_then(|x| x.output_tokens)
+                    .unwrap_or(0) as u64
+        })
+        .sum();
+    let mut prev_lats: Vec<u32> = prev.iter().filter_map(|r| lat(r)).collect();
+    let prev_p50_latency_ms = percentile(&mut prev_lats, 50);
+    let prev_ids: BTreeMap<&str, ()> =
+        prev.iter().map(|r| (r.request.id.as_str(), ())).collect();
+    let prev_pii_findings = findings
+        .iter()
+        .filter(|f| prev_ids.contains_key(f.record_id.as_str()))
+        .count() as u64;
+
+    // ---- time series ----
+    let bucket_ms = analytics_bucket_ms(range_ms);
+    let n_buckets = ((range_ms + bucket_ms - 1) / bucket_ms).max(1) as usize;
+    let mut bkt_req = vec![0u64; n_buckets];
+    let mut bkt_in = vec![0u64; n_buckets];
+    let mut bkt_out = vec![0u64; n_buckets];
+    let mut bkt_pii = vec![0u64; n_buckets];
+    let mut bkt_lat: Vec<Vec<u32>> = vec![Vec::new(); n_buckets];
+    let bidx = |ts: i64| -> usize {
+        (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1)
+    };
+    for r in &cur {
+        let i = bidx(r.request.ts);
+        bkt_req[i] += 1;
+        bkt_in[i] += r.request.input_tokens.unwrap_or(0) as u64;
+        bkt_out[i] += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        if let Some(l) = lat(r) {
+            bkt_lat[i].push(l);
+        }
+    }
+    for f in &in_findings {
+        if let Some(r) = row_by_id.get(f.record_id.as_str()) {
+            bkt_pii[bidx(r.request.ts)] += 1;
+        }
+    }
+    let series: Vec<dto::AnalyticsBucket> = (0..n_buckets)
+        .map(|i| dto::AnalyticsBucket {
+            ts: start + (i as i64) * bucket_ms,
+            requests: bkt_req[i],
+            input_tokens: bkt_in[i],
+            output_tokens: bkt_out[i],
+            p50_latency_ms: percentile(&mut bkt_lat[i], 50),
+            pii: bkt_pii[i],
+        })
+        .collect();
+
+    // ---- breakdowns: by app / endpoint ----
+    #[derive(Default)]
+    struct Acc {
+        requests: u64,
+        in_tok: u64,
+        out_tok: u64,
+        lat: Vec<u32>,
+        pii: u64,
+    }
+    let mut apps: BTreeMap<String, Acc> = BTreeMap::new();
+    let mut endpoints: BTreeMap<String, Acc> = BTreeMap::new();
+    // models need ttft + tps
+    #[derive(Default)]
+    struct MAcc {
+        requests: u64,
+        in_tok: u64,
+        out_tok: u64,
+        lat: Vec<u32>,
+        ttft: Vec<u32>,
+        tps: Vec<f64>,
+    }
+    let mut models: BTreeMap<String, MAcc> = BTreeMap::new();
+
+    for r in &cur {
+        let app = r.request.source_app.clone().unwrap_or_else(|| "Unknown".into());
+        let a = apps.entry(app).or_default();
+        a.requests += 1;
+        a.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
+        a.out_tok += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        if let Some(l) = lat(r) {
+            a.lat.push(l);
+        }
+
+        let ep = r.request.endpoint.clone();
+        let e = endpoints.entry(ep).or_default();
+        e.requests += 1;
+        e.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
+        e.out_tok += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        if let Some(l) = lat(r) {
+            e.lat.push(l);
+        }
+
+        let model = match r.request.model.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => "unknown".into(),
+        };
+        let m = models.entry(model).or_default();
+        m.requests += 1;
+        m.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
+        let out = r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0);
+        m.out_tok += out as u64;
+        if let Some(l) = lat(r) {
+            m.lat.push(l);
+        }
+        if let Some(resp) = r.response.as_ref() {
+            if let Some(t) = resp.ttft_ms {
+                m.ttft.push(t);
+            }
+            // decode throughput: output tokens / (total - ttft) seconds. Require a
+            // ≥50ms decode window so a near-zero denominator can't fabricate a
+            // wildly inflated tok/s.
+            if let (Some(total), Some(t), o) = (resp.total_ms, resp.ttft_ms, out) {
+                if o > 1 && total >= t + 50 {
+                    let secs = (total - t) as f64 / 1000.0;
+                    m.tps.push(o as f64 / secs);
+                }
+            }
+        }
+    }
+    // attribute pii to app/endpoint
+    for f in &in_findings {
+        if let Some(r) = row_by_id.get(f.record_id.as_str()) {
+            if let Some(a) = apps.get_mut(
+                r.request.source_app.as_deref().unwrap_or("Unknown"),
+            ) {
+                a.pii += 1;
+            }
+            if let Some(e) = endpoints.get_mut(r.request.endpoint.as_str()) {
+                e.pii += 1;
+            }
+        }
+    }
+    let mut by_app: Vec<dto::GroupStat> = apps
+        .into_iter()
+        .map(|(name, mut a)| dto::GroupStat {
+            name,
+            requests: a.requests,
+            input_tokens: a.in_tok,
+            output_tokens: a.out_tok,
+            avg_latency_ms: percentile(&mut a.lat, 50),
+            pii: a.pii,
+        })
+        .collect();
+    by_app.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_app.truncate(12);
+
+    let mut by_endpoint: Vec<dto::GroupStat> = endpoints
+        .into_iter()
+        .map(|(name, mut e)| dto::GroupStat {
+            name,
+            requests: e.requests,
+            input_tokens: e.in_tok,
+            output_tokens: e.out_tok,
+            avg_latency_ms: percentile(&mut e.lat, 50),
+            pii: e.pii,
+        })
+        .collect();
+    by_endpoint.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_endpoint.truncate(12);
+
+    let mut by_model: Vec<dto::ModelStat> = models
+        .into_iter()
+        .map(|(name, mut m)| dto::ModelStat {
+            name,
+            requests: m.requests,
+            input_tokens: m.in_tok,
+            output_tokens: m.out_tok,
+            p50_latency_ms: percentile(&mut m.lat, 50),
+            avg_ttft_ms: mean_u32(&m.ttft),
+            tokens_per_sec: median_f64(&m.tps).map(|v| (v * 10.0).round() / 10.0),
+        })
+        .collect();
+    by_model.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_model.truncate(12);
+
+    // ---- performance distributions ----
+    let ttft_histogram = histogram(&ttfts, &[0, 100, 250, 500, 1000, 2000, 5000, 10000]);
+    let in_tokens_vec: Vec<u32> = cur.iter().filter_map(|r| r.request.input_tokens).collect();
+    let input_token_histogram =
+        histogram(&in_tokens_vec, &[0, 50, 100, 250, 500, 1000, 2000, 4000]);
+
+    // scatter: output tokens vs latency (sampled to keep payload light)
+    let mut scatter_src: Vec<(u32, u32)> = cur
+        .iter()
+        .filter_map(|r| {
+            let o = r.response.as_ref().and_then(|x| x.output_tokens)?;
+            let l = lat(r)?;
+            Some((o, l))
+        })
+        .collect();
+    let latency_vs_output = sample_xy(&mut scatter_src, 400);
+
+    // finish reasons
+    let mut fr: BTreeMap<String, u64> = BTreeMap::new();
+    for r in &cur {
+        let reason = r
+            .response
+            .as_ref()
+            .and_then(|x| x.finish_reason.clone())
+            .unwrap_or_else(|| "unknown".into());
+        *fr.entry(reason).or_insert(0) += 1;
+    }
+    let mut finish_reasons: Vec<dto::NamedCount> = fr
+        .into_iter()
+        .map(|(name, count)| dto::NamedCount { name, count })
+        .collect();
+    finish_reasons.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // slowest exchanges
+    let mut slow_rows: Vec<&HistoryRow> = cur.clone();
+    slow_rows.sort_by(|a, b| lat(b).unwrap_or(0).cmp(&lat(a).unwrap_or(0)));
+    let slowest: Vec<dto::HistoryItem> = slow_rows
+        .iter()
+        .take(8)
+        .map(|r| history_item(r, Vec::new()))
+        .collect();
+
+    // ---- heatmap (local day×hour) ----
+    let mut heat: BTreeMap<(u8, u8), u64> = BTreeMap::new();
+    for r in &cur {
+        let (dow, hour) = local_dow_hour(r.request.ts, tz_off);
+        *heat.entry((dow, hour)).or_insert(0) += 1;
+    }
+    let heatmap: Vec<dto::HeatCell> = heat
+        .into_iter()
+        .map(|((dow, hour), count)| dto::HeatCell { dow, hour, count })
+        .collect();
+
+    // ---- privacy ----
+    let mut kind_map: BTreeMap<String, dto::PiiKindStat> = BTreeMap::new();
+    let mut action_map: BTreeMap<String, u64> = BTreeMap::new();
+    let mut pii_app_map: BTreeMap<String, u64> = BTreeMap::new();
+    let (mut pii_req, mut pii_resp) = (0u64, 0u64);
+    for f in &in_findings {
+        let entry = kind_map
+            .entry(format!("{:?}", f.kind))
+            .or_insert_with(|| dto::PiiKindStat {
+                kind: f.kind,
+                request_count: 0,
+                response_count: 0,
+            });
+        match f.side {
+            Side::Request => {
+                entry.request_count += 1;
+                pii_req += 1;
+            }
+            Side::Response => {
+                entry.response_count += 1;
+                pii_resp += 1;
+            }
+        }
+        *action_map.entry(format!("{:?}", f.action)).or_insert(0) += 1;
+        if let Some(r) = row_by_id.get(f.record_id.as_str()) {
+            if let Some(app) = r.request.source_app.as_ref() {
+                *pii_app_map.entry(app.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let pii_by_kind: Vec<dto::PiiKindStat> = {
+        let mut v: Vec<_> = kind_map.into_values().collect();
+        v.sort_by(|a, b| {
+            (b.request_count + b.response_count).cmp(&(a.request_count + a.response_count))
+        });
+        v
+    };
+    let pii_by_action = named_counts_sorted(action_map);
+    let pii_by_app = named_counts_sorted(pii_app_map);
+
+    // ---- insights ----
+    let insights = build_insights(
+        total_requests,
+        total_output_tokens,
+        est_cost_saved_usd,
+        p50_latency_ms,
+        prev_p50_latency_ms,
+        &by_model,
+        &pii_by_app,
+        pii_req,
+        &finish_reasons,
+    );
+
+    Ok(Json(dto::AnalyticsReport {
+        range_ms,
+        generated_ts: now,
+        bucket_ms,
+        total_requests,
+        total_input_tokens,
+        total_output_tokens,
+        p50_latency_ms,
+        p90_latency_ms,
+        p99_latency_ms,
+        avg_ttft_ms,
+        pii_findings,
+        active_apps: by_app.len() as u64,
+        active_models: by_model.len() as u64,
+        est_cost_saved_usd: (est_cost_saved_usd * 100.0).round() / 100.0,
+        cost_basis: CLOUD_BASIS.to_string(),
+        prev_total_requests,
+        prev_total_tokens,
+        prev_p50_latency_ms,
+        prev_pii_findings,
+        series,
+        by_app,
+        by_model,
+        by_endpoint,
+        ttft_histogram,
+        input_token_histogram,
+        latency_vs_output,
+        finish_reasons,
+        slowest,
+        heatmap,
+        pii_by_kind,
+        pii_by_action,
+        pii_by_app,
+        pii_request_side: pii_req,
+        pii_response_side: pii_resp,
+        insights,
+    }))
+}
+
+/// Pick a time-series bucket width that yields a readable number of buckets.
+fn analytics_bucket_ms(range_ms: i64) -> i64 {
+    const MIN: i64 = 60 * 1000;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    if range_ms <= 2 * HOUR {
+        5 * MIN
+    } else if range_ms <= 24 * HOUR {
+        HOUR
+    } else if range_ms <= 2 * DAY {
+        2 * HOUR
+    } else if range_ms <= 7 * DAY {
+        6 * HOUR
+    } else {
+        DAY
+    }
+}
+
+/// Local (day-of-week 0=Sun, hour 0..23) from a unix-millis + tz offset (minutes
+/// as `Date.getTimezoneOffset()` reports — local = utc - offset*60_000).
+fn local_dow_hour(utc_ms: i64, tz_offset_min: i64) -> (u8, u8) {
+    let local = utc_ms - tz_offset_min * 60_000;
+    let day_ms = 86_400_000i64;
+    let days = local.div_euclid(day_ms);
+    let rem = local.rem_euclid(day_ms);
+    let hour = (rem / 3_600_000) as u8;
+    // 1970-01-01 was a Thursday (=4); 0=Sunday.
+    let dow = (((days % 7) + 4 + 7) % 7) as u8;
+    (dow, hour.min(23))
+}
+
+/// Bucket `values` into bins defined by ascending `edges`; the last bin is open.
+fn histogram(values: &[u32], edges: &[u32]) -> Vec<dto::HistBin> {
+    let mut bins: Vec<dto::HistBin> = Vec::new();
+    for i in 0..edges.len() {
+        let lo = edges[i];
+        let hi = edges.get(i + 1).copied().unwrap_or(u32::MAX);
+        bins.push(dto::HistBin { lo, hi, count: 0 });
+    }
+    for &v in values {
+        let idx = edges
+            .iter()
+            .rposition(|&e| v >= e)
+            .unwrap_or(0)
+            .min(bins.len() - 1);
+        bins[idx].count += 1;
+    }
+    bins
+}
+
+/// Down-sample (x,y) pairs to at most `max` points (stride sampling).
+fn sample_xy(pairs: &mut [(u32, u32)], max: usize) -> Vec<dto::XYPoint> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let step = (pairs.len() + max - 1) / max;
+    pairs
+        .iter()
+        .step_by(step.max(1))
+        .map(|&(x, y)| dto::XYPoint {
+            x: x as f64,
+            y: y as f64,
+        })
+        .collect()
+}
+
+/// Derive a handful of plain-english, actionable insights from the aggregates.
+#[allow(clippy::too_many_arguments)]
+fn build_insights(
+    total_requests: u64,
+    total_output_tokens: u64,
+    cost_saved: f64,
+    p50: Option<u32>,
+    prev_p50: Option<u32>,
+    by_model: &[dto::ModelStat],
+    pii_by_app: &[dto::NamedCount],
+    pii_request_side: u64,
+    finish_reasons: &[dto::NamedCount],
+) -> Vec<dto::Insight> {
+    let mut out: Vec<dto::Insight> = Vec::new();
+    if total_requests == 0 {
+        out.push(dto::Insight {
+            severity: "info".into(),
+            title: "No traffic yet in this window".into(),
+            detail: "Point an app at the proxy (see About & integrate) and activity will show up here.".into(),
+        });
+        return out;
+    }
+    if cost_saved >= 0.01 {
+        out.push(dto::Insight {
+            severity: "good".into(),
+            title: format!("≈ ${:.2} kept off the cloud", cost_saved),
+            detail: format!(
+                "{} requests · {} output tokens ran on-device {}.",
+                total_requests, total_output_tokens, CLOUD_BASIS
+            ),
+        });
+    }
+    // fastest vs slowest model by throughput
+    let mut tps: Vec<(&str, f64)> = by_model
+        .iter()
+        .filter_map(|m| m.tokens_per_sec.map(|t| (m.name.as_str(), t)))
+        .collect();
+    if tps.len() >= 2 {
+        tps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (fast, ft) = tps[0];
+        let (slow, st) = *tps.last().unwrap();
+        if st > 0.0 && ft / st >= 1.5 {
+            out.push(dto::Insight {
+                severity: "info".into(),
+                title: format!("{} is your fastest model", fast),
+                detail: format!(
+                    "{} decodes at ~{:.0} tok/s vs ~{:.0} tok/s for {} — prefer it for latency-sensitive work.",
+                    fast, ft, st, slow
+                ),
+            });
+        }
+    }
+    // latency trend
+    if let (Some(p), Some(pp)) = (p50, prev_p50) {
+        if pp > 0 && p as f64 / pp as f64 >= 1.3 {
+            out.push(dto::Insight {
+                severity: "warn".into(),
+                title: "Latency is trending up".into(),
+                detail: format!(
+                    "Median latency rose from {}ms to {}ms vs the previous period.",
+                    pp, p
+                ),
+            });
+        }
+    }
+    // PII leak source
+    if pii_request_side > 0 {
+        if let Some(top) = pii_by_app.first() {
+            out.push(dto::Insight {
+                severity: "warn".into(),
+                title: format!("{} sends the most PII to the model", top.name),
+                detail: format!(
+                    "{} findings on request bodies from {}. Consider enabling PII masking for it (Settings → Privacy & data).",
+                    top.count, top.name
+                ),
+            });
+        }
+    }
+    // length-capped responses
+    let total_fr: u64 = finish_reasons.iter().map(|f| f.count).sum();
+    if let Some(len) = finish_reasons.iter().find(|f| f.name == "length") {
+        if total_fr > 0 && (len.count as f64 / total_fr as f64) >= 0.2 {
+            out.push(dto::Insight {
+                severity: "warn".into(),
+                title: "Many responses hit the length limit".into(),
+                detail: format!(
+                    "{}% of responses stopped at the token cap — consider raising num_predict / max_tokens.",
+                    (len.count * 100 / total_fr)
+                ),
+            });
+        }
+    }
+    out
 }
 
 /// `GET /api/engines`
@@ -529,6 +1166,17 @@ pub async fn update_post(
             &msg,
         )),
     }
+}
+
+/// `POST /api/restart` — relaunch the daemon with the current on-disk binary.
+///
+/// Spawns a detached helper that stops this process (freeing the ports) and
+/// starts a fresh one. Used right after a successful in-app update so the new
+/// version takes effect without the user opening a terminal. The SPA polls
+/// `/api/health` afterwards and reloads once the new daemon answers.
+pub async fn restart(State(_state): State<StudioState>) -> Result<Json<dto::RestartResult>, Response> {
+    crate::cli::daemon::spawn_restart_helper().map_err(internal)?;
+    Ok(Json(dto::RestartResult { restarting: true }))
 }
 
 /// `GET /api/settings`
@@ -753,6 +1401,19 @@ fn distinct_kinds(findings: &[PiiFindingRecord], record_id: &str) -> Vec<PiiKind
     seen
 }
 
+/// One pass over all findings → `record_id` → distinct PII kinds. Lets the
+/// Live/History feeds show PII badges on every row (not only live SSE rows).
+fn kinds_by_record(findings: &[PiiFindingRecord]) -> std::collections::BTreeMap<String, Vec<PiiKind>> {
+    let mut map: std::collections::BTreeMap<String, Vec<PiiKind>> = std::collections::BTreeMap::new();
+    for f in findings {
+        let v = map.entry(f.record_id.clone()).or_default();
+        if !v.contains(&f.kind) {
+            v.push(f.kind);
+        }
+    }
+    map
+}
+
 /// Sort a `name -> count` map into descending [`dto::NamedCount`] list.
 fn named_counts_sorted(map: BTreeMap<String, u64>) -> Vec<dto::NamedCount> {
     let mut v: Vec<dto::NamedCount> = map
@@ -770,6 +1431,36 @@ fn median(samples: &mut [u32]) -> Option<u32> {
     }
     samples.sort_unstable();
     Some(samples[samples.len() / 2])
+}
+
+/// p-th percentile (0..100) of a sample (mutates: sorts in place). `None` if empty.
+fn percentile(samples: &mut [u32], p: u8) -> Option<u32> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let n = samples.len();
+    let idx = ((p as usize) * (n - 1) + 50) / 100; // nearest-rank, rounded
+    Some(samples[idx.min(n - 1)])
+}
+
+/// Integer mean of a sample. `None` if empty.
+fn mean_u32(samples: &[u32]) -> Option<u32> {
+    if samples.is_empty() {
+        return None;
+    }
+    let sum: u64 = samples.iter().map(|&v| v as u64).sum();
+    Some((sum / samples.len() as u64) as u32)
+}
+
+/// Median of an f64 sample (clones+sorts). `None` if empty.
+fn median_f64(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut v = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
 }
 
 /// Current wall-clock time in unix millis.

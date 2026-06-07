@@ -20,11 +20,12 @@ use axum::routing::any;
 use axum::Router;
 use bytes::{Bytes, BytesMut};
 
-use crate::brain::Side;
+use crate::brain::{PiiKind, Side};
 use crate::config::ConfigHandle;
 use crate::store::{
     PiiAction, PiiFindingRecord, RequestMeta, ResponseMeta, Store, TokenSource, WriteOp,
 };
+use crate::studio::dto;
 use crate::Result;
 
 /// Default capacity of the bounded tee channel (events, not bytes). When full,
@@ -135,6 +136,11 @@ pub struct ProxyState {
     pub detector: Arc<crate::brain::pii::Detector>,
     /// Base URL of the upstream engine (shadow port in Gateway, real in Coop).
     pub upstream: Arc<str>,
+    /// Broadcast sender for live Studio SSE events (`/api/stream`). The logger
+    /// publishes `RequestStarted`/`Finished`/`Pii` here so the Live page updates
+    /// in real time. `send` is non-blocking and a no-op when no client is
+    /// connected (Err is ignored).
+    pub events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
 }
 
 /// The proxy server. Owns its `axum` router + the upstream client.
@@ -277,6 +283,13 @@ struct InFlight {
     ts_millis: i64,
     /// The engine name (host:port-derived label).
     engine: String,
+    /// Request metadata snapshot — reused to build the live `Finished` SSE item
+    /// (the same projection the store-row path uses, kept in lock-step).
+    request_meta: RequestMeta,
+    /// Distinct PII kinds found on the request side (for the finished item badges).
+    req_pii_kinds: Vec<PiiKind>,
+    /// Count of request-side PII findings (for the finished item's pii_count).
+    req_pii_count: u32,
 }
 
 async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
@@ -402,7 +415,29 @@ fn on_request_started(
         request_hash,
     };
 
-    // Enqueue request metadata (always).
+    // Distinct request-side PII kinds + count (for the live row's badges/KPIs).
+    let mut req_pii_kinds: Vec<PiiKind> = Vec::new();
+    for f in &findings {
+        if !req_pii_kinds.contains(&f.kind) {
+            req_pii_kinds.push(f.kind);
+        }
+    }
+    let req_pii_count = findings.len() as u32;
+
+    // Live SSE: a new exchange started — the Live page renders the row at once.
+    // Non-blocking; a no-op when no Studio client is connected.
+    let _ = state.events.send(dto::StreamEvent::RequestStarted {
+        item: crate::studio::api::item_from_parts(
+            &meta,
+            None,
+            req_pii_count,
+            req_pii_kinds.clone(),
+        ),
+    });
+
+    // Keep a snapshot for the eventual `Finished` event, then enqueue the
+    // authoritative request row (always).
+    let request_meta = meta.clone();
     state.store.enqueue(WriteOp::Request(meta));
 
     // Enqueue request-side PII findings (if any). The action recorded per
@@ -429,6 +464,13 @@ fn on_request_started(
                 PiiFindingRecord::from_finding(&id, f, action)
             })
             .collect();
+        // Live SSE: surface each finding so the PII KPI + privacy lens update live.
+        for rec in &records {
+            let _ = state.events.send(dto::StreamEvent::Pii {
+                id: id.clone(),
+                finding: crate::studio::api::finding_view(rec),
+            });
+        }
         state.store.enqueue(WriteOp::PiiFindings(records));
     }
 
@@ -457,6 +499,9 @@ fn on_request_started(
             first_chunk_at: None,
             ts_millis,
             engine: engine_label.to_string(),
+            request_meta,
+            req_pii_kinds,
+            req_pii_count,
         },
     );
 }
@@ -489,10 +534,23 @@ fn on_response_finished(
         None => (None, TokenSource::Estimated),
     };
 
-    // If the engine reported input usage in the response, prefer it over our
-    // earlier unknown; re-enqueue an updated request row is not part of the
-    // contract WriteOps, so we only use it to fill the response side here.
-    let _ = in_count;
+    // Engine-reported INPUT usage (e.g. Ollama `prompt_eval_count`) rides on the
+    // RESPONSE, not the request, so the request row was stored with input tokens
+    // unknown. Backfill it now (targeted UPDATE) and surface it on the live item.
+    let (input_tokens, input_tokens_src) = match in_count {
+        Some(tc) => (Some(tc.value), tc.source),
+        None => (
+            entry.request_meta.input_tokens,
+            entry.request_meta.input_tokens_src,
+        ),
+    };
+    if input_tokens.is_some() && input_tokens != entry.request_meta.input_tokens {
+        state.store.enqueue(WriteOp::RequestUsage {
+            id: id.clone(),
+            input_tokens,
+            input_tokens_src,
+        });
+    }
 
     let finish_reason = parse_finish_reason(&response_bytes, entry.stream);
 
@@ -504,18 +562,53 @@ fn on_response_finished(
         ttft_ms,
         total_ms: total,
     };
+
+    // Response-side PII findings (computed before building the live item so the
+    // finished row carries the full request+response kind set).
+    let resp_findings = if response_text.is_empty() {
+        Vec::new()
+    } else {
+        state.detector.scan(Side::Response, &response_text)
+    };
+
+    // Live SSE: the exchange settled — push the final row (latency = total_ms,
+    // tokens, ttft) so the Live table updates in place without a reload.
+    let mut all_kinds = entry.req_pii_kinds.clone();
+    for f in &resp_findings {
+        if !all_kinds.contains(&f.kind) {
+            all_kinds.push(f.kind);
+        }
+    }
+    let pii_count = entry.req_pii_count + resp_findings.len() as u32;
+    // Use the backfilled input tokens for the live item so the drawer + token
+    // column show ↑input without waiting for a reload.
+    let mut item_req = entry.request_meta.clone();
+    item_req.input_tokens = input_tokens;
+    item_req.input_tokens_src = input_tokens_src;
+    let _ = state.events.send(dto::StreamEvent::Finished {
+        item: crate::studio::api::item_from_parts(
+            &item_req,
+            Some(&response_meta),
+            pii_count,
+            all_kinds,
+        ),
+    });
+
     state.store.enqueue(WriteOp::Response(response_meta));
 
-    // Response-side PII findings.
-    if !response_text.is_empty() {
-        let findings = state.detector.scan(Side::Response, &response_text);
-        if !findings.is_empty() {
-            let records: Vec<PiiFindingRecord> = findings
-                .iter()
-                .map(|f| PiiFindingRecord::from_finding(&id, f, PiiAction::Observed))
-                .collect();
-            state.store.enqueue(WriteOp::PiiFindings(records));
+    // Persist response-side findings + surface them live.
+    if !resp_findings.is_empty() {
+        let records: Vec<PiiFindingRecord> = resp_findings
+            .iter()
+            .map(|f| PiiFindingRecord::from_finding(&id, f, PiiAction::Observed))
+            .collect();
+        for rec in &records {
+            let _ = state.events.send(dto::StreamEvent::Pii {
+                id: id.clone(),
+                finding: crate::studio::api::finding_view(rec),
+            });
         }
+        state.store.enqueue(WriteOp::PiiFindings(records));
     }
 
     // Optional payload: fill the response text. We re-emit the full payload row

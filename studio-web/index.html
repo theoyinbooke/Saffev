@@ -15,14 +15,14 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="app">
+  <div class="appshell">
     <!-- SIDEBAR -->
     <aside class="sidebar">
       <div class="brand">
         <div class="mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
             <path d="M12 2 4 5.5v6c0 5 3.4 8.8 8 10.5 4.6-1.7 8-5.5 8-10.5v-6L12 2Z" fill="#fff" opacity=".95"/>
-            <path d="M9 12.2 11 14.2 15.2 9.8" stroke="#6C4FE0" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M9 12.2 11 14.2 15.2 9.8" stroke="#0F766E" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </div>
         <div class="wm"><span id="wmName">Saffev</span><small id="wmSub">local ai studio</small></div>
@@ -40,6 +40,9 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 5 6v5c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6l-7-3Z"/></svg> Privacy
           <span class="badge" id="navPiiBadge" hidden>0</span>
         </a>
+        <a data-route="analytics" href="#/analytics">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M4 19h16M8 16V9M13 16V6M18 16v-4"/></svg> Analytics
+        </a>
       </nav>
 
       <div class="navlabel">Manage</div>
@@ -52,6 +55,16 @@
         </a>
       </nav>
 
+      <div class="navlabel">Learn</div>
+      <nav class="nav" id="navLearn">
+        <a data-route="about" href="#/about">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg> About &amp; integrate
+        </a>
+      </nav>
+
+      <!-- Update affordance (bottom-left). Populated by app.js when GET /api/update
+           reports a newer release; clicking installs + relaunches automatically. -->
+      <div class="upfoot" id="updateFoot" hidden></div>
       <div class="foot">Everything stays on this device. <b>Encrypted</b> · no telemetry.</div>
     </aside>
 
@@ -82,6 +95,7 @@
     </main>
   </div>
 
+  <script src="/charts.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

@@ -22,10 +22,10 @@
   --border:        #E9E3DA;  /* card/input borders */
   --divider:       #F1EBE3;  /* hairline separators, list rows */
 
-  /* brand — primary (violet) */
-  --brand:         #6C4FE0;  /* primary actions, active nav, brand, CLI prompt */
-  --brand-soft:    #ECE7FB;  /* active-nav fill, soft chips, tints */
-  --brand-press:   #5A3FD0;  /* pressed / emphasis */
+  /* brand — primary (teal) */
+  --brand:         #0F766E;  /* primary actions, active nav, brand, CLI prompt — 5.5:1 on white */
+  --brand-soft:    #DCF1EC;  /* active-nav fill, soft chips, tints */
+  --brand-press:   #115E59;  /* pressed / emphasis */
   --on-brand:      #FFFFFF;  /* text/icon on a filled brand surface */
 
   /* semantic status (strong + soft) */
@@ -49,7 +49,7 @@
   /* elevation (light only) + focus */
   --shadow:    0 1px 2px rgba(48,36,22,.04), 0 10px 30px rgba(48,36,22,.06);
   --shadow-sm: 0 1px 2px rgba(48,36,22,.05);
-  --ring:      0 0 0 4px rgba(108,79,224,.16);
+  --ring:      0 0 0 4px rgba(15,118,110,.18);
 
   /* type */
   --font-display: "Bricolage Grotesque", ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
@@ -73,14 +73,14 @@
   :root:not([data-theme="light"]) {
     --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
     --border:    #38322A;  --divider:    #2C2720;
-    --brand:     #B7A6F2;  --brand-soft: #2C2446;  --brand-press:#C9BBF6;  --on-brand:  #1A1410;
+    --brand:     #4FD1C5;  --brand-soft: #16403B;  --brand-press:#6FE0D4;  --on-brand:  #08201C;
     --safe:      #57C98C;  --safe-soft:  #1E3F2E;
     --warn:      #E7B25A;  --warn-soft:  #3D3115;
     --danger:    #E27875;  --danger-soft:#3E2422;
     --gold:      #E9C064;  --gold-soft:  #3B2F14;
     --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
     --shadow: none;  --shadow-sm: none;
-    --ring:   0 0 0 4px rgba(183,166,242,.22);
+    --ring:   0 0 0 4px rgba(79,209,197,.24);
     color-scheme: dark;
   }
 }
@@ -89,14 +89,14 @@
 :root[data-theme="dark"] {
   --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
   --border:    #38322A;  --divider:    #2C2720;
-  --brand:     #B7A6F2;  --brand-soft: #2C2446;  --brand-press:#C9BBF6;  --on-brand:  #1A1410;
+  --brand:     #4FD1C5;  --brand-soft: #16403B;  --brand-press:#6FE0D4;  --on-brand:  #08201C;
   --safe:      #57C98C;  --safe-soft:  #1E3F2E;
   --warn:      #E7B25A;  --warn-soft:  #3D3115;
   --danger:    #E27875;  --danger-soft:#3E2422;
   --gold:      #E9C064;  --gold-soft:  #3B2F14;
   --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
   --shadow: none;  --shadow-sm: none;
-  --ring:   0 0 0 4px rgba(183,166,242,.22);
+  --ring:   0 0 0 4px rgba(79,209,197,.24);
   color-scheme: dark;
 }
 

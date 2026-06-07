@@ -250,6 +250,14 @@ pub enum WriteOp {
     Engine(EngineRecord),
     /// Insert request metadata.
     Request(RequestMeta),
+    /// Fill in the request's input-token count once the engine reports it in the
+    /// response (`prompt_eval_count`). A targeted UPDATE (not a REPLACE) so it
+    /// never disturbs the row's other columns or the linked response.
+    RequestUsage {
+        id: String,
+        input_tokens: Option<u32>,
+        input_tokens_src: TokenSource,
+    },
     /// Insert response metadata.
     Response(ResponseMeta),
     /// Insert a payload (only emitted when `payload_storage` is on).
@@ -591,6 +599,16 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                     r.latency_ms,
                     r.request_hash,
                 ],
+            )?;
+        }
+        WriteOp::RequestUsage {
+            id,
+            input_tokens,
+            input_tokens_src,
+        } => {
+            conn.execute(
+                "UPDATE requests SET input_tokens = ?2, input_tokens_src = ?3 WHERE id = ?1",
+                rusqlite::params![id, input_tokens, token_source_str(*input_tokens_src)],
             )?;
         }
         WriteOp::Response(r) => {
