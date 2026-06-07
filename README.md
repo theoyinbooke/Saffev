@@ -44,8 +44,37 @@ installer instead, never erroring.)
 > prompt to allow **Keychain** access on first start (for the encryption key +
 > Studio token) — choose **Always Allow**.
 
-Then start it **alongside** your existing Ollama (Cooperative mode — it never
-touches your engine):
+Then just start it — **no config required**:
+
+```sh
+saffev start          # zero-config first run; opens the Studio in your browser
+```
+
+On a true first run (no config yet) Saffev auto-configures itself to run
+**alongside** your existing engine in Cooperative mode — it never touches your
+engine. It detects your engine on the well-known port (Ollama `:11434` / LM
+Studio), keeps it as the upstream, and picks the first **free** ports for the
+proxy and the Studio (so a running Ollama on `:11434` is no longer a conflict —
+it's the expected setup). It persists the resolved config so later runs are
+stable, prints a calm summary (Studio URL, proxy base URL, engine status), and
+opens the Studio in your default browser. Use `--no-open` to skip the browser
+(handy on headless/CI hosts).
+
+The summary tells you the two URLs it chose, for example:
+
+```text
+● studio      http://localhost:7100
+● proxy       http://localhost:8088 · OpenAI base: /v1
+● engine      ollama v0.30.6 · :11434
+```
+
+Open the **Studio** at the printed URL to watch traffic, and point your apps'
+Ollama base URL (or OpenAI `…/v1` base URL) at the **proxy** URL. `saffev status`
+/ `saffev logs -f` / `saffev stop` to manage it.
+
+**Advanced — pin your own ports.** If you'd rather fix the ports yourself (or run
+multiple instances), write a config and pass it with `--config`; an existing
+config is always honored exactly and never overridden:
 
 ```sh
 mkdir -p ~/.config/saffev
@@ -57,13 +86,10 @@ studio = 7100     # open the Studio here
 upstream = 11434  # your real Ollama
 TOML
 
-saffev start --config ~/.config/saffev/saffev.toml   # daemonizes; prints the Studio URL
+saffev start --config ~/.config/saffev/saffev.toml
 ```
 
-Open the Studio at **http://localhost:7100** and point your apps' Ollama base URL
-at **http://localhost:8088** to see their traffic. `saffev status` / `saffev logs
--f` / `saffev stop` to manage it. Full details in **Build / run / test** and
-**Configuration** below.
+Full details in **Build / run / test** and **Configuration** below.
 
 ## Hard invariants
 
