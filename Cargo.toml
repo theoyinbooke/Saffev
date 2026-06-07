@@ -23,10 +23,12 @@ path = "src/lib.rs"
 # keyring (or the `SAFFEV_DB_KEY` env override) via the `PRAGMA key` handshake.
 # See `src/store/mod.rs`.
 default = ["sqlcipher"]
-# At-rest encryption for the SQLite store via SQLCipher (bundled — compiles C, no
-# system crypto deps). Enabled in `default`; opt out with `--no-default-features`
-# for a plain bundled-SQLite build.
-sqlcipher = ["rusqlite/bundled-sqlcipher"]
+# At-rest encryption for the SQLite store via SQLCipher (bundled — compiles C).
+# Uses VENDORED OpenSSL (built from source) so it needs no system OpenSSL /
+# OPENSSL_DIR — required for a portable build, especially Windows (which has no
+# system OpenSSL). Enabled in `default`; opt out with `--no-default-features`
+# for a plain bundled-SQLite build (no encryption, no crypto compile).
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 # --- async runtime / proxy spine ---
