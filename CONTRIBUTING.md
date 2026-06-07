@@ -24,9 +24,8 @@ before opening a PR.
 
 ## Design system
 
-UI and brand work should follow the design system reference in
-[`05-design-system.md`](05-design-system.md), with `design/tokens.css` and
-`design/brand.json` as the source of truth.
+UI and brand work should match the existing Studio styling in `studio-web/`
+(`styles.css` + `tokens.css`) and the CLI palette in `src/ui/palette.rs`.
 
 ## Hard invariants (please keep them)
 

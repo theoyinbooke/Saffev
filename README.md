@@ -312,11 +312,10 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 | `ui`              | The CLI palette (status dots, alignment, color detection). |
 | `brand`           | Single source of truth for the product name. |
 | `studio-web/`     | The embedded SPA (`index.html`, `app.js`, `styles.css`, `tokens.css`). |
-| `design/`         | Brand + design-system source (`brand.json`, `tokens.css`, the reference HTML). |
 
 ## Status: v0/v1 implemented vs deferred
 
-Per `04-implementation-plan.md`, this build is the **passive core, v1 complete**
+This build is the **passive core, v1 complete**
 (see "What's new in v1" above). The model-based capabilities are in the deferred
 set. Everything in scope is independently reliable and ships no unreliable model
 signal.
