@@ -10,9 +10,16 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-# Scoped to the reference platforms for v0.1.0: macOS (both arches) + Linux x86_64.
-# ARM-Linux and Windows are deferred (Windows: unix-specific daemon/attribution code).
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# v0.1.2 adds ARM-Linux + Windows to the original three (macOS both arches +
+# Linux x86_64). The unix-only daemon/attribution/signal code is now cfg-gated for
+# Windows (see src/cli/daemon.rs, src/attribution.rs, src/cli/commands.rs).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 # Path-style install: drop the binary on PATH (no extra prompts).
 install-path = "CARGO_HOME"
 # Write the install receipt the in-app updater (axoupdater) reads to find the
@@ -50,3 +57,20 @@ github-build-setup = "../build-setup.yml"
 # archive (that would break the installer's embedded checksums); it is read-only
 # against the release. It no-ops unless the Apple API-key secrets are present.
 post-announce-jobs = ["./notarize-macos"]
+
+# --- per-target CI runners ---
+#
+# Build aarch64-unknown-linux-gnu on a NATIVE ARM runner rather than dist's
+# default zig cross-compile. Rationale: the `sqlcipher` feature (ON by default)
+# links **bundled SQLCipher**, which compiles C, and `axoupdater` pulls in
+# `aws-lc-sys` (also C). Building that C natively on an ARM host sidesteps the
+# cross-C toolchain pitfalls (sysroot / headers / linker) that bite zig-cross C
+# builds. GitHub's `ubuntu-22.04-arm` runner is GA for public repos, so this needs
+# no paid runners. The other four targets keep their dist defaults (macOS arches on
+# macOS runners, x86_64 Linux on ubuntu-22.04, Windows on a windows runner — all
+# native, so their C deps compile natively too).
+#
+# NB: this is a TOML sub-table of [dist]; it MUST stay at the end of the file,
+# after every bare [dist] key, or those keys would bind to this table instead.
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"

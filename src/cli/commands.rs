@@ -1116,12 +1116,15 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 
 /// `saffev stop` — stop the proxy + Studio + supervisor.
 ///
-/// Reads the PID file written by `start`, sends `SIGTERM` for a graceful
-/// shutdown (the servers drain in-flight requests via `with_graceful_shutdown`),
-/// waits briefly for the process to exit, then removes the PID file. A **stale**
-/// PID file (the recorded process is no longer alive) is cleaned up gracefully.
-/// When there is no PID file but a Saffev-looking proxy is up, we report that the
-/// running instance is unmanaged (foreground in another terminal: Ctrl-C there).
+/// Reads the PID file written by `start` and asks the OS to terminate the daemon,
+/// then waits briefly for the process to exit and removes the PID file. On Unix
+/// this is a graceful `SIGTERM` (the servers drain in-flight requests via
+/// `with_graceful_shutdown`); on Windows it is `taskkill /T` (no SIGTERM
+/// equivalent — less graceful, but the SQLite WAL keeps the store consistent —
+/// see [`daemon::send_terminate`]). A **stale** PID file (the recorded process is
+/// no longer alive) is cleaned up gracefully. When there is no PID file but a
+/// Saffev-looking proxy is up, we report that the running instance is unmanaged
+/// (foreground in another terminal: Ctrl-C there).
 pub async fn stop(cli: &Cli) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
@@ -1190,9 +1193,10 @@ pub async fn stop(cli: &Cli) -> Result<()> {
         );
     }
 
-    // Graceful: SIGTERM, then wait briefly for the process to exit.
-    if let Err(e) = daemon::send_sigterm(record.pid) {
-        tracing::debug!("sending SIGTERM to {} failed: {e}", record.pid);
+    // Ask the OS to terminate the daemon (SIGTERM on unix; taskkill on Windows),
+    // then wait briefly for the process to exit.
+    if let Err(e) = daemon::send_terminate(record.pid) {
+        tracing::debug!("terminating {} failed: {e}", record.pid);
     }
 
     let exited = daemon::wait_for_exit(

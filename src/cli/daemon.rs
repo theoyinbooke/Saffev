@@ -11,16 +11,35 @@
 //!   the parent's terminal; the parent prints the URL and returns promptly.
 //! - A **PID file** (`saffev.pid` in `config.data_dir`) records the daemon's pid
 //!   and the Studio URL so `stop` (and a future `status`) can find it.
-//! - **Stop** reads the PID file, sends `SIGTERM` for a graceful shutdown (the
-//!   servers run under [`tokio::select!`] on a signal future — see
-//!   `commands::run_servers`), waits briefly for the process to exit, then
-//!   removes the PID file. A **stale** PID file (the process is no longer alive)
-//!   is handled gracefully: we just clean it up.
+//! - **Stop** reads the PID file and asks the OS to terminate the daemon, waits
+//!   briefly for the process to exit, then removes the PID file. A **stale** PID
+//!   file (the process is no longer alive) is handled gracefully: we just clean
+//!   it up.
 //!
-//! Signaling and liveness go through the POSIX `kill` binary (`kill -0 <pid>` to
-//! probe, `kill -TERM <pid>` to terminate) rather than `libc::kill`, again to
-//! stay within safe Rust. `kill` is present on both macOS and Linux on the
-//! default PATH (`/bin/kill`).
+//! ## Platform gating
+//!
+//! Process liveness, termination, and detached spawn are inherently OS-specific
+//! and `cfg`-gated so the crate compiles + runs everywhere:
+//!
+//! * **Unix (macOS / Linux)** — signaling and liveness go through the POSIX
+//!   `kill` binary (`kill -0 <pid>` to probe, `kill -TERM <pid>` to terminate)
+//!   rather than `libc::kill`, to stay within safe Rust (the crate is
+//!   `#![forbid(unsafe_code)]`). `kill` is present on both macOS and Linux on the
+//!   default PATH (`/bin/kill`). SIGTERM gives the servers a graceful drain (they
+//!   run under [`tokio::select!`] on a signal future — see
+//!   `commands::run_servers`).
+//! * **Windows** — there is no SIGTERM, so we shell out to the always-present
+//!   `tasklist` / `taskkill` tools (no new crate deps, mirroring the unix `kill`
+//!   approach): liveness via `tasklist /FI "PID eq <pid>" /NH`, termination via
+//!   `taskkill /PID <pid> /T` (tree). Windows stop is necessarily **less
+//!   graceful** than unix — `taskkill` (without `/F`) posts a WM_CLOSE / console
+//!   close event rather than draining like SIGTERM, and the server's shutdown
+//!   path is wired to `ctrl_c()` (see `commands::termination_signal`), so a clean
+//!   in-flight drain is best-effort. This is acceptable for now: the SQLite WAL
+//!   keeps the store consistent across an abrupt stop. A future nicety would be a
+//!   GenerateConsoleCtrlEvent-based graceful stop.
+//!   Detached spawn uses `CommandExt::creation_flags` with
+//!   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (both safe std APIs).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -107,40 +126,120 @@ pub fn remove_pid_file(path: &Path) -> Result<()> {
 
 /// Is the process with `pid` currently alive?
 ///
-/// Uses `kill -0 <pid>`, which sends no signal but performs the same existence +
-/// permission check the kernel would for a real signal. Exit status 0 means the
-/// process exists (and we may signal it). This is the portable, unsafe-free
-/// liveness probe on macOS + Linux. Our own pid (`saffev start` re-checking
-/// itself) is short-circuited to `true`.
+/// Our own pid (`saffev start` re-checking itself) is short-circuited to `true`
+/// on every platform.
+///
+/// * **Unix** — uses `kill -0 <pid>`, which sends no signal but performs the same
+///   existence + permission check the kernel would for a real signal. Exit status
+///   0 means the process exists (and we may signal it). Portable + unsafe-free on
+///   macOS + Linux.
+/// * **Windows** — shells out to `tasklist /FI "PID eq <pid>" /NH`. `tasklist`
+///   always emits a header-less line for a live pid and prints an "INFO: No
+///   tasks…" line (on stderr, exit 0) when nothing matches, so we look for the
+///   pid in stdout rather than trusting the exit code.
 pub fn process_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        // `tasklist` returns exit 0 even when nothing matches (it prints an
+        // "INFO:" line), so we cannot trust the status — we scan stdout for the
+        // pid. `/NH` drops the column header; `/FI "PID eq <pid>"` filters.
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                // A matching row contains the pid as a standalone whitespace token
+                // (e.g. `saffev.exe  12345 Console  1  …`). The no-match path
+                // prints `INFO: No tasks are running…`, which has no such token.
+                let needle = pid.to_string();
+                text.lines()
+                    .any(|line| line.split_whitespace().any(|tok| tok == needle))
+            }
+            // If `tasklist` can't be run at all, fail-soft to "not alive" so a
+            // missing tool degrades to treating the pid as gone (mirrors the unix
+            // `.unwrap_or(false)`), letting `stop` clean up a stale pid file.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No liveness probe on exotic targets; assume not alive (fail-soft).
+        let _ = pid;
+        false
+    }
 }
 
-/// Send `SIGTERM` to `pid` for a graceful shutdown. Returns `Ok(())` if the
-/// signal was delivered (or the process was already gone), `Err` only if the
-/// `kill` invocation itself failed to run.
+/// Ask the OS to terminate `pid` (best-effort graceful where possible). Returns
+/// `Ok(())` if the request was delivered (or the process was already gone), `Err`
+/// only if the termination tool itself failed to run.
+///
+/// * **Unix** — sends `SIGTERM`, which the servers handle for a graceful
+///   in-flight drain (`with_graceful_shutdown`). A non-success status (e.g.
+///   ESRCH: no such process) means it's already gone, which is fine.
+/// * **Windows** — runs `taskkill /PID <pid> /T` (terminate the process tree). No
+///   SIGTERM equivalent exists, so this is less graceful than unix: without `/F`
+///   it requests a WM_CLOSE/console-close shutdown, but there is no guaranteed
+///   request drain. The SQLite WAL keeps the store consistent across an abrupt
+///   stop. We deliberately do **not** pass `/F` (force) here so a still-draining
+///   daemon gets the chance to exit cleanly; `wait_for_exit` then reports whether
+///   it actually went, and the caller can re-run `stop` to retry.
+pub fn send_terminate(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(Error::Io)?;
+        let _ = status;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(Error::Io)?;
+        // A non-success status (process already gone, or access denied) is not an
+        // error for our purposes — the caller's goal is "stop it"; wait_for_exit
+        // reports the truth either way.
+        let _ = status;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+/// Back-compat alias for [`send_terminate`]. The name predates the Windows port
+/// (when this only ever sent SIGTERM); kept so existing call sites compile.
+#[inline]
 pub fn send_sigterm(pid: u32) -> Result<()> {
-    let status = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(Error::Io)?;
-    // A non-success status (e.g. ESRCH: no such process) means it's already gone,
-    // which is fine for our purposes — the caller wants it stopped.
-    let _ = status;
-    Ok(())
+    send_terminate(pid)
 }
 
 /// Whether a PID file refers to a live process. `Some(true)` = running,
@@ -183,6 +282,20 @@ pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: boo
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    // On Windows there is no `setsid`-style detach via stdio alone: a child of a
+    // console process stays attached to the parent's console and dies when the
+    // launching `saffev start` returns. Set DETACHED_PROCESS (no console at all)
+    // + CREATE_NEW_PROCESS_GROUP (its own group, so a Ctrl-C in the parent's
+    // console doesn't propagate to the daemon). Both flags go through the *safe*
+    // `CommandExt::creation_flags`, so this respects `#![forbid(unsafe_code)]`.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
 
     let child = cmd
         .spawn()
