@@ -282,20 +282,18 @@ mod tests {
         assert_eq!(CURRENT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
-    #[tokio::test]
-    async fn apply_without_receipt_is_graceful_not_panic() {
-        // A `cargo test` binary was NOT installed via the cargo-dist installer,
-        // so it has no install receipt. `apply()` must return the typed
-        // NoReceipt error (with friendly guidance) BEFORE any network call —
-        // never panic, never hang on the network. This is the no-receipt path
-        // the CLI + Studio rely on.
-        let result = super::apply().await;
-        match result {
-            Err(UpdateError::NoReceipt(msg)) => {
-                assert!(msg.contains("installer"), "guidance must mention installer");
-            }
-            other => panic!("expected NoReceipt for a non-installed binary, got {other:?}"),
-        }
+    #[test]
+    fn no_receipt_message_is_friendly_and_mentions_installer() {
+        // The no-receipt path (dev / `cargo install` builds) returns this
+        // single-source guidance. `apply()` returns it from the `!has_receipt`
+        // early-return BEFORE any network call (see `apply`), so a non-installed
+        // binary never hangs or panics. We assert the guidance HERMETICALLY here:
+        // calling the real `apply()` would depend on whether THIS machine has an
+        // install receipt and could trigger a live update, so it must not be a test.
+        assert!(
+            NO_RECEIPT_MESSAGE.contains("installer"),
+            "no-receipt guidance must mention the installer"
+        );
     }
 
     #[test]
