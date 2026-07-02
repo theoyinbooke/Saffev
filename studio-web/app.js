@@ -1678,7 +1678,7 @@
 
       const safEnable = switchBtn(s.evalSafety, 'Toggle safety guard', { disabled: !s.evalEnabled });
       safEnable.addEventListener('click', () => { if (!s.evalEnabled) return; this.save(view, { evalSafety: !safEnable.classList.contains('on') }); });
-      const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v1) — cheap, no model, runs on all exchanges.';
+      const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v2) — cheap, no model, runs on all exchanges.';
       evalCard.appendChild(setRow('Safety guard', safHint, el('div', { class: 'ctl' }, [safEnable])));
 
       // Quality judge (model-backed, opt-in). Needs a judge model configured.
@@ -2271,7 +2271,11 @@
      ========================================================================= */
   // Human label for a safety category.
   function safetyLabel(cat) {
-    return ({ self_harm: 'Self-harm', violence: 'Violence', weapons: 'Weapons', illicit: 'Illicit', csae: 'CSAE' })[cat] || cat;
+    return ({
+      self_harm: 'Self-harm', violence: 'Violence', weapons: 'Weapons',
+      illicit: 'Illicit drugs', financial_crime: 'Financial crime',
+      malware: 'Malware / hacking', harassment: 'Harassment', csae: 'CSAE',
+    })[cat] || cat.replace(/_/g, ' ');
   }
 
   /* =========================================================================
