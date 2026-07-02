@@ -924,7 +924,7 @@
           ]));
         });
         const extra = kinds.length - 2;
-        body.appendChild(el('a', { class: 'pii-more', href: '#/privacy', html: '<span>' + (extra > 0 ? '+' + extra + ' more · view full breakdown' : 'View full breakdown') + '</span>' + ICON.chevR }));
+        body.appendChild(el('a', { class: 'pii-more', href: '#/analytics/privacy', html: '<span>' + (extra > 0 ? '+' + extra + ' more · view full breakdown' : 'View full breakdown') + '</span>' + ICON.chevR }));
       }
       body.appendChild(el('div', { class: 'modebar', id: 'liveMaskBar' }));
       this.renderMaskingBar();
@@ -2054,6 +2054,7 @@
       { k: 'usage', l: 'Usage' },
       { k: 'performance', l: 'Performance' },
       { k: 'privacy', l: 'Privacy' },
+      { k: 'quality', l: 'Quality' },
       { k: 'explorer', l: 'Explorer' },
     ],
 
@@ -2089,14 +2090,20 @@
     renderTab() {
       $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
       const panel = $('#anPanel');
-      if (!panel || !this.data) return;
+      if (!panel) return;
       panel.innerHTML = '';
+      // Privacy + Quality are folded in as tabs; they own their own data + empty
+      // states (fetched from /privacy and /quality), so they render directly and
+      // bypass the analytics-window empty guard below.
+      if (this.tab === 'privacy') { Privacy.render(panel); return; }
+      if (this.tab === 'quality') { Quality.draw(panel, this.rangeMs); return; }
+      if (!this.data) return;
       const d = this.data;
       if (d.totalRequests === 0 && this.tab !== 'overview') {
         panel.appendChild(emptyState('No traffic in this window', 'Try a longer window, or point an app at the proxy (see About & integrate).'));
         return;
       }
-      ({ overview: this.overview, usage: this.usage, performance: this.performance, privacy: this.privacy, explorer: this.explorer }[this.tab] || this.overview).call(this, panel, d);
+      ({ overview: this.overview, usage: this.usage, performance: this.performance, explorer: this.explorer }[this.tab] || this.overview).call(this, panel, d);
     },
 
     xLabels(d) {
@@ -2332,13 +2339,14 @@
       view.appendChild(el('div', { id: 'qBody' }));
       await this.draw();
     },
-    async draw() {
-      const body = $('#qBody');
+    async draw(container, rangeMs) {
+      const body = container || $('#qBody');
+      const range = rangeMs || this.rangeMs;
       if (!body) return;
       body.innerHTML = '';
       body.appendChild(loadingState('Loading evaluations…'));
       let d;
-      try { d = await api('/quality?rangeMs=' + this.rangeMs); hideBanner(); }
+      try { d = await api('/quality?rangeMs=' + range); hideBanner(); }
       catch (e) { handleApiError(e); body.innerHTML = ''; body.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
       body.innerHTML = '';
 
@@ -2419,7 +2427,9 @@
     teardown() {},
   };
 
-  const ROUTES = { live: Live, history: History, privacy: Privacy, analytics: Analytics, quality: Quality, engines: Engines, settings: Settings, about: About };
+  // Privacy + Quality are folded into Analytics tabs (see navigate() redirects);
+  // they stay as objects (Analytics renders their bodies) but aren't top-level routes.
+  const ROUTES = { live: Live, history: History, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {
@@ -2427,9 +2437,15 @@
   }
 
   async function navigate() {
-    const hash = (location.hash || '#/live').replace(/^#\/?/, '');
-    const route = ROUTES[hash] ? hash : 'live';
+    let raw = (location.hash || '#/live').replace(/^#\/?/, '');
+    // Consolidated pages redirect to their Analytics tab (deep links still work).
+    const REDIRECT = { privacy: 'analytics/privacy', quality: 'analytics/quality' };
+    if (!raw.includes('/') && REDIRECT[raw]) raw = REDIRECT[raw];
+    const [seg, sub] = raw.split('/');
+    const route = ROUTES[seg] ? seg : 'live';
     const page = ROUTES[route];
+    // A `#/analytics/<tab>` deep link opens Analytics on that tab.
+    if (route === 'analytics' && sub && Analytics.TABS.some((t) => t.k === sub)) Analytics.tab = sub;
     if (activePage && activePage.teardown) activePage.teardown();
     activePage = page;
     setActiveNav(route);
