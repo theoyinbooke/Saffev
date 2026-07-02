@@ -500,6 +500,20 @@
       body.appendChild(sf);
     }
 
+    // quality scores (eval pipeline)
+    if (detail.eval && detail.eval.length) {
+      const ef = el('div', { class: 'payblk' }, [el('h4', { text: 'Quality (' + esc(detail.eval[0].judgeModel) + ')' })]);
+      const list = el('div', { class: 'findlist' });
+      detail.eval.forEach((e) => {
+        const r = el('div', { class: 'find' });
+        r.appendChild(el('span', { class: 'actchip ' + (e.band === 'good' ? 'act-masked' : 'act-would_mask'), text: e.band }));
+        r.appendChild(el('span', { text: e.metric + (e.rationale ? ' · ' + e.rationale : '') }));
+        list.appendChild(r);
+      });
+      ef.appendChild(list);
+      body.appendChild(ef);
+    }
+
     // payloads
     if (detail.payloadsDisabled) {
       body.appendChild(el('div', { class: 'payblk' }, [
@@ -1666,11 +1680,24 @@
       const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v1) — cheap, no model, runs on all exchanges.';
       evalCard.appendChild(setRow('Safety guard', safHint, el('div', { class: 'ctl' }, [safEnable])));
 
+      // Quality judge (model-backed, opt-in). Needs a judge model configured.
+      const qEnable = switchBtn(s.evalQuality, 'Toggle quality judge', { disabled: !s.evalEnabled });
+      qEnable.addEventListener('click', () => { if (!s.evalEnabled) return; this.save(view, { evalQuality: !qEnable.classList.contains('on') }); });
+      const qHint = !s.evalEnabled ? 'Enable evaluation first.'
+        : (s.evalJudgeModel ? 'LLM-as-judge on your own engine — sampled + concurrency-gated so it never thrashes the model.' : 'Set a judge model below to activate.');
+      evalCard.appendChild(setRow('Quality judge', qHint, el('div', { class: 'ctl' }, [qEnable])));
+
+      const modelInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. qwen3.5:2b', value: s.evalJudgeModel || '' });
+      if (!s.evalEnabled) modelInput.setAttribute('disabled', '');
+      let mt;
+      modelInput.addEventListener('input', () => { clearTimeout(mt); mt = setTimeout(() => this.save(view, { evalJudgeModel: modelInput.value.trim() }), 600); });
+      evalCard.appendChild(setRow('Judge model', 'A small model on your running engine (Ollama/LM Studio) to score quality. Leave blank to disable.', el('div', { class: 'ctl' }, [modelInput])));
+
       const rateSel = dropdown(
         [['0', 'Off'], ['0.1', '10%'], ['0.25', '25%'], ['0.5', '50%'], ['1', '100%']].map(([v, t]) => ({ value: v, label: t })),
         String(s.evalSampleRate), (v) => this.save(view, { evalSampleRate: parseFloat(v) }), { ariaLabel: 'Judge sampling' }
       );
-      evalCard.appendChild(setRow('Judge sampling', 'Fraction of exchanges sent to the (optional) model judge. The safety guard always runs on all exchanges when enabled.', el('div', { class: 'ctl' }, [rateSel])));
+      evalCard.appendChild(setRow('Judge sampling', 'Fraction of exchanges sent to the model judge. The safety guard always runs on all exchanges when enabled.', el('div', { class: 'ctl' }, [rateSel])));
       panel.appendChild(evalCard);
     },
 
@@ -2272,7 +2299,7 @@
       const kpis = el('section', { class: 'grid kpis reveal' }, [
         kpiCard(d.totalFlagged > 0 ? 'danger' : 'safe', ICON.shieldAlert, 'Flagged exchanges', el('div', { class: 'val num', text: fmtNum(d.totalFlagged) }), el('div', { class: 'meta', text: 'safety guard' })),
         kpiCard('brand', ICON.shield, 'Safety guard', el('div', { class: 'val', text: d.safetyEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'deterministic:v1' })),
-        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'LLM sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' })),
+        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: fmtNum(d.totalJudged || 0) + ' judged · sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' })),
       ]);
       view.appendChild(kpis);
 
@@ -2283,6 +2310,23 @@
       if (!d.byCategory || !d.byCategory.length) catCard.appendChild(el('div', { class: 'expnote', html: ICON.check + ' No safety flags in the retained window.' }));
       else catCard.appendChild(C.hbars({ items: d.byCategory.map((c) => ({ label: safetyLabel(c.name), value: c.count, suffix: ' flag', color: 'var(--danger)' })) }));
       view.appendChild(catCard);
+
+      // Quality scores by metric (only when the judge has produced any).
+      if (d.evalByMetric && d.evalByMetric.length) {
+        const qCard = el('div', { class: 'card reveal', style: 'animation-delay:.08s' }, [
+          el('div', { class: 'hrow' }, [el('h3', { text: 'Quality by metric' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'judge' })]),
+        ]);
+        d.evalByMetric.forEach((m) => {
+          const total = (m.good || 0) + (m.weak || 0);
+          const pct = total ? Math.round((m.good / total) * 100) : 0;
+          qCard.appendChild(el('div', { class: 'pii-row' }, [
+            el('div', { class: 'swt ic safe', html: ICON.check }),
+            el('div', {}, [el('div', { class: 'nm', text: m.metric.charAt(0).toUpperCase() + m.metric.slice(1) }), el('div', { class: 'cf', text: fmtNum(m.good) + ' good · ' + fmtNum(m.weak) + ' weak' })]),
+            el('div', { class: 'ct', text: pct + '%' }),
+          ]));
+        });
+        view.appendChild(qCard);
+      }
 
       const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
         el('div', { class: 'hrow' }, [el('h3', { text: 'Recent flagged exchanges' }), el('div', { class: 'spacer' })]),

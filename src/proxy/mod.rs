@@ -288,35 +288,209 @@ pub mod upstream;
 // ---------------------------------------------------------------------------
 
 /// Spawn the async **eval worker**: drains the eval channel and runs the safety
-/// guard on each record (Phase 3). The model-backed judge (Phase 4) will run here
-/// too, behind a concurrency semaphore. Fully off the request path; fail-open.
+/// guard (Phase 3) + the model-backed quality judge (Phase 4) on each record.
+/// The judge is sampled, timed out, and gated by a concurrency semaphore so it
+/// never thrashes the engine. Fully off the request path; fail-open.
+///
+/// `upstream` is the LOCAL engine base URL — the judge only ever calls loopback.
 pub fn spawn_eval_worker(
     store: Store,
     config: ConfigHandle,
     events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    upstream: Arc<str>,
     rx: EvalReceiver,
 ) {
-    tokio::spawn(run_eval_worker(store, config, events, rx));
+    tokio::spawn(run_eval_worker(store, config, events, upstream, rx));
 }
 
 async fn run_eval_worker(
     store: Store,
     config: ConfigHandle,
     events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    upstream: Arc<str>,
     mut rx: EvalReceiver,
 ) {
+    // Contention guard: at most `max_concurrency` judge calls in flight. Sized
+    // once at startup (changing it is restart-required — the safe default is 1).
+    let max = config.load().eval.max_concurrency.max(1) as usize;
+    let judge_sem = Arc::new(tokio::sync::Semaphore::new(max));
+
     while let Some(rec) = rx.recv().await {
         // Re-read live config: eval may have been toggled off since enqueue.
         let cfg = config.load();
         if !cfg.eval.enabled {
             continue;
         }
+        // Safety guard: cheap + deterministic, runs inline on every record.
         if cfg.eval.safety {
             run_safety_guard(&store, &events, &rec);
         }
-        // Phase 4: model-backed quality judge (semaphore-gated) runs here.
+        // Quality judge: model-backed, opt-in, sampled, concurrency-gated. Spawned
+        // so the loop keeps draining the safety guard while judges queue on the
+        // semaphore. Runs only with a configured judge model.
+        if cfg.eval.quality {
+            if let Some(model) = cfg
+                .eval
+                .judge_model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+            {
+                if sampled(&rec.record_id, cfg.eval.sample_rate) {
+                    let backend = EngineBackend {
+                        base: upstream.clone(),
+                        model,
+                        timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
+                    };
+                    let sem = judge_sem.clone();
+                    let store = store.clone();
+                    let rec = rec.clone();
+                    tokio::spawn(async move {
+                        // Acquire a permit INSIDE the task so the worker loop never
+                        // blocks; excess judges simply queue here.
+                        let Ok(_permit) = sem.acquire_owned().await else {
+                            return;
+                        };
+                        run_quality_judge(&store, &backend, &rec).await;
+                    });
+                }
+            }
+        }
     }
     tracing::debug!("proxy: eval channel closed, worker exiting");
+}
+
+/// Deterministic per-record sampling (no rng dependency): FNV-hash the record id
+/// and keep it if it falls in the first `rate` fraction of the space. Stable, so
+/// the same exchange is judged consistently.
+fn sampled(record_id: &str, rate: f32) -> bool {
+    if rate >= 1.0 {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+    let mut h = OFFSET;
+    for &b in record_id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    (h % 1000) < (rate * 1000.0) as u64
+}
+
+/// Run the model-backed quality judge and persist its banded scores. Fail-open.
+async fn run_quality_judge(
+    store: &Store,
+    backend: &EngineBackend,
+    rec: &crate::brain::JudgeRecord,
+) {
+    let scores = crate::brain::judge::RubricJudge::evaluate(backend, rec).await;
+    if scores.is_empty() {
+        return;
+    }
+    let ts = now_millis();
+    let records: Vec<crate::store::EvalScoreRecord> = scores
+        .into_iter()
+        .map(|s| crate::store::EvalScoreRecord {
+            record_id: rec.record_id.clone(),
+            judge_model: backend.model.clone(),
+            metric: s.metric,
+            band: s.band,
+            rationale: s.rationale,
+            sampled: true,
+            ts,
+        })
+        .collect();
+    store.enqueue(crate::store::WriteOp::EvalScores(records));
+}
+
+/// Lazy HTTP client for judge calls to the local engine. No overall timeout —
+/// the worker wraps each call with `eval.timeout_ms` via `tokio::time::timeout`.
+static JUDGE_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// [`crate::brain::judge::LlmBackend`] backed by the LOCAL engine's OpenAI-compat
+/// endpoint (`/v1/chat/completions`) — which both Ollama and LM Studio speak, so
+/// the judge is engine-agnostic. Only ever calls loopback.
+struct EngineBackend {
+    base: Arc<str>,
+    model: String,
+    timeout: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::brain::judge::LlmBackend for EngineBackend {
+    async fn complete(&self, prompt: &str) -> Option<String> {
+        // Wrap the whole request+parse in the configured timeout.
+        tokio::time::timeout(self.timeout, self.do_complete(prompt))
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+impl EngineBackend {
+    async fn do_complete(&self, prompt: &str) -> Option<String> {
+        // Prefer Ollama's NATIVE /api/chat: `think:false` skips the slow reasoning
+        // trace that "thinking" small models emit (and that the OpenAI-compat
+        // endpoint returns as empty content), and `format:"json"` forces a
+        // parseable object. Fall back to /v1/chat/completions for LM Studio.
+        if let Some(s) = self.ollama_chat(prompt).await {
+            return Some(s);
+        }
+        self.openai_chat(prompt).await
+    }
+
+    async fn ollama_chat(&self, prompt: &str) -> Option<String> {
+        let url = format!("{}/api/chat", self.base.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": false,
+            "think": false,
+            "format": "json",
+            "options": { "temperature": 0, "num_predict": 256 },
+        });
+        let resp = JUDGE_CLIENT.post(&url).json(&body).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        v.get("message")?
+            .get("content")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    async fn openai_chat(&self, prompt: &str) -> Option<String> {
+        let url = format!("{}/v1/chat/completions", self.base.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": 512,
+        });
+        let resp = JUDGE_CLIENT.post(&url).json(&body).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        v.get("choices")?
+            .get(0)?
+            .get("message")?
+            .get("content")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
 }
 
 /// Run the deterministic safety guard over a record's text; persist + publish any

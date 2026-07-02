@@ -1135,11 +1135,12 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     // Drain the tee into the store off the request path.
     crate::proxy::ProxyServer::spawn_logger(proxy_state.clone(), rx);
 
-    // Drain the eval channel: run the safety guard (+ judge later) off the path.
+    // Drain the eval channel: run the safety guard + quality judge off the path.
     crate::proxy::spawn_eval_worker(
         proxy_state.store.clone(),
         proxy_state.config.clone(),
         events,
+        proxy_state.upstream.clone(),
         eval_rx,
     );
 
