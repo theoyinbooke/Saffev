@@ -12,6 +12,7 @@
 //!   only via the async sampler.
 
 pub mod guard;
+pub mod judge;
 pub mod pii;
 
 use serde::{Deserialize, Serialize};

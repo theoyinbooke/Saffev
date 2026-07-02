@@ -75,6 +75,20 @@ pub struct HistoryItem {
     pub safety_flagged: bool,
 }
 
+/// One quality-judge score as shown in the History detail drawer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalView {
+    /// Metric (e.g. `relevance`).
+    pub metric: String,
+    /// Banded verdict (e.g. `good` / `weak`).
+    pub band: String,
+    /// Optional short rationale.
+    pub rationale: Option<String>,
+    /// The judge model.
+    pub judge_model: String,
+}
+
 /// One safety finding as shown in the History detail drawer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +171,9 @@ pub struct HistoryDetail {
     /// Safety findings on this exchange (eval pipeline).
     #[serde(default)]
     pub safety: Vec<SafetyView>,
+    /// Quality-judge scores on this exchange (eval pipeline).
+    #[serde(default)]
+    pub eval: Vec<EvalView>,
     /// Raw prompt, present only when payload storage is on.
     pub prompt: Option<String>,
     /// Raw response, present only when payload storage is on.
@@ -181,8 +198,24 @@ pub struct QualityReport {
     pub total_flagged: u64,
     /// Safety findings bucketed by category (descending).
     pub by_category: Vec<NamedCount>,
+    /// Distinct exchanges the quality judge scored.
+    pub total_judged: u64,
+    /// Quality scores bucketed by metric (good vs weak counts).
+    pub eval_by_metric: Vec<MetricBands>,
     /// Recent flagged exchanges (for the table).
     pub recent_flagged: Vec<HistoryItem>,
+}
+
+/// Good/weak counts for one quality metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricBands {
+    /// Metric name (e.g. `relevance`).
+    pub metric: String,
+    /// Count banded `good`.
+    pub good: u64,
+    /// Count banded anything else (weak).
+    pub weak: u64,
 }
 
 /// One bucket in the Privacy page breakdown.
@@ -317,6 +350,10 @@ pub struct SettingsView {
     /// LLM-judge sampling fraction (0..1).
     #[serde(default)]
     pub eval_sample_rate: f32,
+    /// Model the quality judge asks (on the user's own engine). Empty = unset
+    /// (the judge is inert until a model is chosen).
+    #[serde(default)]
+    pub eval_judge_model: Option<String>,
     /// Fields whose new value was persisted to TOML but is **not** applied to the
     /// running process because it cannot be safely changed at runtime — `mode` and
     /// the ports rebind the listeners / re-adopt the engine. Empty when the last
@@ -356,6 +393,8 @@ pub struct SettingsUpdate {
     pub eval_quality: Option<bool>,
     /// Set the LLM-judge sampling fraction (0..1).
     pub eval_sample_rate: Option<f32>,
+    /// Set the quality-judge model (empty string clears it).
+    pub eval_judge_model: Option<String>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.

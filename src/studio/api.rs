@@ -357,6 +357,21 @@ pub async fn history_detail(
         })
         .collect();
 
+    // Quality-judge scores for this record (eval pipeline), projected to views.
+    let eval: Vec<dto::EvalView> = state
+        .store
+        .eval_for(&id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| dto::EvalView {
+            metric: e.metric,
+            band: e.band,
+            rationale: e.rationale,
+            judge_model: e.judge_model,
+        })
+        .collect();
+
     // Payloads are present only when payload storage is on (load live snapshot).
     let payloads_disabled = !state.config.load().payload_storage;
     let (prompt, response) = if payloads_disabled {
@@ -372,6 +387,7 @@ pub async fn history_detail(
         item,
         findings,
         safety,
+        eval,
         prompt,
         response,
         payloads_disabled,
@@ -470,6 +486,25 @@ pub async fn quality(
     let by_category = named_counts_sorted(by_cat);
     let total_flagged = flagged.len() as u64;
 
+    // Quality-judge summary: per-metric good/weak + distinct judged records.
+    let evals = state.store.eval_scores().await.map_err(internal)?;
+    let mut judged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut metric_bands: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for e in &evals {
+        judged.insert(e.record_id.clone());
+        let entry = metric_bands.entry(e.metric.clone()).or_insert((0, 0));
+        if e.band == "good" {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    let total_judged = judged.len() as u64;
+    let eval_by_metric: Vec<dto::MetricBands> = metric_bands
+        .into_iter()
+        .map(|(metric, (good, weak))| dto::MetricBands { metric, good, weak })
+        .collect();
+
     // Recent flagged exchanges for the table (join safety back to history rows).
     let rows = state
         .store
@@ -502,6 +537,8 @@ pub async fn quality(
         sample_rate: cfg.eval.sample_rate,
         total_flagged,
         by_category,
+        total_judged,
+        eval_by_metric,
         recent_flagged,
     }))
 }
@@ -1496,6 +1533,13 @@ pub async fn settings_put(
         persisted.eval.sample_rate = v;
         live.eval.sample_rate = v;
     }
+    if let Some(v) = body.eval_judge_model {
+        // Empty string clears the model (judge goes inert).
+        let m = v.trim();
+        let val = (!m.is_empty()).then(|| m.to_string());
+        persisted.eval.judge_model = val.clone();
+        live.eval.judge_model = val;
+    }
 
     // Persist the full config (write-through to TOML). The token is never touched.
     persisted.save().map_err(internal)?;
@@ -1579,6 +1623,7 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         eval_safety: cfg.eval.safety,
         eval_quality: cfg.eval.quality,
         eval_sample_rate: cfg.eval.sample_rate,
+        eval_judge_model: cfg.eval.judge_model.clone(),
         restart_required: Vec::new(),
         restart_note: None,
     }
