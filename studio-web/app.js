@@ -2111,12 +2111,20 @@
     overview(panel, d) {
       const C = window.SaffevCharts;
       const xl = this.xLabels(d);
-      const kpis = el('section', { class: 'grid kpis reveal' }, [
-        anKpi('brand', ICON.pulse, 'Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
-        anKpi('gold', ICON.bolt, 'Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'meta', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
-        anKpi('brand', ICON.clock, 'Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
-        anKpi('danger', ICON.shieldAlert, 'PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
-        anKpi(d.failedRequests > 0 ? 'danger' : 'gold', ICON.shieldAlert, 'Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
+      // One balanced metric band (design's "metric cells"), even at 5 cells —
+      // no orphan card. mono label · big tabular number · delta · sparkline.
+      const sCell = (label, valueHtml, subNode, spark) => el('div', { class: 'stat' }, [
+        el('div', { class: 'stat-l', text: label }),
+        el('div', { class: 'stat-v num', html: valueHtml }),
+        subNode || null,
+        spark ? el('div', { class: 'stat-spark' }, [spark]) : null,
+      ]);
+      const kpis = el('section', { class: 'statbar reveal', style: '--cols:5' }, [
+        sCell('Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
+        sCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'stat-s', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
+        sCell('Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
+        sCell('PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
+        sCell('Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
       ]);
       panel.appendChild(kpis);
       const cost = el('div', { class: 'card reveal an-cost' }, [
