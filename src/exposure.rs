@@ -87,7 +87,7 @@ pub fn classify_binding(port: u16, binding: &Binding, token_protected: bool) -> 
             exposed: false,
             bound_to: Some(format!("127.0.0.1:{port}")),
             token_protected,
-            detail: "Engine is bound to localhost only — not reachable from the network.".into(),
+            detail: "Engine is bound to localhost only, not reachable from the network.".into(),
         },
         Binding::Wildcard => ExposureReport {
             exposed: true,

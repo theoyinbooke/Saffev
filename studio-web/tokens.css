@@ -69,6 +69,12 @@
   --fs-body: 0.9375rem;      --fs-small: 0.8125rem;  --fs-data: 0.8125rem;
   --fs-label: 0.6875rem;     /* mono, uppercase, .16em tracking */
 
+  /* atmosphere washes — soft corner glows on the canvas (top-right brand,
+     top-left amber). Subtle on paper; stronger in dark to lift the surface off
+     pure black. Applied on the body background-image (must not lower contrast). */
+  --wash-brand: color-mix(in oklab, var(--brand) 8%, transparent);
+  --wash-gold:  color-mix(in oklab, var(--gold) 9%, transparent);
+
   color-scheme: light;
 }
 
@@ -86,6 +92,8 @@
     --shadow:    0 16px 38px -14px rgba(0,0,0,.66);
     --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
     --ring:      0 0 0 3px rgba(92,196,179,.30);
+    --wash-brand: color-mix(in oklab, var(--brand) 20%, transparent);
+    --wash-gold:  color-mix(in oklab, var(--gold) 15%, transparent);
     color-scheme: dark;
   }
 }
@@ -114,6 +122,12 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   transition: background .35s ease, color .35s ease;
+  /* soft corner glows — a warm green at top-right, amber at top-left. Fixed to
+     the viewport so they stay in the corners as content scrolls. */
+  background-image:
+    radial-gradient(1000px 500px at 92% -10%, var(--wash-brand), transparent 68%),
+    radial-gradient(880px 460px at -6% 6%, var(--wash-gold), transparent 66%);
+  background-attachment: fixed;
 }
 ::selection { background: color-mix(in oklab, var(--brand) 18%, transparent); }
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }

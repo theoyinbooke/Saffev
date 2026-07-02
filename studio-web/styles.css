@@ -398,11 +398,17 @@ a{color:inherit}
 /* ============================================================
    About & integrate page
    ============================================================ */
-.about-hero{background:var(--brand-soft);border-color:color-mix(in srgb,var(--brand) 20%,transparent)}
+.about-hero{background:var(--brand-soft);border-color:color-mix(in srgb,var(--brand) 20%,transparent);display:flex;justify-content:space-between;align-items:flex-start;gap:44px;flex-wrap:wrap;padding:26px 28px}
+.about-hero-main{flex:1;min-width:min(100%,300px);max-width:640px}
+.about-hero-side{display:flex;flex-direction:column;gap:12px;align-items:flex-start;padding-top:6px}
+.hero-sig{display:inline-flex;align-items:center;gap:9px;font-family:var(--font-mono);font-size:.72rem;color:var(--text-2)}
+.hero-sig-dot{width:6px;height:6px;border-radius:var(--r-full);background:var(--brand);flex:none}
+.hero-sig.dim{color:var(--text-3)}
+.hero-sig.dim .hero-sig-dot{background:var(--text-3)}
 .about-badge{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:var(--r-full);background:var(--surface);border:1px solid var(--border);font-size:.72rem;font-weight:600;color:var(--brand)}
 .about-badge svg{width:15px;height:15px}
-.about-h1{font-family:var(--font-display);font-weight:600;font-size:1.9rem;letter-spacing:-.03em;line-height:1.1;margin-top:16px;max-width:34ch}
-.about-lead{color:var(--text-2);font-size:1rem;line-height:1.6;margin-top:14px;max-width:64ch}
+.about-h1{font-family:var(--font-display);font-weight:600;font-size:2.0rem;letter-spacing:-.03em;line-height:1.05;margin-top:18px;max-width:20ch}
+.about-lead{color:var(--text-2);font-size:.98rem;line-height:1.6;margin-top:14px;max-width:56ch}
 .about-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
 .about-chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:var(--r-full);background:var(--surface);border:1px solid var(--border);font-size:.78rem;font-weight:500;color:var(--text-2)}
 .about-chip svg{width:14px;height:14px;color:var(--brand)}
