@@ -114,6 +114,15 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE responses ADD COLUMN status INTEGER;
     ALTER TABLE responses ADD COLUMN error_kind TEXT;
     "#,
+    // --- v4: indexes for the eval pipeline's per-record lookups ---
+    //
+    // `safety_findings` / `eval_scores` were created in v1 (schema-ready, unused).
+    // The eval worker now writes them and the Studio drawer reads them by
+    // `record_id`, so index that column on both — mirrors `idx_pii_record`.
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_safety_record ON safety_findings(record_id);
+    CREATE INDEX IF NOT EXISTS idx_eval_record ON eval_scores(record_id);
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

@@ -192,6 +192,10 @@ a{color:inherit}
 .trow.failed .cell-endpoint,.trow.failed .cell-model{color:var(--danger)}
 .cell-status{color:var(--text-2);font-family:var(--font-mono);font-size:.76rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cell-status.bad{color:var(--danger);font-weight:600}
+/* Safety flag (eval pipeline): a danger chip + a subtle row marker. */
+.safetybadge{margin-left:6px;font-family:var(--font-mono);font-size:.6rem;font-weight:700;letter-spacing:.04em;padding:2px 6px;border-radius:var(--r-full);background:var(--danger-soft);color:var(--danger);white-space:nowrap}
+.trow.flagged{box-shadow:inset 3px 0 0 var(--gold)}
+.trow.failed.flagged{box-shadow:inset 3px 0 0 var(--danger)}
 /* Per-finding action chip in the detail drawer. */
 .actchip{font-family:var(--font-mono);font-size:.62rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:var(--r-full);background:var(--surface-2);color:var(--text-2)}
 .actchip.act-masked{background:var(--safe-soft);color:var(--safe)}

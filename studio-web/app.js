@@ -375,6 +375,8 @@
         cell.appendChild(el('span', { class: 'piibadge' + (kinds[0] === 'api_key' ? ' key' : ''), 'data-k': kinds[0], text: piiShort(kinds[0]) }));
         if (kinds.length > 1) cell.appendChild(el('span', { class: 'piibadge more', title: kinds.slice(1).map(piiShort).join(', '), text: '+' + (kinds.length - 1) }));
       }
+      // Safety flag badge (eval pipeline).
+      if (item.safetyFlagged) cell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
       return cell;
     }
     if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '—' });
@@ -421,7 +423,7 @@
     opts = opts || {};
     const cols = opts.columns || HIST_COLS;
     const row = el('div', {
-      class: 'trow' + (opts.streaming ? ' streaming' : '') + (opts.enter ? ' enter' : '') + (isFailed(item) ? ' failed' : ''),
+      class: 'trow' + (opts.streaming ? ' streaming' : '') + (opts.enter ? ' enter' : '') + (isFailed(item) ? ' failed' : '') + (item.safetyFlagged ? ' flagged' : ''),
       'data-id': item.id, role: 'button', tabindex: '0',
     });
     cols.forEach((k) => row.appendChild(reqCell(k, item)));
@@ -481,6 +483,21 @@
       });
       fl.appendChild(list);
       body.appendChild(fl);
+    }
+
+    // safety findings (eval pipeline)
+    if (detail.safety && detail.safety.length) {
+      const sf = el('div', { class: 'payblk' }, [el('h4', { text: 'Safety findings' })]);
+      const list = el('div', { class: 'findlist' });
+      detail.safety.forEach((s) => {
+        const r = el('div', { class: 'find' });
+        r.appendChild(el('span', { class: 'safetybadge', text: '⚠ ' + s.verdict }));
+        r.appendChild(el('span', { text: safetyLabel(s.category) + (s.score != null ? ' · ' + s.score.toFixed(2) : '') }));
+        r.appendChild(el('span', { class: 'where', text: s.guardModel }));
+        list.appendChild(r);
+      });
+      sf.appendChild(list);
+      body.appendChild(sf);
     }
 
     // payloads
@@ -1075,6 +1092,17 @@
         // Badges render from the row item's piiKinds (collapsed to "first + N");
         // the live finding event just advances the KPI + privacy lens.
         this.bumpPii();
+      } else if (msg.type === 'safety') {
+        // Eval runs asynchronously after the exchange finished — badge the row
+        // retroactively if it's still on screen.
+        const row = this.seen[msg.id];
+        if (row) {
+          row.classList.add('flagged');
+          const appCell = row.querySelector('.cell-app');
+          if (appCell && !appCell.querySelector('.safetybadge')) {
+            appCell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
+          }
+        }
       }
     },
 
@@ -1623,6 +1651,27 @@
       if (s.maskingEnabled && !s.maskingDryRun) dryRow.querySelector('.hint').classList.add('danger-note');
       maskCard.appendChild(dryRow);
       panel.appendChild(maskCard);
+
+      // Evaluation (eval pipeline: safety guard + judge). Async, off hot path.
+      const evalCard = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Evaluation' })])]);
+      const evEnable = switchBtn(s.evalEnabled, 'Toggle evaluation');
+      evEnable.addEventListener('click', () => this.save(view, { evalEnabled: !evEnable.classList.contains('on') }));
+      const evHint = s.evalEnabled
+        ? 'On — sampled exchanges are scored asynchronously, on-device (never blocks your model).'
+        : 'Off — no evaluation. Turn on to score traffic for safety (and quality later).';
+      evalCard.appendChild(setRow('Enable evaluation', evHint, el('div', { class: 'ctl' }, [evEnable])));
+
+      const safEnable = switchBtn(s.evalSafety, 'Toggle safety guard', { disabled: !s.evalEnabled });
+      safEnable.addEventListener('click', () => { if (!s.evalEnabled) return; this.save(view, { evalSafety: !safEnable.classList.contains('on') }); });
+      const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v1) — cheap, no model, runs on all exchanges.';
+      evalCard.appendChild(setRow('Safety guard', safHint, el('div', { class: 'ctl' }, [safEnable])));
+
+      const rateSel = dropdown(
+        [['0', 'Off'], ['0.1', '10%'], ['0.25', '25%'], ['0.5', '50%'], ['1', '100%']].map(([v, t]) => ({ value: v, label: t })),
+        String(s.evalSampleRate), (v) => this.save(view, { evalSampleRate: parseFloat(v) }), { ariaLabel: 'Judge sampling' }
+      );
+      evalCard.appendChild(setRow('Judge sampling', 'Fraction of exchanges sent to the (optional) model judge. The safety guard always runs on all exchanges when enabled.', el('div', { class: 'ctl' }, [rateSel])));
+      panel.appendChild(evalCard);
     },
 
     panelSystem(panel, view, s) {
@@ -2192,7 +2241,66 @@
   /* =========================================================================
      ROUTER
      ========================================================================= */
-  const ROUTES = { live: Live, history: History, privacy: Privacy, analytics: Analytics, engines: Engines, settings: Settings, about: About };
+  // Human label for a safety category.
+  function safetyLabel(cat) {
+    return ({ self_harm: 'Self-harm', violence: 'Violence', weapons: 'Weapons', illicit: 'Illicit', csae: 'CSAE' })[cat] || cat;
+  }
+
+  /* =========================================================================
+     PAGE: QUALITY & SAFETY  (eval pipeline)
+     ========================================================================= */
+  const Quality = {
+    title: 'Quality & Safety',
+    sub: 'Sampled safety + quality evaluation of your local model traffic — async, on-device.',
+    async render(view) {
+      view.innerHTML = '';
+      view.appendChild(loadingState('Loading evaluations…'));
+      let d;
+      try { d = await api('/quality'); hideBanner(); }
+      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
+      view.innerHTML = '';
+
+      if (!d.evalEnabled) {
+        view.appendChild(el('div', { class: 'card reveal' }, [
+          aboutSection(ICON.shieldAlert, 'Evaluation is off', 'Turn it on to score traffic for safety'),
+          el('p', { class: 'about-p', text: 'The eval pipeline scores sampled exchanges for safety (and, optionally, quality) — asynchronously and on-device, never blocking your model. It is off by default.' }),
+          el('a', { class: 'btn primary', href: '#/settings', html: ICON.check + '<span>Enable in Settings</span>' }),
+        ]));
+        return;
+      }
+
+      const kpis = el('section', { class: 'grid kpis reveal' }, [
+        kpiCard(d.totalFlagged > 0 ? 'danger' : 'safe', ICON.shieldAlert, 'Flagged exchanges', el('div', { class: 'val num', text: fmtNum(d.totalFlagged) }), el('div', { class: 'meta', text: 'safety guard' })),
+        kpiCard('brand', ICON.shield, 'Safety guard', el('div', { class: 'val', text: d.safetyEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'deterministic:v1' })),
+        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'LLM sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' })),
+      ]);
+      view.appendChild(kpis);
+
+      const C = window.SaffevCharts;
+      const catCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Flagged by category' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'safety' })]),
+      ]);
+      if (!d.byCategory || !d.byCategory.length) catCard.appendChild(el('div', { class: 'expnote', html: ICON.check + ' No safety flags in the retained window.' }));
+      else catCard.appendChild(C.hbars({ items: d.byCategory.map((c) => ({ label: safetyLabel(c.name), value: c.count, suffix: ' flag', color: 'var(--danger)' })) }));
+      view.appendChild(catCard);
+
+      const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Recent flagged exchanges' }), el('div', { class: 'spacer' })]),
+      ]);
+      if (!d.recentFlagged || !d.recentFlagged.length) {
+        listCard.appendChild(el('div', { class: 'state sm', style: 'padding:18px', text: 'None flagged yet.' }));
+      } else {
+        const tbl = el('div', { class: 'ttable', style: '--gtc:' + gtcFor(HIST_COLS) }, [reqHead(HIST_COLS), el('div', { class: 'list' })]);
+        const listBody = tbl.querySelector('.list');
+        d.recentFlagged.forEach((it) => listBody.appendChild(reqRow(it, { columns: HIST_COLS })));
+        listCard.appendChild(tbl);
+      }
+      view.appendChild(listCard);
+    },
+    teardown() {},
+  };
+
+  const ROUTES = { live: Live, history: History, privacy: Privacy, analytics: Analytics, quality: Quality, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {

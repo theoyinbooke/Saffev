@@ -68,6 +68,25 @@ pub struct HistoryItem {
     /// `null` for a normal HTTP response. A row is "failed" when `error_kind` is
     /// set OR `status >= 400`.
     pub error_kind: Option<String>,
+    /// True when the eval pipeline flagged a safety category on this exchange
+    /// (for the row's safety badge). Async — set on stored rows; live rows get it
+    /// via a `Safety` stream event after evaluation completes.
+    #[serde(default)]
+    pub safety_flagged: bool,
+}
+
+/// One safety finding as shown in the History detail drawer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SafetyView {
+    /// Category flagged (e.g. `self_harm`).
+    pub category: String,
+    /// Banded verdict (e.g. `flagged`).
+    pub verdict: String,
+    /// The guard that produced it (e.g. `deterministic:v1`).
+    pub guard_model: String,
+    /// Optional numeric score (model guards only).
+    pub score: Option<f32>,
 }
 
 /// `GET /api/live` — current snapshot of recent activity + headline KPIs.
@@ -135,12 +154,35 @@ pub struct HistoryDetail {
     pub item: HistoryItem,
     /// PII findings on this exchange.
     pub findings: Vec<PiiFindingView>,
+    /// Safety findings on this exchange (eval pipeline).
+    #[serde(default)]
+    pub safety: Vec<SafetyView>,
     /// Raw prompt, present only when payload storage is on.
     pub prompt: Option<String>,
     /// Raw response, present only when payload storage is on.
     pub response: Option<String>,
     /// True when payload storage was off, so prompt/response are intentionally null.
     pub payloads_disabled: bool,
+}
+
+/// `GET /api/quality` — the eval pipeline's safety/quality summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityReport {
+    /// Whether the eval pipeline is enabled.
+    pub eval_enabled: bool,
+    /// Whether the deterministic safety guard is on.
+    pub safety_enabled: bool,
+    /// Whether the model-backed quality judge is on (Phase 4).
+    pub quality_enabled: bool,
+    /// LLM-judge sampling fraction (0..1).
+    pub sample_rate: f32,
+    /// Distinct exchanges with at least one safety flag.
+    pub total_flagged: u64,
+    /// Safety findings bucketed by category (descending).
+    pub by_category: Vec<NamedCount>,
+    /// Recent flagged exchanges (for the table).
+    pub recent_flagged: Vec<HistoryItem>,
 }
 
 /// One bucket in the Privacy page breakdown.
@@ -263,6 +305,18 @@ pub struct SettingsView {
     /// Masking dry-run: when true (default), record what *would* be masked but
     /// forward traffic unchanged. Only `enabled && !dry_run` redacts requests.
     pub masking_dry_run: bool,
+    /// Eval pipeline master switch (off by default).
+    #[serde(default)]
+    pub eval_enabled: bool,
+    /// Run the deterministic safety guard when eval is on.
+    #[serde(default)]
+    pub eval_safety: bool,
+    /// Run the model-backed quality judge when eval is on (Phase 4).
+    #[serde(default)]
+    pub eval_quality: bool,
+    /// LLM-judge sampling fraction (0..1).
+    #[serde(default)]
+    pub eval_sample_rate: f32,
     /// Fields whose new value was persisted to TOML but is **not** applied to the
     /// running process because it cannot be safely changed at runtime — `mode` and
     /// the ports rebind the listeners / re-adopt the engine. Empty when the last
@@ -294,6 +348,14 @@ pub struct SettingsUpdate {
     /// Toggle masking dry-run. Setting this to `false` turns on real request
     /// redaction — the only traffic-mutating action in v1.
     pub masking_dry_run: Option<bool>,
+    /// Toggle the eval pipeline (safety guard + judge). Async, off hot path.
+    pub eval_enabled: Option<bool>,
+    /// Toggle the deterministic safety guard.
+    pub eval_safety: Option<bool>,
+    /// Toggle the model-backed quality judge (Phase 4).
+    pub eval_quality: Option<bool>,
+    /// Set the LLM-judge sampling fraction (0..1).
+    pub eval_sample_rate: Option<f32>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.
@@ -321,6 +383,16 @@ pub enum StreamEvent {
         id: String,
         /// The finding.
         finding: PiiFindingView,
+    },
+    /// A safety guard flagged a (now-evaluated) exchange. Arrives asynchronously
+    /// after the exchange finished — the Live/History row badges retroactively.
+    Safety {
+        /// Exchange id.
+        id: String,
+        /// Category flagged (e.g. `self_harm`).
+        category: String,
+        /// Banded verdict (e.g. `flagged`).
+        verdict: String,
     },
 }
 

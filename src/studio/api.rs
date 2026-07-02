@@ -63,12 +63,14 @@ fn internal(err: impl std::fmt::Display) -> Response {
 /// Project a store [`HistoryRow`] (+ the distinct PII kinds present) into the
 /// wire [`dto::HistoryItem`].
 fn history_item(row: &HistoryRow, pii_kinds: Vec<PiiKind>) -> dto::HistoryItem {
-    item_from_parts(
+    let mut item = item_from_parts(
         &row.request,
         row.response.as_ref(),
         row.pii_count,
         pii_kinds,
-    )
+    );
+    item.safety_flagged = row.safety_count > 0;
+    item
 }
 
 /// Build a wire [`dto::HistoryItem`] from request (+ optional response) metadata.
@@ -103,6 +105,10 @@ pub(crate) fn item_from_parts(
         pii_kinds,
         status: resp.and_then(|r| r.status),
         error_kind: resp.and_then(|r| r.error_kind.clone()),
+        // Live rows don't know their safety status yet (eval is async); the store
+        // projection (history_item) sets this, and a Safety stream event updates
+        // live rows retroactively.
+        safety_flagged: false,
     }
 }
 
@@ -336,6 +342,21 @@ pub async fn history_detail(
 
     let item = history_item(&row, kinds);
 
+    // Safety findings for this record (eval pipeline), projected to views.
+    let safety: Vec<dto::SafetyView> = state
+        .store
+        .safety_for(&id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| dto::SafetyView {
+            category: s.category,
+            verdict: s.verdict,
+            guard_model: s.guard_model,
+            score: s.score,
+        })
+        .collect();
+
     // Payloads are present only when payload storage is on (load live snapshot).
     let payloads_disabled = !state.config.load().payload_storage;
     let (prompt, response) = if payloads_disabled {
@@ -350,6 +371,7 @@ pub async fn history_detail(
     Ok(Json(dto::HistoryDetail {
         item,
         findings,
+        safety,
         prompt,
         response,
         payloads_disabled,
@@ -429,6 +451,58 @@ pub async fn privacy(
         // the Privacy page can say "observing" vs "redacting".
         masking_enabled: masking.enabled,
         masking_dry_run: masking.dry_run,
+    }))
+}
+
+/// `GET /api/quality` — the eval pipeline's safety/quality summary.
+pub async fn quality(
+    State(state): State<StudioState>,
+) -> Result<Json<dto::QualityReport>, Response> {
+    let cfg = state.config.load();
+    let safety = state.store.safety_findings().await.map_err(internal)?;
+
+    let mut by_cat: BTreeMap<String, u64> = BTreeMap::new();
+    let mut flagged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &safety {
+        *by_cat.entry(f.category.clone()).or_insert(0) += 1;
+        flagged.insert(f.record_id.clone());
+    }
+    let by_category = named_counts_sorted(by_cat);
+    let total_flagged = flagged.len() as u64;
+
+    // Recent flagged exchanges for the table (join safety back to history rows).
+    let rows = state
+        .store
+        .history(HistoryQuery {
+            limit: Some(MAX_HISTORY_LIMIT),
+            ..Default::default()
+        })
+        .await
+        .map_err(internal)?;
+    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    let recent_flagged: Vec<dto::HistoryItem> = rows
+        .iter()
+        .filter(|r| r.safety_count > 0)
+        .take(50)
+        .map(|r| {
+            history_item(
+                r,
+                kinds
+                    .get(r.request.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    Ok(Json(dto::QualityReport {
+        eval_enabled: cfg.eval.enabled,
+        safety_enabled: cfg.eval.safety,
+        quality_enabled: cfg.eval.quality,
+        sample_rate: cfg.eval.sample_rate,
+        total_flagged,
+        by_category,
+        recent_flagged,
     }))
 }
 
@@ -1400,6 +1474,29 @@ pub async fn settings_put(
         });
     }
 
+    // Eval pipeline toggles — all hot-reloadable (the worker reads config live).
+    if let Some(v) = body.eval_enabled {
+        persisted.eval.enabled = v;
+        live.eval.enabled = v;
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "eval_enabled".to_string(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = body.eval_safety {
+        persisted.eval.safety = v;
+        live.eval.safety = v;
+    }
+    if let Some(v) = body.eval_quality {
+        persisted.eval.quality = v;
+        live.eval.quality = v;
+    }
+    if let Some(v) = body.eval_sample_rate {
+        let v = v.clamp(0.0, 1.0);
+        persisted.eval.sample_rate = v;
+        live.eval.sample_rate = v;
+    }
+
     // Persist the full config (write-through to TOML). The token is never touched.
     persisted.save().map_err(internal)?;
 
@@ -1478,6 +1575,10 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         studio_port: cfg.ports.studio,
         masking_enabled: cfg.masking.enabled,
         masking_dry_run: cfg.masking.dry_run,
+        eval_enabled: cfg.eval.enabled,
+        eval_safety: cfg.eval.safety,
+        eval_quality: cfg.eval.quality,
+        eval_sample_rate: cfg.eval.sample_rate,
         restart_required: Vec::new(),
         restart_note: None,
     }
@@ -1649,6 +1750,7 @@ mod tests {
             request: sample_request("r1", 1000),
             response: Some(sample_response("r1")),
             pii_count: 2,
+            safety_count: 0,
         };
         let item = history_item(&row, vec![PiiKind::Email]);
         assert_eq!(item.id, "r1");
@@ -1670,6 +1772,7 @@ mod tests {
             request: sample_request("r2", 2000),
             response: None,
             pii_count: 0,
+            safety_count: 0,
         };
         let item = history_item(&row, Vec::new());
         assert_eq!(item.output_tokens, None);

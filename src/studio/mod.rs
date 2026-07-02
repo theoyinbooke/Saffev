@@ -95,6 +95,7 @@ impl StudioServer {
             .route("/history", get(api::history))
             .route("/history/:id", get(api::history_detail))
             .route("/privacy", get(api::privacy))
+            .route("/quality", get(api::quality))
             .route("/analytics", get(api::analytics))
             .route("/engines", get(api::engines))
             .route("/engines/adopt", post(api::engines_adopt))
