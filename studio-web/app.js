@@ -6,7 +6,7 @@
 
    Wire contract (see src/studio/dto.rs):
      GET  /api/health   -> { app, version, proxyUp, mode }
-     GET  /api/live     -> { recent:[HistoryItem], requestsToday, p50LatencyMs, piiFindingsToday }
+     GET  /api/live     -> { recent:[HistoryItem], requestsToday, p50LatencyMs, piiFindingsToday, lifetimeRequests }
      GET  /api/history  ?q&piiOnly&limit&beforeTs -> [HistoryItem]
      GET  /api/history/:id -> { item, findings:[PiiFindingView], prompt, response, payloadsDisabled }
      GET  /api/privacy  -> { byKind, byApp, byModel, total, maskingEnabled }
@@ -676,9 +676,13 @@
     kpis: { requestsToday: 0, p50: null, pii: 0 },
     masking: { enabled: false, dryRun: true },  // synced from /api/settings
     _lastRecent: [],      // last recent window (for re-rendering the privacy lens)
+    proxyPort: 8088,      // proxy port (from /api/settings) for onboarding copy blocks
+    _needOnboard: false,  // true until the first request is ever captured
 
     async render(view) {
       view.innerHTML = '';
+      // Onboarding slot — filled when no traffic has ever been captured.
+      view.appendChild(el('div', { id: 'onboard' }));
       // KPI section
       const kpis = el('section', { class: 'grid kpis' }, [
         kpiCard('brand', ICON.pulse, 'Requests today', el('div', { class: 'val num', id: 'kpiReq', text: '—' }), el('div', { class: 'meta', id: 'kpiReqMeta', text: 'since midnight' })),
@@ -751,6 +755,10 @@
         }
         // privacy lens from recent
         this.renderPrivacyLens(snap.recent || []);
+        // Onboarding: show the "point an app at the proxy" card until the very
+        // first request is ever captured (lifetime total, not the 24h window).
+        this._needOnboard = (snap.lifetimeRequests || 0) === 0;
+        this.renderOnboard(this._needOnboard);
       } catch (e) { handleApiError(e); }
 
       // engine + exposure (best-effort, independent of /live)
@@ -766,7 +774,34 @@
         const s = await api('/settings');
         this.masking = { enabled: !!s.maskingEnabled, dryRun: !!s.maskingDryRun };
         this.renderMaskingBar();
+        // Pick up the real proxy port so onboarding copy-blocks are accurate.
+        this.proxyPort = s.proxyPort || this.proxyPort;
+        if (this._needOnboard) this.renderOnboard(true);
       } catch (e) { /* leave the bar at its last-known state */ }
+    },
+
+    // Render (or clear) the "no traffic yet" onboarding card. Shows the easiest
+    // path (`saffev run`) plus manual base-URL routing for both Ollama and LM
+    // Studio, using the live proxy port. Cleared the moment traffic arrives.
+    renderOnboard(show) {
+      const host = $('#onboard');
+      if (!host) return;
+      host.innerHTML = '';
+      if (!show) return;
+      const proxyUrl = 'http://localhost:' + this.proxyPort;
+      host.appendChild(el('div', { class: 'card reveal' }, [
+        el('div', { class: 'hrow' }, [
+          el('h3', { text: 'No traffic captured yet' }),
+          el('div', { class: 'spacer' }),
+          el('span', { class: 'tag', text: 'setup' }),
+        ]),
+        el('p', { class: 'about-p', text: 'Saffev only sees traffic that flows through its proxy (' + proxyUrl + '). The easiest way to route any app — Ollama or LM Studio — with no config edits:' }),
+        copyBlock('saffev run -- <your app>', { title: 'terminal · traces any app' }),
+        el('p', { class: 'about-p', text: 'Or point the app’s base URL at the proxy yourself:' }),
+        copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env · Ollama' }),
+        copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env · LM Studio / OpenAI-compatible' }),
+        el('div', { class: 'meta', html: 'Then run a prompt — it appears here live. <a href="#/about">More ways to integrate →</a>' }),
+      ]));
     },
 
     renderPrivacyLens(recent) {
@@ -957,6 +992,8 @@
       const ph = stream.querySelector('.state'); if (ph) ph.remove();
 
       if (msg.type === 'requestStarted') {
+        // Traffic has arrived — retire the onboarding card for good.
+        if (this._needOnboard) { this._needOnboard = false; this.renderOnboard(false); }
         const it = msg.item;
         const row = reqRow(it, { columns: LIVE_COLS, streaming: it.stream, enter: true });
         this.seen[it.id] = row;
@@ -1647,10 +1684,12 @@
     pointApp(proxyUrl) {
       return el('div', { class: 'card reveal', style: 'animation-delay:.15s' }, [
         aboutSection(ICON.bolt, 'Point an app at Saffev', 'So its traffic shows up here'),
-        el('p', { class: 'about-p', text: 'Set your app’s local-LLM base URL to the Saffev proxy. It forwards to your real Ollama, so nothing else changes. Use an environment variable so it’s easy to revert.' }),
-        copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env  (Ollama-style)' }),
-        el('p', { class: 'about-p', text: 'If your app uses the OpenAI-compatible API instead:' }),
-        copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env  (OpenAI-compatible)' }),
+        el('p', { class: 'about-p', text: 'Easiest — wrap the command and Saffev injects the base-URL env vars for you (works for Ollama and LM Studio):' }),
+        copyBlock('saffev run -- <your app>', { title: 'terminal · traces any app' }),
+        el('p', { class: 'about-p', text: 'Or set your app’s local-LLM base URL to the Saffev proxy yourself. It forwards to your real engine, so nothing else changes. Use an environment variable so it’s easy to revert.' }),
+        copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env  (Ollama)' }),
+        el('p', { class: 'about-p', text: 'If your app uses the OpenAI-compatible API (including LM Studio):' }),
+        copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env  (LM Studio / OpenAI-compatible)' }),
       ]);
     },
 

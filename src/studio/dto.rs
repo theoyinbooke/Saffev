@@ -75,6 +75,9 @@ pub struct LiveSnapshot {
     pub p50_latency_ms: Option<u32>,
     /// PII findings in the last 24h.
     pub pii_findings_today: u64,
+    /// Total requests ever recorded. `0` means no traffic has been captured yet
+    /// (the Studio shows the onboarding / "point an app at the proxy" card).
+    pub lifetime_requests: u64,
 }
 
 /// `GET /api/history` query parameters.

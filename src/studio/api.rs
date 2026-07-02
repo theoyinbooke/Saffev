@@ -63,7 +63,12 @@ fn internal(err: impl std::fmt::Display) -> Response {
 /// Project a store [`HistoryRow`] (+ the distinct PII kinds present) into the
 /// wire [`dto::HistoryItem`].
 fn history_item(row: &HistoryRow, pii_kinds: Vec<PiiKind>) -> dto::HistoryItem {
-    item_from_parts(&row.request, row.response.as_ref(), row.pii_count, pii_kinds)
+    item_from_parts(
+        &row.request,
+        row.response.as_ref(),
+        row.pii_count,
+        pii_kinds,
+    )
 }
 
 /// Build a wire [`dto::HistoryItem`] from request (+ optional response) metadata.
@@ -182,7 +187,15 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
     let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
     let recent: Vec<dto::HistoryItem> = rows
         .iter()
-        .map(|r| history_item(r, kinds.get(r.request.id.as_str()).cloned().unwrap_or_default()))
+        .map(|r| {
+            history_item(
+                r,
+                kinds
+                    .get(r.request.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
 
     // KPIs computed off the privacy/finding + history reads. "Today" is the
@@ -226,11 +239,16 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         .filter(|f| recent_ids.contains(f.record_id.as_str()))
         .count() as u64;
 
+    // Lifetime total — distinguishes "never captured anything" (show onboarding)
+    // from a merely empty recent window.
+    let lifetime_requests = state.store.request_count().await.map_err(internal)?;
+
     Ok(Json(dto::LiveSnapshot {
         recent,
         requests_today,
         p50_latency_ms,
         pii_findings_today,
+        lifetime_requests,
     }))
 }
 
@@ -258,7 +276,15 @@ pub async fn history(
     let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
     let items: Vec<dto::HistoryItem> = rows
         .iter()
-        .map(|r| history_item(r, kinds.get(r.request.id.as_str()).cloned().unwrap_or_default()))
+        .map(|r| {
+            history_item(
+                r,
+                kinds
+                    .get(r.request.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
     Ok(Json(items))
 }
@@ -523,8 +549,7 @@ pub async fn analytics(
         .sum();
     let mut prev_lats: Vec<u32> = prev.iter().filter_map(|r| lat(r)).collect();
     let prev_p50_latency_ms = percentile(&mut prev_lats, 50);
-    let prev_ids: BTreeMap<&str, ()> =
-        prev.iter().map(|r| (r.request.id.as_str(), ())).collect();
+    let prev_ids: BTreeMap<&str, ()> = prev.iter().map(|r| (r.request.id.as_str(), ())).collect();
     let prev_pii_findings = findings
         .iter()
         .filter(|f| prev_ids.contains_key(f.record_id.as_str()))
@@ -538,14 +563,17 @@ pub async fn analytics(
     let mut bkt_out = vec![0u64; n_buckets];
     let mut bkt_pii = vec![0u64; n_buckets];
     let mut bkt_lat: Vec<Vec<u32>> = vec![Vec::new(); n_buckets];
-    let bidx = |ts: i64| -> usize {
-        (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1)
-    };
+    let bidx =
+        |ts: i64| -> usize { (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1) };
     for r in &cur {
         let i = bidx(r.request.ts);
         bkt_req[i] += 1;
         bkt_in[i] += r.request.input_tokens.unwrap_or(0) as u64;
-        bkt_out[i] += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        bkt_out[i] += r
+            .response
+            .as_ref()
+            .and_then(|x| x.output_tokens)
+            .unwrap_or(0) as u64;
         if let Some(l) = lat(r) {
             bkt_lat[i].push(l);
         }
@@ -590,11 +618,19 @@ pub async fn analytics(
     let mut models: BTreeMap<String, MAcc> = BTreeMap::new();
 
     for r in &cur {
-        let app = r.request.source_app.clone().unwrap_or_else(|| "Unknown".into());
+        let app = r
+            .request
+            .source_app
+            .clone()
+            .unwrap_or_else(|| "Unknown".into());
         let a = apps.entry(app).or_default();
         a.requests += 1;
         a.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
-        a.out_tok += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        a.out_tok += r
+            .response
+            .as_ref()
+            .and_then(|x| x.output_tokens)
+            .unwrap_or(0) as u64;
         if let Some(l) = lat(r) {
             a.lat.push(l);
         }
@@ -603,7 +639,11 @@ pub async fn analytics(
         let e = endpoints.entry(ep).or_default();
         e.requests += 1;
         e.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
-        e.out_tok += r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0) as u64;
+        e.out_tok += r
+            .response
+            .as_ref()
+            .and_then(|x| x.output_tokens)
+            .unwrap_or(0) as u64;
         if let Some(l) = lat(r) {
             e.lat.push(l);
         }
@@ -615,7 +655,11 @@ pub async fn analytics(
         let m = models.entry(model).or_default();
         m.requests += 1;
         m.in_tok += r.request.input_tokens.unwrap_or(0) as u64;
-        let out = r.response.as_ref().and_then(|x| x.output_tokens).unwrap_or(0);
+        let out = r
+            .response
+            .as_ref()
+            .and_then(|x| x.output_tokens)
+            .unwrap_or(0);
         m.out_tok += out as u64;
         if let Some(l) = lat(r) {
             m.lat.push(l);
@@ -638,9 +682,7 @@ pub async fn analytics(
     // attribute pii to app/endpoint
     for f in &in_findings {
         if let Some(r) = row_by_id.get(f.record_id.as_str()) {
-            if let Some(a) = apps.get_mut(
-                r.request.source_app.as_deref().unwrap_or("Unknown"),
-            ) {
+            if let Some(a) = apps.get_mut(r.request.source_app.as_deref().unwrap_or("Unknown")) {
                 a.pii += 1;
             }
             if let Some(e) = endpoints.get_mut(r.request.endpoint.as_str()) {
@@ -920,7 +962,9 @@ fn build_insights(
         out.push(dto::Insight {
             severity: "info".into(),
             title: "No traffic yet in this window".into(),
-            detail: "Point an app at the proxy (see About & integrate) and activity will show up here.".into(),
+            detail:
+                "Point an app at the proxy (see About & integrate) and activity will show up here."
+                    .into(),
         });
         return out;
     }
@@ -1174,7 +1218,9 @@ pub async fn update_post(
 /// starts a fresh one. Used right after a successful in-app update so the new
 /// version takes effect without the user opening a terminal. The SPA polls
 /// `/api/health` afterwards and reloads once the new daemon answers.
-pub async fn restart(State(_state): State<StudioState>) -> Result<Json<dto::RestartResult>, Response> {
+pub async fn restart(
+    State(_state): State<StudioState>,
+) -> Result<Json<dto::RestartResult>, Response> {
     crate::cli::daemon::spawn_restart_helper().map_err(internal)?;
     Ok(Json(dto::RestartResult { restarting: true }))
 }
@@ -1403,8 +1449,11 @@ fn distinct_kinds(findings: &[PiiFindingRecord], record_id: &str) -> Vec<PiiKind
 
 /// One pass over all findings → `record_id` → distinct PII kinds. Lets the
 /// Live/History feeds show PII badges on every row (not only live SSE rows).
-fn kinds_by_record(findings: &[PiiFindingRecord]) -> std::collections::BTreeMap<String, Vec<PiiKind>> {
-    let mut map: std::collections::BTreeMap<String, Vec<PiiKind>> = std::collections::BTreeMap::new();
+fn kinds_by_record(
+    findings: &[PiiFindingRecord],
+) -> std::collections::BTreeMap<String, Vec<PiiKind>> {
+    let mut map: std::collections::BTreeMap<String, Vec<PiiKind>> =
+        std::collections::BTreeMap::new();
     for f in findings {
         let v = map.entry(f.record_id.clone()).or_default();
         if !v.contains(&f.kind) {

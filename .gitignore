@@ -23,3 +23,7 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# Local AI-agent guidance (not for the public repo)
+CLAUDE.md
+AGENTS.md
