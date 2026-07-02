@@ -130,7 +130,7 @@ pub(crate) fn finding_view(rec: &PiiFindingRecord) -> dto::PiiFindingView {
 
 /// Project a store [`EngineRecord`] into the wire [`dto::EngineView`], with a
 /// best-effort live `health` string.
-fn engine_view(rec: &EngineRecord, health: &str) -> dto::EngineView {
+fn engine_view(rec: &EngineRecord, health: &str, is_active: bool) -> dto::EngineView {
     dto::EngineView {
         engine: rec.engine.clone(),
         version: rec.version.clone(),
@@ -138,13 +138,19 @@ fn engine_view(rec: &EngineRecord, health: &str) -> dto::EngineView {
         shadow_port: rec.shadow_port,
         adoption_state: rec.adoption_state,
         health: health.to_string(),
+        is_active,
     }
 }
 
-/// Project a freshly-detected [`EngineInfo`] (e.g. the Cooperative upstream that
-/// has no store row yet) into the wire [`dto::EngineView`]. The probed port is
-/// the engine's real port, so it maps to `public_port` with no shadow.
-fn detected_engine_view(info: &crate::engine::EngineInfo, health: &str) -> dto::EngineView {
+/// Project a freshly-detected [`EngineInfo`] (a running engine with no store row
+/// yet — the Cooperative upstream, or a second engine like LM Studio) into the
+/// wire [`dto::EngineView`]. The probed port is the engine's real port, so it
+/// maps to `public_port` with no shadow.
+fn detected_engine_view(
+    info: &crate::engine::EngineInfo,
+    health: &str,
+    is_active: bool,
+) -> dto::EngineView {
     dto::EngineView {
         engine: crate::engine::detect::engine_name(info.engine).to_string(),
         version: info.version.clone(),
@@ -152,6 +158,7 @@ fn detected_engine_view(info: &crate::engine::EngineInfo, health: &str) -> dto::
         shadow_port: None,
         adoption_state: info.adoption_state,
         health: health.to_string(),
+        is_active,
     }
 }
 
@@ -179,6 +186,7 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         .history(HistoryQuery {
             q: None,
             pii_only: false,
+            failed_only: false,
             limit: Some(LIVE_RECENT_LIMIT),
             before_ts: None,
         })
@@ -211,6 +219,7 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         .history(HistoryQuery {
             q: None,
             pii_only: false,
+            failed_only: false,
             limit: Some(MAX_HISTORY_LIMIT),
             before_ts: None,
         })
@@ -269,6 +278,7 @@ pub async fn history(
         .history(HistoryQuery {
             q: params.q.clone(),
             pii_only: params.pii_only,
+            failed_only: params.failed_only,
             limit: Some(limit),
             before_ts: params.before_ts,
         })
@@ -303,6 +313,7 @@ pub async fn history_detail(
         .history(HistoryQuery {
             q: None,
             pii_only: false,
+            failed_only: false,
             limit: Some(MAX_HISTORY_LIMIT),
             before_ts: None,
         })
@@ -378,6 +389,7 @@ pub async fn privacy(
         .history(HistoryQuery {
             q: None,
             pii_only: false,
+            failed_only: false,
             limit: Some(MAX_HISTORY_LIMIT),
             before_ts: None,
         })
@@ -407,14 +419,16 @@ pub async fn privacy(
     let by_app = named_counts_sorted(app_counts);
     let by_model = named_counts_sorted(model_counts);
 
+    let masking = &state.config.load().masking;
     Ok(Json(dto::PrivacySummary {
         by_kind,
         by_app,
         by_model,
         total: findings.len() as u64,
-        // Reflect the opt-in masking switch (§7.6). The Privacy page badges
-        // dry-run vs live via the Settings view; here we just expose enablement.
-        masking_enabled: state.config.load().masking.enabled,
+        // Reflect the opt-in masking switch (§7.6) AND whether it's dry-run, so
+        // the Privacy page can say "observing" vs "redacting".
+        masking_enabled: masking.enabled,
+        masking_dry_run: masking.dry_run,
     }))
 }
 
@@ -465,6 +479,7 @@ pub async fn analytics(
             .history(HistoryQuery {
                 q: None,
                 pii_only: false,
+                failed_only: false,
                 limit: Some(1000),
                 before_ts: cursor,
             })
@@ -566,6 +581,14 @@ pub async fn analytics(
         .iter()
         .filter(|f| prev_ids.contains_key(f.record_id.as_str()))
         .count() as u64;
+    let prev_failed_requests = prev
+        .iter()
+        .filter(|r| {
+            r.response.as_ref().is_some_and(|resp| {
+                resp.error_kind.is_some() || resp.status.is_some_and(|s| s >= 400)
+            })
+        })
+        .count() as u64;
 
     // ---- time series ----
     let bucket_ms = analytics_bucket_ms(range_ms);
@@ -574,6 +597,7 @@ pub async fn analytics(
     let mut bkt_in = vec![0u64; n_buckets];
     let mut bkt_out = vec![0u64; n_buckets];
     let mut bkt_pii = vec![0u64; n_buckets];
+    let mut bkt_failed = vec![0u64; n_buckets];
     let mut bkt_lat: Vec<Vec<u32>> = vec![Vec::new(); n_buckets];
     let bidx =
         |ts: i64| -> usize { (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1) };
@@ -586,6 +610,12 @@ pub async fn analytics(
             .as_ref()
             .and_then(|x| x.output_tokens)
             .unwrap_or(0) as u64;
+        if r.response
+            .as_ref()
+            .is_some_and(|resp| resp.error_kind.is_some() || resp.status.is_some_and(|s| s >= 400))
+        {
+            bkt_failed[i] += 1;
+        }
         if let Some(l) = lat(r) {
             bkt_lat[i].push(l);
         }
@@ -603,6 +633,7 @@ pub async fn analytics(
             output_tokens: bkt_out[i],
             p50_latency_ms: percentile(&mut bkt_lat[i], 50),
             pii: bkt_pii[i],
+            failed: bkt_failed[i],
         })
         .collect();
 
@@ -821,7 +852,14 @@ pub async fn analytics(
                 pii_resp += 1;
             }
         }
-        *action_map.entry(format!("{:?}", f.action)).or_insert(0) += 1;
+        // Use the wire (snake_case) name so the frontend has one canonical form
+        // for a finding's action everywhere (drawer + analytics).
+        let action_name = match f.action {
+            crate::store::PiiAction::Observed => "observed",
+            crate::store::PiiAction::WouldMask => "would_mask",
+            crate::store::PiiAction::Masked => "masked",
+        };
+        *action_map.entry(action_name.to_string()).or_insert(0) += 1;
         if let Some(r) = row_by_id.get(f.record_id.as_str()) {
             if let Some(app) = r.request.source_app.as_ref() {
                 *pii_app_map.entry(app.clone()).or_insert(0) += 1;
@@ -872,6 +910,7 @@ pub async fn analytics(
         prev_total_tokens,
         prev_p50_latency_ms,
         prev_pii_findings,
+        prev_failed_requests,
         series,
         by_app,
         by_model,
@@ -1059,9 +1098,18 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
     let cfg = state.config.load();
     let records = state.store.engines().await.map_err(internal)?;
 
+    // The port the proxy actually forwards to right now: the shadow port in
+    // Gateway mode, else the configured upstream. The engine on this port is the
+    // "active" one; other running engines are shown but marked inactive.
+    let active_port = match cfg.mode {
+        crate::config::Mode::Gateway => cfg.ports.shadow,
+        crate::config::Mode::Cooperative => cfg.ports.upstream,
+    };
+
     // Health is best-effort: probe each engine's effective port (shadow if
     // adopted, else public). Down on any probe failure — never fail the call.
-    let mut views = Vec::with_capacity(records.len());
+    let mut views = Vec::with_capacity(records.len() + 2);
+    let mut covered_ports: Vec<u16> = Vec::new();
     for rec in &records {
         let port = rec.shadow_port.unwrap_or(rec.public_port);
         let health = if probe_loopback(port).await {
@@ -1069,26 +1117,31 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
         } else {
             "down"
         };
-        views.push(engine_view(rec, health));
+        let is_active = port == active_port || rec.public_port == active_port;
+        views.push(engine_view(rec, health, is_active));
+        covered_ports.push(rec.public_port);
+        if let Some(sp) = rec.shadow_port {
+            covered_ports.push(sp);
+        }
     }
 
-    // Cooperative mode never adopts the engine, so it has no `engines` row of
-    // its own and the panel would otherwise read "No engine detected". Probe
-    // the configured upstream the proxy forwards to and surface that engine
-    // here, unless a store record already covers the same port. Fail-soft: a
-    // silent upstream just adds nothing.
-    let upstream = cfg.ports.upstream;
-    let already_known = records
-        .iter()
-        .any(|r| r.shadow_port.unwrap_or(r.public_port) == upstream || r.public_port == upstream);
-    if !already_known {
-        if let Ok(Some(info)) = crate::engine::detect::probe_upstream(upstream).await {
+    // Surface EVERY running local engine (Ollama on :11434, LM Studio on :1234,
+    // …), not just the configured upstream — so a second engine shows its own
+    // card. Skip ports already covered by a store record. The one on `active_port`
+    // is badged active; the rest are "detected · not proxied". Fail-soft: a silent
+    // port simply adds nothing.
+    if let Ok(detected) = crate::engine::detect::detect_all().await {
+        for info in &detected {
+            if covered_ports.contains(&info.port) {
+                continue;
+            }
             let health = if probe_loopback(info.port).await {
                 "healthy"
             } else {
                 "down"
             };
-            views.push(detected_engine_view(&info, health));
+            views.push(detected_engine_view(info, health, info.port == active_port));
+            covered_ports.push(info.port);
         }
     }
 
@@ -1446,7 +1499,13 @@ async fn current_engine_view(
     } else {
         "down"
     };
-    Ok(engine_view(&rec, health))
+    let cfg = state.config.load();
+    let active_port = match cfg.mode {
+        crate::config::Mode::Gateway => cfg.ports.shadow,
+        crate::config::Mode::Cooperative => cfg.ports.upstream,
+    };
+    let is_active = port == active_port || rec.public_port == active_port;
+    Ok(engine_view(&rec, health, is_active))
 }
 
 /// Distinct PII kinds present on a given record id, for the history badge.
@@ -1715,13 +1774,14 @@ mod tests {
             how_it_starts: StartMode::Launchd,
             adoption_state: AdoptionState::Cooperative,
         };
-        let view = detected_engine_view(&info, "healthy");
+        let view = detected_engine_view(&info, "healthy", true);
         assert_eq!(view.engine, "ollama");
         assert_eq!(view.public_port, 11434, "must surface the upstream port");
         assert_eq!(view.shadow_port, None);
         assert_eq!(view.adoption_state, AdoptionState::Cooperative);
         assert_eq!(view.version.as_deref(), Some("0.5.0"));
         assert_eq!(view.health, "healthy");
+        assert!(view.is_active, "the upstream engine is the active one");
     }
 
     #[test]

@@ -96,6 +96,9 @@ pub struct HistoryParams {
     /// Only exchanges with PII findings.
     #[serde(default)]
     pub pii_only: bool,
+    /// Only failed exchanges (transport error / HTTP >= 400).
+    #[serde(default)]
+    pub failed_only: bool,
     /// Page size (server clamps).
     pub limit: Option<u32>,
     /// Cursor: rows with `ts` strictly before this (millis).
@@ -168,6 +171,9 @@ pub struct PrivacySummary {
     pub total: u64,
     /// Whether opt-in masking is currently enabled (§7.6; false in v0).
     pub masking_enabled: bool,
+    /// When masking is enabled, whether it is dry-run (observe only, nothing
+    /// redacted) vs live (redacting). Lets the UI say "observing" vs "redacting".
+    pub masking_dry_run: bool,
 }
 
 /// A `(name, count)` pair for breakdown lists.
@@ -196,6 +202,9 @@ pub struct EngineView {
     pub adoption_state: AdoptionState,
     /// Live health string (`healthy` / `starting` / `down`).
     pub health: String,
+    /// True when this is the engine the proxy currently forwards to (the active
+    /// upstream). Other detected engines are shown but marked inactive.
+    pub is_active: bool,
 }
 
 /// `GET /api/engines` — engines + the exposure result.
@@ -406,6 +415,7 @@ pub struct AnalyticsReport {
     pub prev_total_tokens: u64,
     pub prev_p50_latency_ms: Option<u32>,
     pub prev_pii_findings: u64,
+    pub prev_failed_requests: u64,
 
     // ---- time series (one entry per bucket, ascending) ----
     pub series: Vec<AnalyticsBucket>,
@@ -448,6 +458,8 @@ pub struct AnalyticsBucket {
     pub output_tokens: u64,
     pub p50_latency_ms: Option<u32>,
     pub pii: u64,
+    /// Failed exchanges (transport error / HTTP >= 400) in this bucket.
+    pub failed: u64,
 }
 
 /// Aggregate stats for a named group (app or endpoint).
