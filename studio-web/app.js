@@ -1,5 +1,5 @@
 /* ============================================================================
-   Saffev Studio SPA — app.js
+   Saffev Studio SPA · app.js
    Static, no-build. Talks to the Studio HTTP API (camelCase JSON) and the
    SSE feed at GET /api/stream. All colours/spacing come from tokens.css; this
    file only structures data + behaviour.
@@ -16,7 +16,7 @@
      GET  /api/exposure -> ExposureReport
      GET  /api/settings -> SettingsView
      PUT  /api/settings { mode?, payloadStorage?, retention?, handover?, maskingEnabled?, maskingDryRun? } -> SettingsView
-     GET  /api/update   -> { currentVersion, latestVersion, updateAvailable }  (GitHub release metadata only — nothing about the user leaves the device)
+     GET  /api/update   -> { currentVersion, latestVersion, updateAvailable }  (GitHub release metadata only · nothing about the user leaves the device)
      POST /api/update   -> { updated, newVersion, message }
      GET  /api/stream   SSE of StreamEvent (tagged by `type`)
 
@@ -27,7 +27,7 @@
   'use strict';
 
   /* -------------------------------------------------------------------------
-     Brand — single source of truth (mirrors design/brand.json).
+     Brand · single source of truth (mirrors design/brand.json).
      ------------------------------------------------------------------------- */
   const BRAND = { wordmark: 'Saffev', tagline: 'local ai studio', command: 'saffev' };
 
@@ -114,7 +114,7 @@
   }
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const fmtNum = (n) => (n == null ? '—' : Number(n).toLocaleString());
+  const fmtNum = (n) => (n == null ? '·' : Number(n).toLocaleString());
   function initials(name) {
     if (!name) return '?';
     const parts = String(name).trim().split(/[\s._-]+/).filter(Boolean);
@@ -239,9 +239,9 @@
      On load we GET /api/update; if a newer release exists we show a compact card
      in the sidebar foot: "Update available · vX → vY  [Update & restart]". One
      click installs it (POST /api/update), then relaunches the daemon
-     (POST /api/restart) and reloads the Studio once it's back — no terminal.
+     (POST /api/restart) and reloads the Studio once it's back · no terminal.
 
-     PRIVACY: GET /api/update contacts GitHub release metadata only — nothing
+     PRIVACY: GET /api/update contacts GitHub release metadata only · nothing
      about the user leaves the device. Fail-soft: any error leaves the slot hidden.
      ------------------------------------------------------------------------- */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -251,7 +251,7 @@
     if (!foot) return;
     let st;
     try { st = await api('/update'); } // { currentVersion, latestVersion, updateAvailable }
-    catch (e) { return; } // optional — never surface as an error
+    catch (e) { return; } // optional · never surface as an error
     if (!st || !st.updateAvailable || !st.latestVersion) { foot.hidden = true; return; }
     renderFootUpdate(foot, st);
   }
@@ -291,13 +291,13 @@
       return;
     }
     if (!res || !res.updated) {
-      // Already current, or a dev build with no install receipt — show guidance.
+      // Already current, or a dev build with no install receipt · show guidance.
       footMsg(foot, ICON.shield, 'Update', (res && res.message) || 'Already on the latest version.');
       return;
     }
-    // Installed — relaunch the daemon and reload the Studio once it's back.
+    // Installed · relaunch the daemon and reload the Studio once it's back.
     footMsg(foot, ICON.restart, 'Restarting Saffev', 'Installed v' + res.newVersion + '. Relaunching…');
-    try { await api('/restart', { method: 'POST' }); } catch (e) { /* server may drop mid-call — expected */ }
+    try { await api('/restart', { method: 'POST' }); } catch (e) { /* server may drop mid-call · expected */ }
     await waitForRestartThenReload(foot);
   }
 
@@ -309,17 +309,17 @@
       try {
         const r = await fetch('/api/health', { headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}, cache: 'no-store' });
         if (r.ok) { location.reload(); return; }
-      } catch (e) { /* still down — keep polling */ }
+      } catch (e) { /* still down · keep polling */ }
       await sleep(1000);
     }
-    footMsg(foot, ICON.check, 'Update installed', 'Saffev was relaunched — reload this page to continue.');
+    footMsg(foot, ICON.check, 'Update installed', 'Saffev was relaunched · reload this page to continue.');
   }
 
   function handleApiError(e) {
     if (e && e.status === 401) {
-      showBanner('Not authorized — the Studio token is missing or invalid. Run `' + BRAND.command + ' status` for the local URL with a token, or open Settings.', 'danger');
+      showBanner('Not authorized · the Studio token is missing or invalid. Run `' + BRAND.command + ' status` for the local URL with a token, or open Settings.', 'danger');
     } else if (e && e.status === 403) {
-      showBanner('Blocked by Host allowlist — open the Studio at its loopback address (e.g. 127.0.0.1).', 'danger');
+      showBanner('Blocked by Host allowlist · open the Studio at its loopback address (e.g. 127.0.0.1).', 'danger');
     } else {
       showBanner('Cannot reach the Studio backend: ' + (e && e.message ? e.message : 'unknown error') + '.', 'danger');
     }
@@ -379,8 +379,8 @@
       if (item.safetyFlagged) cell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
       return cell;
     }
-    if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '—' });
-    if (key === 'endpoint') return el('div', { class: 'tcell cell-endpoint', title: item.endpoint || '', text: item.endpoint || '—' });
+    if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '·' });
+    if (key === 'endpoint') return el('div', { class: 'tcell cell-endpoint', title: item.endpoint || '', text: item.endpoint || '·' });
     if (key === 'status') {
       // Failed → the reason (red); otherwise the HTTP status (muted), or blank.
       if (isFailed(item)) {
@@ -393,7 +393,7 @@
     if (key === 'tokens') {
       const up = item.inputTokens != null ? (item.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.inputTokens) + '↑' : '';
       const down = item.outputTokens != null ? (item.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.outputTokens) + '↓' : '';
-      return el('div', { class: 'tcell r cell-tokens', text: [up, down].filter(Boolean).join('  ') || '—' });
+      return el('div', { class: 'tcell r cell-tokens', text: [up, down].filter(Boolean).join('  ') || '·' });
     }
     if (key === 'time') return el('div', { class: 'tcell r cell-time', title: item.ts ? new Date(item.ts).toLocaleString() : '', text: item.ts ? fmtStamp(item.ts) : '' });
     return el('div', { class: 'tcell' });
@@ -447,14 +447,14 @@
     kv('App', it.sourceApp || 'Unknown');
     kv('Confidence', it.sourceConfidence);
     kv('Engine', it.engine);
-    kv('Model', it.model || '—');
+    kv('Model', it.model || '·');
     kv('Endpoint', it.endpoint);
     kv('Streamed', it.stream ? 'yes' : 'no');
-    kv('Input tokens', it.inputTokens != null ? (it.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.inputTokens) : '—');
-    kv('Output tokens', it.outputTokens != null ? (it.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.outputTokens) : '—');
-    kv('Latency', it.latencyMs != null ? it.latencyMs + 'ms' : '—');
-    kv('TTFT', it.ttftMs != null ? it.ttftMs + 'ms' : '—');
-    kv('Status', it.status != null ? String(it.status) : (it.errorKind ? 'no response' : '—'));
+    kv('Input tokens', it.inputTokens != null ? (it.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.inputTokens) : '·');
+    kv('Output tokens', it.outputTokens != null ? (it.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.outputTokens) : '·');
+    kv('Latency', it.latencyMs != null ? it.latencyMs + 'ms' : '·');
+    kv('TTFT', it.ttftMs != null ? it.ttftMs + 'ms' : '·');
+    kv('Status', it.status != null ? String(it.status) : (it.errorKind ? 'no response' : '·'));
     if (isFailed(it)) kv('Outcome', failLabel(it));
     kv('Time', new Date(it.ts).toLocaleString());
 
@@ -470,7 +470,7 @@
       // Header reflects what actually happened to this exchange's findings.
       const anyMasked = detail.findings.some((f) => f.action === 'masked');
       const anyWould = detail.findings.some((f) => f.action === 'would_mask');
-      const hdr = anyMasked ? 'PII findings (some redacted)' : anyWould ? 'PII findings (dry-run — would redact)' : 'PII findings (observe-only)';
+      const hdr = anyMasked ? 'PII findings (some redacted)' : anyWould ? 'PII findings (dry-run · would redact)' : 'PII findings (observe-only)';
       const fl = el('div', { class: 'payblk' }, [el('h4', { text: hdr })]);
       const list = el('div', { class: 'findlist' });
       detail.findings.forEach((f) => {
@@ -518,7 +518,7 @@
     if (detail.payloadsDisabled) {
       body.appendChild(el('div', { class: 'payblk' }, [
         el('h4', { text: 'Payloads' }),
-        el('div', { class: 'expnote', html: ICON.shield + ' Metadata-only — raw prompt &amp; response are not stored (payload storage off).' }),
+        el('div', { class: 'expnote', html: ICON.shield + ' Metadata-only · raw prompt &amp; response are not stored (payload storage off).' }),
       ]));
     } else {
       if (detail.prompt != null) {
@@ -551,7 +551,7 @@
   }
 
   /* -------------------------------------------------------------------------
-     Dropdown — design-system replacement for the native <select>. Follows the
+     Dropdown · design-system replacement for the native <select>. Follows the
      ARIA listbox keyboard pattern (Enter/Space/↑/↓/Home/End/Esc), closes on
      outside-click, one open at a time, fully token-themed. Used everywhere a
      native select used to be (History page size, Settings mode/handover/retention).
@@ -572,7 +572,7 @@
     opts = opts || {};
     const id = 'dd' + (++_ddSeq);
     const root = el('div', { class: 'dropdown' + (opts.block ? ' block' : '') });
-    const cur = () => items.find((it) => String(it.value) === String(value)) || items[0] || { label: '—' };
+    const cur = () => items.find((it) => String(it.value) === String(value)) || items[0] || { label: '·' };
     const labelSpan = el('span', { class: 'dd-label', text: cur().label });
     const trigger = el('button', {
       class: 'dd-trigger', type: 'button',
@@ -682,7 +682,7 @@
   }
 
   /* -------------------------------------------------------------------------
-     confirmModal — design-system confirmation dialog. Replaces the native
+     confirmModal · design-system confirmation dialog. Replaces the native
      window.confirm() everywhere so every prompt matches the Studio's look and
      theme (no browser chrome). Returns a Promise<boolean>.
 
@@ -743,7 +743,7 @@
      ========================================================================= */
   const Live = {
     title: 'Live',
-    sub: 'What your apps are doing with local models — right now.',
+    sub: 'What your apps are doing with local models · right now.',
     stream: null,         // legacy handle (unused; fetch-reader drives the feed)
     _streamCtrl: null,    // AbortController for the in-flight stream fetch
     _streamTimer: null,   // reconnect backoff timer
@@ -758,20 +758,26 @@
 
     async render(view) {
       view.innerHTML = '';
-      // Onboarding slot — filled when no traffic has ever been captured.
+      // Onboarding slot · filled when no traffic has ever been captured.
       view.appendChild(el('div', { id: 'onboard' }));
-      // KPI section
-      const kpis = el('section', { class: 'grid kpis' }, [
-        kpiCard('brand', ICON.pulse, 'Requests today', el('div', { class: 'val num', id: 'kpiReq', text: '—' }), el('div', { class: 'meta', id: 'kpiReqMeta', text: 'since midnight' })),
-        kpiCard('gold', ICON.clock, 'Latency p50', el('div', { class: 'val num', id: 'kpiLat', html: '—' }), el('div', { class: 'meta mono', id: 'kpiLatMeta', text: 'recent window' })),
-        kpiCard('danger', ICON.shieldAlert, 'PII findings', el('div', { class: 'val num', id: 'kpiPii', text: '—' }), el('div', { class: 'meta', id: 'kpiPiiMeta', text: 'observe-only · today' })),
-        exposureHeroPlaceholder(),
-      ]);
-      kpis.className = 'grid kpis reveal';
-      view.appendChild(kpis);
 
-      // body: stream + side panels
-      const streamCard = el('div', { class: 'card reveal', style: 'animation-delay:.3s' }, [
+      // Thin metric strip — a single hairline-separated band of figures, so the
+      // stream (not the KPIs) is the hero. Matches the design's "metric cells".
+      const stat = (id, label, sub, valHtml) => el('div', { class: 'stat' }, [
+        el('div', { class: 'stat-l', text: label }),
+        el('div', { class: 'stat-v num', id, html: valHtml }),
+        el('div', { class: 'stat-s', text: sub }),
+      ]);
+      view.appendChild(el('section', { class: 'statbar reveal' }, [
+        stat('kpiReq', 'Requests', 'since midnight', '·'),
+        stat('kpiLat', 'Latency p50', 'recent window', '·'),
+        stat('kpiPii', 'PII findings', 'observing · today', '·'),
+        stat('kpiPulse', 'Throughput', 'req / min · live', '0'),
+      ]));
+
+      // Cockpit — the traffic stream is the hero (fills the height); a slim rail
+      // carries "now" context: exposure, engine, and the privacy lens.
+      const streamCard = el('div', { class: 'card streamcard reveal', style: 'animation-delay:.06s' }, [
         el('div', { class: 'hrow' }, [
           el('h3', { text: 'Traffic stream' }),
           el('div', { class: 'spacer' }),
@@ -782,23 +788,32 @@
           el('div', { class: 'stream', id: 'stream' }),
         ]),
       ]);
-
-      const side = el('div', { class: 'grid', style: 'align-content:start;gap:16px' }, [
-        el('div', { class: 'card reveal', id: 'livePrivacy', style: 'animation-delay:.36s' }, [
+      const rail = el('div', { class: 'rail reveal', style: 'animation-delay:.12s' }, [
+        exposureHeroPlaceholder(),
+        el('div', { class: 'card engine', id: 'liveEngine' }, [el('div', { class: 'state sm', text: 'Loading engine…' })]),
+        el('div', { class: 'card', id: 'livePrivacy' }, [
           el('div', { class: 'hrow' }, [el('h3', { text: 'Privacy lens' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'observe' })]),
           el('div', { id: 'livePrivacyBody' }, [el('div', { class: 'state sm', text: 'No findings yet.' })]),
         ]),
-        el('div', { class: 'card engine reveal', id: 'liveEngine', style: 'animation-delay:.42s' }, [
-          el('div', { class: 'state sm', text: 'Loading engine…' }),
-        ]),
       ]);
-
-      const body = el('section', { class: 'body livebody' }, [streamCard, side]);
-      view.appendChild(body);
+      view.appendChild(el('section', { class: 'cockpit' }, [streamCard, rail]));
       view.appendChild(cliBlock());
 
       await this.refresh();
       this.connectStream();
+      this.startPulse();
+    },
+
+    startPulse() {
+      this._pulse = this._pulse || [];
+      this.renderPulse();
+      this._pulseTimer = setInterval(() => this.renderPulse(), 1500);
+    },
+    renderPulse() {
+      const now = Date.now();
+      this._pulse = (this._pulse || []).filter((t) => now - t < 60000);
+      const c = $('#kpiPulse');
+      if (c) c.textContent = String(this._pulse.length);
     },
 
     async refresh() {
@@ -810,7 +825,7 @@
         this.kpis.pii = snap.piiFindingsToday;
         setText('#kpiReq', fmtNum(snap.requestsToday));
         const lat = $('#kpiLat');
-        if (lat) lat.innerHTML = snap.p50LatencyMs != null ? esc(snap.p50LatencyMs) + '<small>ms</small>' : '—';
+        if (lat) lat.innerHTML = snap.p50LatencyMs != null ? esc(snap.p50LatencyMs) + '<small>ms</small>' : '·';
         setText('#kpiPii', fmtNum(snap.piiFindingsToday));
         updatePiiBadge(snap.piiFindingsToday);
 
@@ -819,7 +834,7 @@
         if (stream) {
           stream.innerHTML = '';
           this.seen = {};
-          const recent = (snap.recent || []).slice(0, 8);
+          const recent = (snap.recent || []).slice(0, 14);
           if (recent.length === 0) {
             stream.appendChild(el('div', { class: 'state sm', style: 'padding:24px 6px', text: 'Waiting for traffic… run a prompt in any local-LLM app.' }));
           } else {
@@ -845,15 +860,15 @@
         this.renderExposureHero(ev.exposure);
         setEnginePill(ev);
       } catch (e) {
-        // Don't leave the cards stuck on their loading text — show a small
+        // Don't leave the cards stuck on their loading text · show a small
         // error/retry state instead.
         const engBox = $('#liveEngine');
-        if (engBox) { engBox.innerHTML = ''; engBox.appendChild(el('div', { class: 'state sm', text: 'Could not load engine — retrying…' })); }
+        if (engBox) { engBox.innerHTML = ''; engBox.appendChild(el('div', { class: 'state sm', text: 'Could not load engine · retrying…' })); }
         const heroBox = $('#exposureHero');
         if (heroBox) { heroBox.innerHTML = ''; heroBox.appendChild(el('div', { class: 'state sm', text: 'Exposure check unavailable' })); }
       }
 
-      // masking state (best-effort) — keeps the Live toggle in sync with Settings.
+      // masking state (best-effort) · keeps the Live toggle in sync with Settings.
       try {
         const s = await api('/settings');
         this.masking = { enabled: !!s.maskingEnabled, dryRun: !!s.maskingDryRun };
@@ -879,12 +894,12 @@
           el('div', { class: 'spacer' }),
           el('span', { class: 'tag', text: 'setup' }),
         ]),
-        el('p', { class: 'about-p', text: 'Saffev only sees traffic that flows through its proxy (' + proxyUrl + '). The easiest way to route any app — Ollama or LM Studio — with no config edits:' }),
+        el('p', { class: 'about-p', text: 'Saffev only sees traffic that flows through its proxy (' + proxyUrl + '). The easiest way to route any app (Ollama or LM Studio) with no config edits:' }),
         copyBlock('saffev run -- <your app>', { title: 'terminal · traces any app' }),
         el('p', { class: 'about-p', text: 'Or point the app’s base URL at the proxy yourself:' }),
         copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env · Ollama' }),
         copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env · LM Studio / OpenAI-compatible' }),
-        el('div', { class: 'meta', html: 'Then run a prompt — it appears here live. <a href="#/about">More ways to integrate →</a>' }),
+        el('div', { class: 'meta', html: 'Then run a prompt · it appears here live. <a href="#/about">More ways to integrate →</a>' }),
       ]));
     },
 
@@ -909,7 +924,7 @@
           ]));
         });
         const extra = kinds.length - 2;
-        body.appendChild(el('a', { class: 'pii-more', href: '#/privacy', html: '<span>' + (extra > 0 ? '+' + extra + ' more · view full breakdown' : 'View full breakdown') + '</span>' + ICON.chevR }));
+        body.appendChild(el('a', { class: 'pii-more', href: '#/analytics/privacy', html: '<span>' + (extra > 0 ? '+' + extra + ' more · view full breakdown' : 'View full breakdown') + '</span>' + ICON.chevR }));
       }
       body.appendChild(el('div', { class: 'modebar', id: 'liveMaskBar' }));
       this.renderMaskingBar();
@@ -924,8 +939,8 @@
       const on = this.masking.enabled;
       const txt = on
         ? 'Masking is <b>on</b> · ' + (this.masking.dryRun ? 'dry-run (observing)' : 'live (redacting)')
-        : 'Masking is <b>off</b> — observe only';
-      const sw = switchBtn(on, 'Toggle PII masking', { title: on ? 'Masking on — click to turn off' : 'Masking off — click to turn on' });
+        : 'Masking is <b>off</b> · observe only';
+      const sw = switchBtn(on, 'Toggle PII masking', { title: on ? 'Masking on · click to turn off' : 'Masking off · click to turn on' });
       sw.addEventListener('click', () => this.toggleMasking(!on, sw));
       bar.innerHTML = '';
       bar.appendChild(el('div', { class: 't', html: txt }));
@@ -983,7 +998,7 @@
           el('span', { class: 'check', html: exposed ? ICON.alert : ICON.check }),
           document.createTextNode(exposed ? 'Exposed' : 'Localhost only'),
         ]),
-        el('div', { class: 'meta', text: exp.detail || (exposed ? 'Reachable beyond this device' : 'Bound to 127.0.0.1 — not exposed') }),
+        el('div', { class: 'meta', text: exp.detail || (exposed ? 'Reachable beyond this device' : 'Bound to 127.0.0.1 · not exposed') }),
       ]);
       host.replaceWith(card);
       card.id = 'exposureHero';
@@ -1045,7 +1060,7 @@
       } catch (e) {
         if (this._stopStream || (e && e.name === 'AbortError')) return;
       }
-      // Connection ended/failed — reconnect with capped backoff.
+      // Connection ended/failed · reconnect with capped backoff.
       if (this._stopStream) return;
       this.setLiveTag('reconnecting');
       this._streamRetry = Math.min(this._streamRetry + 1, 6);
@@ -1079,13 +1094,15 @@
       const ph = stream.querySelector('.state'); if (ph) ph.remove();
 
       if (msg.type === 'requestStarted') {
-        // Traffic has arrived — retire the onboarding card for good.
+        // Traffic has arrived · retire the onboarding card for good.
         if (this._needOnboard) { this._needOnboard = false; this.renderOnboard(false); }
+        // Feed the throughput pulse (req/min over a rolling 60s window).
+        this._pulse = this._pulse || []; this._pulse.push(Date.now()); this.renderPulse();
         const it = msg.item;
         const row = reqRow(it, { columns: LIVE_COLS, streaming: it.stream, enter: true });
         this.seen[it.id] = row;
         stream.prepend(row);
-        while (stream.children.length > 8) {
+        while (stream.children.length > 14) {
           const last = stream.lastElementChild;
           if (last && last.dataset.id) delete this.seen[last.dataset.id];
           last.remove();
@@ -1107,7 +1124,7 @@
         // the live finding event just advances the KPI + privacy lens.
         this.bumpPii();
       } else if (msg.type === 'safety') {
-        // Eval runs asynchronously after the exchange finished — badge the row
+        // Eval runs asynchronously after the exchange finished · badge the row
         // retroactively if it's still on screen.
         const row = this.seen[msg.id];
         if (row) {
@@ -1130,7 +1147,7 @@
       updatePiiBadge(this.kpis.pii);
     },
 
-    teardown() { this.disconnectStream(); },
+    teardown() { this.disconnectStream(); if (this._pulseTimer) { clearInterval(this._pulseTimer); this._pulseTimer = null; } },
   };
 
   function exposureHeroPlaceholder() {
@@ -1161,7 +1178,7 @@
     return el('div', { class: 'cli reveal', style: 'animation-delay:.48s' }, [
       el('div', { class: 'bar' }, [
         el('div', { class: 'tl', html: '<i></i><i></i><i></i>' }),
-        el('div', { class: 'ti', text: BRAND.command + ' — zsh — the CLI speaks the same language' }),
+        el('div', { class: 'ti', text: BRAND.command + ' · zsh · the CLI speaks the same language' }),
       ]),
       el('pre', { html: pre }),
     ]);
@@ -1177,7 +1194,7 @@
      `pageIndex`; going forward past the last fetched page fetches the next one. */
   const History = {
     title: 'History',
-    sub: 'Every proxied exchange — searchable, filterable, on-device.',
+    sub: 'Every proxied exchange · searchable, filterable, on-device.',
     q: '', piiOnly: false, failedOnly: false, pageSize: 25,
     pages: [],        // fetched pages: array of arrays of HistoryItem (each non-empty)
     pageIndex: 0,     // which fetched page is currently shown (0-based)
@@ -1185,28 +1202,38 @@
     loading: false,
 
     async render(view) {
-      this.q = ''; this.piiOnly = false; this.failedOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
+      this.q = ''; this.scope = 'all'; this.piiOnly = false; this.failedOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
       view.innerHTML = '';
 
-      // toolbar: search + PII-only + rows-per-page drop-down
-      const search = el('input', { class: 'input', type: 'search', placeholder: 'Search app, model, or endpoint…', value: this.q });
+      // Forensic filter bar: a prominent search field + a segmented scope facet
+      // (All / With PII / Failed) + rows-per-page. Scope is exclusive — cleaner
+      // than two independent checkboxes.
+      const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
+      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search app, model, or endpoint…', value: this.q });
       let t;
       search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
-      const piiToggle = el('label', { class: 'chk' }, [
-        (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.piiOnly = c.checked; this.reload(); }); return c; })(),
-        document.createTextNode('PII only'),
-      ]);
-      const failToggle = el('label', { class: 'chk' }, [
-        (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.failedOnly = c.checked; this.reload(); }); return c; })(),
-        document.createTextNode('Failed only'),
-      ]);
+      const searchField = el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]);
+
+      const SCOPES = [['all', 'All'], ['pii', 'With PII'], ['failed', 'Failed']];
+      const seg = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Filter scope', style: 'margin-bottom:0' });
+      SCOPES.forEach(([k, l]) => {
+        const b = el('button', { class: 'tab' + (this.scope === k ? ' active' : ''), type: 'button', 'data-scope': k, text: l });
+        b.addEventListener('click', () => {
+          if (this.scope === k) return;
+          this.scope = k; this.piiOnly = k === 'pii'; this.failedOnly = k === 'failed';
+          seg.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x.dataset.scope === k));
+          this.reload();
+        });
+        seg.appendChild(b);
+      });
+
       const sizeSel = dropdown(
         [10, 25, 50, 100].map((n) => ({ value: n, label: n + ' / page' })),
         this.pageSize,
         (v) => { this.pageSize = parseInt(v, 10); this.reload(); },
         { ariaLabel: 'Rows per page', align: 'right' }
       );
-      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle, failToggle, sizeSel]);
+      const toolbar = el('div', { class: 'filterbar reveal' }, [searchField, seg, el('div', { class: 'spacer' }), sizeSel]);
 
       // bounded, internally-scrolling list card (columnar table; header fixed above the scroll body)
       const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
@@ -1320,7 +1347,7 @@
      ========================================================================= */
   const Privacy = {
     title: 'Privacy',
-    sub: 'Deterministic PII detection — observe-only, on this device.',
+    sub: 'Deterministic PII detection · observe-only, on this device.',
 
     async render(view) {
       view.innerHTML = '';
@@ -1345,9 +1372,9 @@
           const live = on && !s.maskingDryRun;
           // Three honest states: off, dry-run (observing), live (redacting).
           const valText = !on ? 'Observe-only' : live ? 'Live' : 'Dry-run';
-          const metaText = !on ? 'Nothing is altered — detection only'
+          const metaText = !on ? 'Nothing is altered · detection only'
             : live ? 'High-confidence PII is redacted'
-            : 'Enabled, but observing — nothing redacted yet';
+            : 'Enabled, but observing · nothing redacted yet';
           return el('div', { class: 'card kpi hero' }, [
             el('div', { class: 'label' }, [el('span', { class: 'ic safe', html: ICON.shield }), document.createTextNode(' Masking')]),
             el('div', { class: 'val' }, [el('span', { class: 'check', html: live ? ICON.check : ICON.shield }), document.createTextNode(valText)]),
@@ -1413,7 +1440,7 @@
      ========================================================================= */
   const Engines = {
     title: 'Engines',
-    sub: 'Detected engines, exposure doctor, and adopt / revert controls.',
+    sub: 'How your apps reach the engine, and whether anything is exposed.',
     busy: false,
 
     async render(view) {
@@ -1424,38 +1451,64 @@
 
     async refresh(view) {
       view = view || $('#view');
-      let ev;
+      let ev, s = null;
       try { ev = await api('/engines'); hideBanner(); }
       catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load engines', e.message || '')); return; }
+      try { s = await api('/settings'); } catch (e) { /* proxy port is best-effort */ }
       view.innerHTML = '';
       setEnginePill(ev);
 
-      // exposure doctor hero
+      // Connection topology hero — the whole point of the page: how traffic flows
+      // (your apps → Saffev → engine), with exposure + mode woven onto the path.
       const exp = ev.exposure;
-      const heroCls = exp.exposed ? ' dangerhero' : '';
-      const hero = el('div', { class: 'card kpi hero' + heroCls + ' reveal' }, [
-        el('div', { class: 'label' }, [el('span', { class: 'ic ' + (exp.exposed ? 'danger' : 'safe'), html: exp.exposed ? ICON.shieldAlert : ICON.shield }), document.createTextNode(' Exposure doctor')]),
-        el('div', { class: 'val' }, [el('span', { class: 'check', html: exp.exposed ? ICON.alert : ICON.check }), document.createTextNode(exp.exposed ? 'Exposed' : 'Localhost only')]),
-        el('div', { class: 'meta', text: exposureLine(exp) }),
-        el('div', { class: 'meta mono', style: 'margin-top:6px', text: 'auth ' + (exp.tokenProtected ? 'protected' : 'unprotected') + (exp.boundTo ? ' · bound ' + exp.boundTo : '') }),
+      const safe = !exp.exposed;
+      const proxyPort = (s && s.proxyPort) || 8088;
+      const activeEng = (ev.engines || []).find((e) => e.isActive);
+      const engName = activeEng ? (engineDisplayName(activeEng.engine) || activeEng.engine) : 'Engine';
+      const engPort = activeEng ? activeEng.publicPort : (ev.mode === 'gateway' && activeEng && activeEng.shadowPort) || '11434';
+      const node = (t, d, brand) => el('div', { class: 'flow-node' + (brand ? ' brandnode' : '') }, [
+        el('div', { class: 'flow-t', text: t }), el('div', { class: 'flow-d', text: d }),
       ]);
-      const heroWrap = el('section', { class: 'grid', style: 'grid-template-columns:repeat(2,1fr);margin-bottom:16px' }, [
-        hero,
-        el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
-          el('div', { class: 'hrow' }, [el('h3', { text: 'Mode' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: ev.mode })]),
-          el('div', { class: 'muted', style: 'font-size:.86rem;margin-top:8px', text: ev.mode === 'gateway'
-            ? 'Gateway — Saffev supervises the engine and owns the public port, forwarding to a shadow port.'
-            : 'Cooperative — apps point at Saffev; the engine keeps running independently. Universal, zero-config.' }),
+      const arrow = () => el('div', { class: 'flow-arrow', html: ICON.chevR });
+      const topo = el('div', { class: 'card reveal' }, [
+        el('div', { class: 'hrow' }, [
+          el('h3', { text: 'Connection' }), el('div', { class: 'spacer' }),
+          el('span', { class: 'tag', text: ev.mode }),
+          el('span', { class: 'pill ' + (safe ? '' : 'dangerpill'), style: 'margin-left:8px', html: '<span class="dot"></span> ' + (safe ? 'localhost only' : 'exposed') }),
         ]),
+        el('div', { class: 'flow', style: 'margin-top:16px' }, [
+          node('Your apps', 'point base URL here', false), arrow(),
+          node('Saffev', ':' + proxyPort + ' · observing', true), arrow(),
+          node(engName, ':' + engPort + ' · untouched', false),
+        ]),
+        el('div', { class: 'expnote' + (safe ? '' : ' danger'), style: 'margin-top:14px', html: (safe ? ICON.check : ICON.alert) + ' ' + esc(exposureLine(exp)) + ' · auth ' + (exp.tokenProtected ? 'protected' : 'unprotected') }),
       ]);
-      view.appendChild(heroWrap);
+      view.appendChild(topo);
+
+      // Route an app + mode explainer (2-up, balanced).
+      const base = 'http://localhost:' + proxyPort;
+      const routeCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Route an app' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'no config edits' })]),
+        el('p', { class: 'about-p', style: 'margin-top:6px', text: 'Wrap any command so its LLM calls flow through Saffev:' }),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:2px' }); b.innerHTML = '<span class="muted">$</span> ' + esc(BRAND.command) + ' run <span class="arr">‹your app›</span>'; return b; })(),
+        el('p', { class: 'about-p', style: 'margin-top:12px', text: 'Or set the base URL manually:' }),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:2px' }); b.innerHTML = '<span class="muted">OpenAI</span> ' + esc(base) + '/v1'; return b; })(),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:8px' }); b.innerHTML = '<span class="muted">Ollama</span> ' + esc(base); return b; })(),
+      ]);
+      const modeCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Mode' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: ev.mode })]),
+        el('div', { class: 'muted', style: 'font-size:.86rem;margin-top:8px;line-height:1.6', text: ev.mode === 'gateway'
+          ? 'Gateway · Saffev supervises the engine and owns the public port, forwarding to a shadow port. Captures all engine traffic transparently.'
+          : 'Cooperative · apps point at Saffev; the engine keeps running independently. Universal and zero-config. Only sees traffic sent to the proxy port.' }),
+      ]);
+      view.appendChild(el('section', { class: 'grid', style: 'grid-template-columns:1fr 1fr;margin:16px 0' }, [routeCard, modeCard]));
 
       // engine cards
       if (!ev.engines || ev.engines.length === 0) {
         view.appendChild(emptyState('No engines detected', 'Start your local LLM engine (Ollama on :11434 or LM Studio on :1234) and refresh.'));
         return;
       }
-      const grid = el('section', { class: 'grid', style: 'grid-template-columns:repeat(auto-fill,minmax(320px,1fr))' });
+      const grid = el('section', { class: 'grid', style: 'grid-template-columns:repeat(auto-fit,minmax(320px,1fr))' });
       ev.engines.forEach((eng) => grid.appendChild(this.engineCard(eng, ev.mode, exp)));
       view.appendChild(grid);
     },
@@ -1504,7 +1557,7 @@
         card.appendChild(btnrow);
       } else {
         // A second running engine Saffev isn't forwarding to. Explain how to
-        // route it — no adopt/revert (only the active upstream is managed).
+        // route it · no adopt/revert (only the active upstream is managed).
         card.appendChild(el('div', { class: 'expnote', html: ICON.plug + ' Saffev is forwarding to the active engine. To trace this one, run an app through it with <span class="kv">saffev run</span>, or set <span class="kv">upstream = ' + esc(eng.publicPort) + '</span> in your config and restart.' }));
       }
       return card;
@@ -1534,7 +1587,7 @@
      ========================================================================= */
   const Settings = {
     title: 'Settings',
-    sub: 'Local configuration — written to the on-device config file.',
+    sub: 'Local configuration · written to the on-device config file.',
     saving: false,
     tab: 'general',  // preserved across re-draws so a toggle doesn't jump tabs
     _restartNote: null,       // set when a restart-required field was changed
@@ -1617,8 +1670,8 @@
         this.save(view, { payloadStorage: next });
       });
       const payHint = s.payloadStorage
-        ? 'On — full prompts & responses are retained on this device.'
-        : 'Off — metadata-only (default). Raw payloads are never stored.';
+        ? 'On · full prompts & responses are retained on this device.'
+        : 'Off · metadata-only (default). Raw payloads are never stored.';
       const payRow = setRow('Store raw payloads', payHint, el('div', { class: 'ctl' }, [sw]));
       if (s.payloadStorage) payRow.querySelector('.hint').classList.add('danger-note');
       privCard.appendChild(payRow);
@@ -1626,7 +1679,7 @@
       const retItems = [['age30', 'Age · 30 days'], ['age7', 'Age · 7 days'], ['age90', 'Age · 90 days'], ['size500', 'Size · 500 MB'], ['unlimited', 'Unlimited']].map(([v, t]) => ({ value: v, label: t }));
       const curKey = retentionKey(s.retention);
       // A config-file value outside the presets (e.g. Age · 14 days) would else
-      // silently show the first option — surface the actual current value.
+      // silently show the first option · surface the actual current value.
       if (!retItems.some((i) => i.value === curKey)) retItems.unshift({ value: curKey, label: retVal + ' (current)' });
       const retSel = dropdown(
         retItems,
@@ -1640,8 +1693,8 @@
       const mEnable = switchBtn(s.maskingEnabled, 'Toggle PII masking');
       mEnable.addEventListener('click', () => { const next = !mEnable.classList.contains('on'); this.save(view, { maskingEnabled: next }); });
       const enHint = s.maskingEnabled
-        ? 'On — high-confidence PII detectors feed the masking pipeline.'
-        : 'Off — observe-only (default). Traffic is never altered.';
+        ? 'On · high-confidence PII detectors feed the masking pipeline.'
+        : 'Off · observe-only (default). Traffic is never altered.';
       maskCard.appendChild(setRow('Enable masking', enHint, el('div', { class: 'ctl' }, [mEnable])));
       const mDry = switchBtn(s.maskingDryRun, 'Toggle masking dry-run', { disabled: !s.maskingEnabled });
       mDry.addEventListener('click', async () => {
@@ -1660,8 +1713,8 @@
       const dryHint = !s.maskingEnabled
         ? 'Enable masking first to choose dry-run vs live.'
         : (s.maskingDryRun
-          ? 'On (default) — records what WOULD be masked; traffic is unchanged.'
-          : 'Off — LIVE: high-confidence PII is redacted from requests before forwarding.');
+          ? 'On (default) · records what WOULD be masked; traffic is unchanged.'
+          : 'Off · LIVE: high-confidence PII is redacted from requests before forwarding.');
       const dryRow = setRow('Dry-run', dryHint, el('div', { class: 'ctl' }, [mDry]));
       if (s.maskingEnabled && !s.maskingDryRun) dryRow.querySelector('.hint').classList.add('danger-note');
       maskCard.appendChild(dryRow);
@@ -1672,20 +1725,20 @@
       const evEnable = switchBtn(s.evalEnabled, 'Toggle evaluation');
       evEnable.addEventListener('click', () => this.save(view, { evalEnabled: !evEnable.classList.contains('on') }));
       const evHint = s.evalEnabled
-        ? 'On — sampled exchanges are scored asynchronously, on-device (never blocks your model).'
-        : 'Off — no evaluation. Turn on to score traffic for safety (and quality later).';
+        ? 'On · sampled exchanges are scored asynchronously, on-device (never blocks your model).'
+        : 'Off · no evaluation. Turn on to score traffic for safety (and quality later).';
       evalCard.appendChild(setRow('Enable evaluation', evHint, el('div', { class: 'ctl' }, [evEnable])));
 
       const safEnable = switchBtn(s.evalSafety, 'Toggle safety guard', { disabled: !s.evalEnabled });
       safEnable.addEventListener('click', () => { if (!s.evalEnabled) return; this.save(view, { evalSafety: !safEnable.classList.contains('on') }); });
-      const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v2) — cheap, no model, runs on all exchanges.';
+      const safHint = !s.evalEnabled ? 'Enable evaluation first.' : 'Deterministic keyword/pattern safety floor (deterministic:v2) · cheap, no model, runs on all exchanges.';
       evalCard.appendChild(setRow('Safety guard', safHint, el('div', { class: 'ctl' }, [safEnable])));
 
       // Quality judge (model-backed, opt-in). Needs a judge model configured.
       const qEnable = switchBtn(s.evalQuality, 'Toggle quality judge', { disabled: !s.evalEnabled });
       qEnable.addEventListener('click', () => { if (!s.evalEnabled) return; this.save(view, { evalQuality: !qEnable.classList.contains('on') }); });
       const qHint = !s.evalEnabled ? 'Enable evaluation first.'
-        : (s.evalJudgeModel ? 'LLM-as-judge on your own engine — sampled + concurrency-gated so it never thrashes the model.' : 'Set a judge model below to activate.');
+        : (s.evalJudgeModel ? 'LLM-as-judge on your own engine · sampled + concurrency-gated so it never thrashes the model.' : 'Set a judge model below to activate.');
       evalCard.appendChild(setRow('Quality judge', qHint, el('div', { class: 'ctl' }, [qEnable])));
 
       const modelInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. qwen3.5:2b', value: s.evalJudgeModel || '' });
@@ -1717,7 +1770,7 @@
       try {
         const updated = await api('/settings', { method: 'PUT', body: update });
         hideBanner();
-        // Mode/ports don't apply live — settings_put persists them but returns the
+        // Mode/ports don't apply live · settings_put persists them but returns the
         // STILL-RUNNING values, so the control would silently snap back. Surface a
         // persistent "restart to apply" note and keep the requested value shown.
         if (updated.restartRequired && updated.restartRequired.length) {
@@ -1744,6 +1797,12 @@
   function aboutChip(icon, text) {
     return el('span', { class: 'about-chip', html: icon + '<span>' + esc(text) + '</span>' });
   }
+  // Masthead signal line (dot + mono text) for the About hero's right column.
+  function heroSig(text, dim) {
+    return el('span', { class: 'hero-sig' + (dim ? ' dim' : '') }, [
+      el('span', { class: 'hero-sig-dot' }), document.createTextNode(text),
+    ]);
+  }
   function featureCard(icon, role, title, desc) {
     return el('div', { class: 'feat' }, [
       el('div', { class: 'feat-ic ic ' + role, html: icon }),
@@ -1769,7 +1828,7 @@
 
   const About = {
     title: 'About & integrate',
-    sub: 'What Saffev is, what it does, and how to point your apps — and AI agents — at it.',
+    sub: 'What Saffev is, what it does, and how to point your apps (and AI agents) at it.',
     tab: 'overview',
     version: '', proxyPort: 8088, studioPort: 7100,
     engineName: null, upstreamPort: null,
@@ -1822,25 +1881,27 @@
 
     hero(version) {
       return el('div', { class: 'card reveal about-hero' }, [
-        el('span', { class: 'about-badge', html: ICON.eye + '<span>A glass box for local AI</span>' }),
-        el('h2', { class: 'about-h1', text: 'See exactly what your apps send to local models — and keep it on this device.' }),
-        el('p', { class: 'about-lead', text: 'Saffev is a transparent proxy that sits in front of your local LLM engine — Ollama or LM Studio. Every request your apps make passes through it, so you can watch the traffic live, catch leaked personal data and failed calls, and confirm nothing is exposed to the network — all on this device, encrypted, with no telemetry.' }),
-        el('div', { class: 'about-chips' }, [
-          aboutChip(ICON.shield, 'On-device only'),
-          aboutChip(ICON.check, 'Encrypted at rest'),
-          aboutChip(ICON.globe, 'No telemetry'),
-          version ? aboutChip(ICON.bolt, 'v' + version) : null,
+        el('div', { class: 'about-hero-main' }, [
+          el('span', { class: 'about-badge', html: ICON.eye + '<span>A glass box for local AI</span>' }),
+          el('h2', { class: 'about-h1', text: 'See exactly what your apps send to local models.' }),
+          el('p', { class: 'about-lead', text: 'A transparent proxy in front of your local engine (Ollama or LM Studio). Watch traffic live, catch leaked data and failed calls, and confirm nothing leaves the network. Everything stays on this device.' }),
+        ]),
+        el('div', { class: 'about-hero-side' }, [
+          heroSig('On-device only'),
+          heroSig('Encrypted at rest'),
+          heroSig('No telemetry'),
+          version ? heroSig('v' + version, true) : null,
         ]),
       ]);
     },
 
     features() {
       const grid = el('div', { class: 'feat-grid' }, [
-        featureCard(ICON.pulse, 'brand', 'Live traffic', 'A real-time stream of every request your apps make to local models — app, model, endpoint, latency, tokens, and HTTP status (failed calls flagged).'),
+        featureCard(ICON.pulse, 'brand', 'Live traffic', 'A real-time stream of every request your apps make to local models · app, model, endpoint, latency, tokens, and HTTP status (failed calls flagged).'),
         featureCard(ICON.clock, 'gold', 'History', 'Every proxied exchange, searchable and filterable, kept on-device with a retention policy you control.'),
-        featureCard(ICON.shieldAlert, 'danger', 'Privacy lens', 'Deterministic detection of PII — email, credit card, API keys, IP, phone — flagged as it flows by.'),
-        featureCard(ICON.globe, 'safe', 'Exposure doctor', 'Confirms the engine and Studio are bound to localhost only and not reachable from the network.'),
-        featureCard(ICON.eye, 'brand', 'PII masking', 'Optionally redact high-confidence PII from requests — and non-streamed responses — before it reaches the model or your app (dry-run first).'),
+        featureCard(ICON.shieldAlert, 'danger', 'Privacy lens', 'Deterministic detection of PII (email, credit card, API keys, IP, phone) flagged as it flows by.'),
+        featureCard(ICON.globe, 'safe', 'Exposure doctor', 'Confirms the engine and Studio are bound to localhost only, not reachable from the network.'),
+        featureCard(ICON.eye, 'brand', 'PII masking', 'Optionally redact high-confidence PII from requests and non-streamed responses before it reaches the model or your app. Dry-run first.'),
         featureCard(ICON.server, 'gold', 'Cooperative & Gateway', 'Cooperative: apps point at Saffev (universal, zero-config, Ollama + LM Studio). Gateway: Saffev supervises the engine port (Ollama on Linux).'),
       ]);
       return el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
@@ -1863,9 +1924,9 @@
         el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: engineTitle }), el('div', { class: 'flow-d', text: engineDesc })]),
       ]);
       return el('div', { class: 'card reveal', style: 'animation-delay:.09s' }, [
-        aboutSection(ICON.plug, 'How it works', 'Cooperative mode — a transparent pass-through'),
+        aboutSection(ICON.plug, 'How it works', 'Cooperative mode · a transparent pass-through'),
         flow,
-        el('p', { class: 'about-p', text: 'Your app talks to Saffev instead of the engine directly. Saffev forwards every request unchanged to the real engine and streams the response straight back — recording only metadata on-device (never the raw prompt or response unless you explicitly turn that on).' }),
+        el('p', { class: 'about-p', text: 'Your app talks to Saffev instead of the engine directly. Saffev forwards every request unchanged to the real engine and streams the response straight back · recording only metadata on-device (never the raw prompt or response unless you explicitly turn that on).' }),
       ]);
     },
 
@@ -1874,7 +1935,7 @@
         aboutSection(ICON.download, 'Quick start', 'Install, run, open'),
       ]);
       card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '1' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Install (macOS / Linux)' }), copyBlock(INSTALL_CMD, { title: 'terminal' })])]));
-      card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '2' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Start it (zero-config — picks free ports, never grabs your engine)' }), copyBlock('saffev start', { title: 'terminal' })])]));
+      card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '2' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Start it (zero-config · picks free ports, never grabs your engine)' }), copyBlock('saffev start', { title: 'terminal' })])]));
       card.appendChild(el('div', { class: 'step' }, [el('span', { class: 'step-n', text: '3' }), el('div', { class: 'step-b' }, [el('div', { class: 'step-t', text: 'Open the Studio' }), el('p', { class: 'about-p', html: 'This dashboard, at <a class="about-link" href="' + esc(studioUrl) + '">' + esc(studioUrl) + '</a>. Run <span class="kv">saffev status</span> anytime to see the exact ports.' })])]));
       return card;
     },
@@ -1882,7 +1943,7 @@
     pointApp(proxyUrl) {
       return el('div', { class: 'card reveal', style: 'animation-delay:.15s' }, [
         aboutSection(ICON.bolt, 'Point an app at Saffev', 'So its traffic shows up here'),
-        el('p', { class: 'about-p', text: 'Easiest — wrap the command and Saffev injects the base-URL env vars for you (works for Ollama and LM Studio):' }),
+        el('p', { class: 'about-p', text: 'Easiest · wrap the command and Saffev injects the base-URL env vars for you (works for Ollama and LM Studio):' }),
         copyBlock('saffev run -- <your app>', { title: 'terminal · traces any app' }),
         el('p', { class: 'about-p', text: 'Or set your app’s local-LLM base URL to the Saffev proxy yourself. It forwards to your real engine, so nothing else changes. Use an environment variable so it’s easy to revert.' }),
         copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env  (Ollama)' }),
@@ -1893,7 +1954,7 @@
 
     agentPrompt(proxyUrl, studioUrl) {
       const prompt =
-'You are integrating an existing app with "Saffev" — a local, on-device AI observability\n' +
+'You are integrating an existing app with "Saffev" · a local, on-device AI observability\n' +
 '& safety proxy that sits in front of a local LLM engine (Ollama or LM Studio). Saffev\n' +
 'runs in "cooperative" mode: it listens on a local proxy port and transparently forwards\n' +
 'every request to the real engine, recording only metadata on-device (no raw prompt/\n' +
@@ -1905,7 +1966,7 @@
 'the engine directly, without changing any app behavior.\n' +
 '\n' +
 'CONTEXT\n' +
-'- Saffev proxy URL: ' + proxyUrl + '   (forwards to your real engine — Ollama on\n' +
+'- Saffev proxy URL: ' + proxyUrl + '   (forwards to your real engine · Ollama on\n' +
 '  :11434 or LM Studio on :1234)\n' +
 '- Saffev Studio (dashboard): ' + studioUrl + '\n' +
 '- The exact proxy URL is also printed by:  saffev status\n' +
@@ -1920,7 +1981,7 @@
 '       OPENAI_BASE_URL=' + proxyUrl + '/v1         (OpenAI-compatible clients / LM Studio)\n' +
 '   If the URL is hardcoded, replace ONLY the origin (host:port) with ' + proxyUrl + ';\n' +
 '   keep the path (e.g. /api/chat, /v1/chat/completions) exactly as-is.\n' +
-'   Tip: `saffev run -- <your start command>` injects these env vars for you — no edits.\n' +
+'   Tip: `saffev run -- <your start command>` injects these env vars for you · no edits.\n' +
 '3. Do NOT change request bodies, headers, model names, or streaming behavior.\n' +
 '4. Restart the app.\n' +
 '\n' +
@@ -1930,7 +1991,7 @@
 '\n' +
 'RULES\n' +
 '- Only use the PROXY port (from ' + proxyUrl + '); never point the app at the Studio port.\n' +
-'- Keep a one-line way to revert (point the base URL back at the engine — e.g.\n' +
+'- Keep a one-line way to revert (point the base URL back at the engine · e.g.\n' +
 '  http://localhost:11434 for Ollama, http://localhost:1234 for LM Studio).\n' +
 '- Nothing about the user or the traffic leaves the device.\n' +
 '\n' +
@@ -1979,7 +2040,7 @@
     return el('div', { class: 'card kpi reveal' }, [el('div', { class: 'label', text: label }), el('div', { class: 'val num', html: value })]);
   }
   function deltaNode(cur, prev, goodUp) {
-    if (prev == null || prev === 0) return el('div', { class: 'meta', text: cur > 0 ? 'new this period' : '—' });
+    if (prev == null || prev === 0) return el('div', { class: 'meta', text: cur > 0 ? 'new this period' : '·' });
     const pct = Math.round(((cur - prev) / prev) * 100);
     if (pct === 0) return el('div', { class: 'meta', text: 'no change vs prev' });
     const up = pct > 0;
@@ -2014,7 +2075,7 @@
 
   const Analytics = {
     title: 'Analytics',
-    sub: 'Granular, on-device insight into your local-AI traffic — nothing leaves this device.',
+    sub: 'Granular, on-device insight into your local-AI traffic · nothing leaves this device.',
     tab: 'overview',
     rangeMs: 24 * 60 * 60 * 1000,
     data: null,
@@ -2029,6 +2090,7 @@
       { k: 'usage', l: 'Usage' },
       { k: 'performance', l: 'Performance' },
       { k: 'privacy', l: 'Privacy' },
+      { k: 'quality', l: 'Quality' },
       { k: 'explorer', l: 'Explorer' },
     ],
 
@@ -2064,14 +2126,20 @@
     renderTab() {
       $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
       const panel = $('#anPanel');
-      if (!panel || !this.data) return;
+      if (!panel) return;
       panel.innerHTML = '';
+      // Privacy + Quality are folded in as tabs; they own their own data + empty
+      // states (fetched from /privacy and /quality), so they render directly and
+      // bypass the analytics-window empty guard below.
+      if (this.tab === 'privacy') { Privacy.render(panel); return; }
+      if (this.tab === 'quality') { Quality.draw(panel, this.rangeMs); return; }
+      if (!this.data) return;
       const d = this.data;
       if (d.totalRequests === 0 && this.tab !== 'overview') {
         panel.appendChild(emptyState('No traffic in this window', 'Try a longer window, or point an app at the proxy (see About & integrate).'));
         return;
       }
-      ({ overview: this.overview, usage: this.usage, performance: this.performance, privacy: this.privacy, explorer: this.explorer }[this.tab] || this.overview).call(this, panel, d);
+      ({ overview: this.overview, usage: this.usage, performance: this.performance, explorer: this.explorer }[this.tab] || this.overview).call(this, panel, d);
     },
 
     xLabels(d) {
@@ -2086,12 +2154,20 @@
     overview(panel, d) {
       const C = window.SaffevCharts;
       const xl = this.xLabels(d);
-      const kpis = el('section', { class: 'grid kpis reveal' }, [
-        anKpi('brand', ICON.pulse, 'Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
-        anKpi('gold', ICON.bolt, 'Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'meta', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
-        anKpi('brand', ICON.clock, 'Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
-        anKpi('danger', ICON.shieldAlert, 'PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
-        anKpi(d.failedRequests > 0 ? 'danger' : 'gold', ICON.shieldAlert, 'Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
+      // One balanced metric band (design's "metric cells"), even at 5 cells —
+      // no orphan card. mono label · big tabular number · delta · sparkline.
+      const sCell = (label, valueHtml, subNode, spark) => el('div', { class: 'stat' }, [
+        el('div', { class: 'stat-l', text: label }),
+        el('div', { class: 'stat-v num', html: valueHtml }),
+        subNode || null,
+        spark ? el('div', { class: 'stat-spark' }, [spark]) : null,
+      ]);
+      const kpis = el('section', { class: 'statbar reveal', style: '--cols:5' }, [
+        sCell('Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
+        sCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'stat-s', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
+        sCell('Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
+        sCell('PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
+        sCell('Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
       ]);
       panel.appendChild(kpis);
       const cost = el('div', { class: 'card reveal an-cost' }, [
@@ -2101,7 +2177,7 @@
       ]);
       const activity = anCard('Activity', 'requests over time', C.lineArea({ series: [{ name: 'Requests', values: d.series.map((b) => b.requests), color: 'var(--brand)' }], xLabels: xl }));
       panel.appendChild(el('section', { class: 'an-grid' }, [activity, cost]));
-      // Failures over time — only worth a chart when there are any.
+      // Failures over time · only worth a chart when there are any.
       if ((d.failedRequests || 0) > 0) {
         panel.appendChild(anCard('Failures over time', 'errors + HTTP ≥ 400', C.lineArea({ series: [{ name: 'Failed', values: d.series.map((b) => b.failed || 0), color: 'var(--danger)' }], xLabels: xl }), true));
       }
@@ -2112,7 +2188,7 @@
 
     insightsCard(d) {
       const list = el('div', { class: 'insights' });
-      if (!d.insights || !d.insights.length) list.appendChild(el('div', { class: 'state sm', style: 'padding:18px', text: 'No notable patterns yet — keep using local models and insights will appear.' }));
+      if (!d.insights || !d.insights.length) list.appendChild(el('div', { class: 'state sm', style: 'padding:18px', text: 'No notable patterns yet · keep using local models and insights will appear.' }));
       else d.insights.forEach((i) => {
         const icon = i.severity === 'good' ? ICON.check : i.severity === 'warn' ? ICON.alert : ICON.sparkles;
         const role = i.severity === 'good' ? 'safe' : i.severity === 'warn' ? 'warn' : 'brand';
@@ -2144,10 +2220,10 @@
       const C = window.SaffevCharts;
       const xl = this.xLabels(d);
       panel.appendChild(el('section', { class: 'grid kpis reveal' }, [
-        miniStat('p50 latency', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—'),
-        miniStat('p90 latency', d.p90LatencyMs != null ? d.p90LatencyMs + '<small>ms</small>' : '—'),
-        miniStat('p99 latency', d.p99LatencyMs != null ? d.p99LatencyMs + '<small>ms</small>' : '—'),
-        miniStat('avg TTFT', d.avgTtftMs != null ? d.avgTtftMs + '<small>ms</small>' : '—'),
+        miniStat('p50 latency', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·'),
+        miniStat('p90 latency', d.p90LatencyMs != null ? d.p90LatencyMs + '<small>ms</small>' : '·'),
+        miniStat('p99 latency', d.p99LatencyMs != null ? d.p99LatencyMs + '<small>ms</small>' : '·'),
+        miniStat('avg TTFT', d.avgTtftMs != null ? d.avgTtftMs + '<small>ms</small>' : '·'),
       ]));
       const grid = el('section', { class: 'an-grid' });
       grid.appendChild(anCard('Latency p50 over time', 'ms', C.lineArea({ series: [{ name: 'p50', values: d.series.map((b) => b.p50LatencyMs), color: 'var(--brand)' }], xLabels: xl }), true));
@@ -2187,9 +2263,9 @@
         el('button', { class: 'btn auto', html: ICON.download + '<span>CSV (apps)</span>', onclick: () => downloadFile('saffev-apps.csv', this.csv(['App', 'Requests', 'Input tokens', 'Output tokens', 'avg ms', 'PII'], d.byApp.map((a) => [a.name, a.requests, a.inputTokens, a.outputTokens, a.avgLatencyMs, a.pii])), 'text/csv') }),
       ]));
       const grid = el('section', { class: 'an-grid' });
-      grid.appendChild(anCard('Models', 'full breakdown', dataTable(['Model', 'Requests', 'Input', 'Output', 'p50', 'TTFT', 'tok/s'], d.byModel.map((m) => [m.name, fmtNum(m.requests), fmtNum(m.inputTokens), fmtNum(m.outputTokens), m.p50LatencyMs != null ? m.p50LatencyMs + 'ms' : '—', m.avgTtftMs != null ? m.avgTtftMs + 'ms' : '—', m.tokensPerSec != null ? m.tokensPerSec.toFixed(0) : '—'])), true));
-      grid.appendChild(anCard('Apps', 'full breakdown', dataTable(['App', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byApp.map((a) => [a.name, fmtNum(a.requests), fmtNum(a.inputTokens), fmtNum(a.outputTokens), a.avgLatencyMs != null ? a.avgLatencyMs + 'ms' : '—', fmtNum(a.pii)])), true));
-      grid.appendChild(anCard('Endpoints', 'full breakdown', dataTable(['Endpoint', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byEndpoint.map((e) => [e.name, fmtNum(e.requests), fmtNum(e.inputTokens), fmtNum(e.outputTokens), e.avgLatencyMs != null ? e.avgLatencyMs + 'ms' : '—', fmtNum(e.pii)])), true));
+      grid.appendChild(anCard('Models', 'full breakdown', dataTable(['Model', 'Requests', 'Input', 'Output', 'p50', 'TTFT', 'tok/s'], d.byModel.map((m) => [m.name, fmtNum(m.requests), fmtNum(m.inputTokens), fmtNum(m.outputTokens), m.p50LatencyMs != null ? m.p50LatencyMs + 'ms' : '·', m.avgTtftMs != null ? m.avgTtftMs + 'ms' : '·', m.tokensPerSec != null ? m.tokensPerSec.toFixed(0) : '·'])), true));
+      grid.appendChild(anCard('Apps', 'full breakdown', dataTable(['App', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byApp.map((a) => [a.name, fmtNum(a.requests), fmtNum(a.inputTokens), fmtNum(a.outputTokens), a.avgLatencyMs != null ? a.avgLatencyMs + 'ms' : '·', fmtNum(a.pii)])), true));
+      grid.appendChild(anCard('Endpoints', 'full breakdown', dataTable(['Endpoint', 'Requests', 'Input', 'Output', 'avg latency', 'PII'], d.byEndpoint.map((e) => [e.name, fmtNum(e.requests), fmtNum(e.inputTokens), fmtNum(e.outputTokens), e.avgLatencyMs != null ? e.avgLatencyMs + 'ms' : '·', fmtNum(e.pii)])), true));
       panel.appendChild(grid);
     },
 
@@ -2245,7 +2321,7 @@
   function exposureLine(exp) {
     if (!exp) return 'exposure unknown';
     if (exp.detail) return exp.detail;
-    return exp.exposed ? 'Reachable beyond this device — review binding' : 'Bound to localhost — safe';
+    return exp.exposed ? 'Reachable beyond this device · review binding' : 'Bound to localhost · safe';
   }
   function setEnginePill(ev) {
     const txt = $('#enginePillText');
@@ -2283,7 +2359,7 @@
      ========================================================================= */
   const Quality = {
     title: 'Quality & Safety',
-    sub: 'Sampled safety + quality evaluation of your local model traffic — async, on-device.',
+    sub: 'Sampled safety + quality evaluation of your local model traffic · async, on-device.',
     rangeMs: 24 * 60 * 60 * 1000,
     RANGES: [
       { value: 3600000, label: 'Last hour' },
@@ -2299,20 +2375,21 @@
       view.appendChild(el('div', { id: 'qBody' }));
       await this.draw();
     },
-    async draw() {
-      const body = $('#qBody');
+    async draw(container, rangeMs) {
+      const body = container || $('#qBody');
+      const range = rangeMs || this.rangeMs;
       if (!body) return;
       body.innerHTML = '';
       body.appendChild(loadingState('Loading evaluations…'));
       let d;
-      try { d = await api('/quality?rangeMs=' + this.rangeMs); hideBanner(); }
+      try { d = await api('/quality?rangeMs=' + range); hideBanner(); }
       catch (e) { handleApiError(e); body.innerHTML = ''; body.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
       body.innerHTML = '';
 
       if (!d.evalEnabled) {
         body.appendChild(el('div', { class: 'card reveal' }, [
           aboutSection(ICON.shieldAlert, 'Evaluation is off', 'Turn it on to score traffic for safety'),
-          el('p', { class: 'about-p', text: 'The eval pipeline scores sampled exchanges for safety (and, optionally, quality) — asynchronously and on-device, never blocking your model. It is off by default.' }),
+          el('p', { class: 'about-p', text: 'The eval pipeline scores sampled exchanges for safety (and, optionally, quality) · asynchronously and on-device, never blocking your model. It is off by default.' }),
           el('a', { class: 'btn primary', href: '#/settings', html: ICON.check + '<span>Enable in Settings</span>' }),
         ]));
         return;
@@ -2328,7 +2405,7 @@
       ]);
       body.appendChild(kpis);
 
-      // Safety flags over time — only meaningful once there are flags.
+      // Safety flags over time · only meaningful once there are flags.
       const xl = d.series.map((b) => new Date(b.ts));
       if (d.totalFlagged > 0) {
         body.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
@@ -2336,7 +2413,7 @@
           C.lineArea({ series: [{ name: 'Flagged', values: d.series.map((b) => b.flagged), color: 'var(--danger)' }], xLabels: xl }),
         ]));
       }
-      // Quality good/weak over time — only once the judge has scored anything.
+      // Quality good/weak over time · only once the judge has scored anything.
       if (d.totalJudged > 0) {
         body.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.08s' }, [
           el('div', { class: 'hrow' }, [el('h3', { text: 'Quality over time' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'judge' })]),
@@ -2386,7 +2463,9 @@
     teardown() {},
   };
 
-  const ROUTES = { live: Live, history: History, privacy: Privacy, analytics: Analytics, quality: Quality, engines: Engines, settings: Settings, about: About };
+  // Privacy + Quality are folded into Analytics tabs (see navigate() redirects);
+  // they stay as objects (Analytics renders their bodies) but aren't top-level routes.
+  const ROUTES = { live: Live, history: History, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {
@@ -2394,9 +2473,15 @@
   }
 
   async function navigate() {
-    const hash = (location.hash || '#/live').replace(/^#\/?/, '');
-    const route = ROUTES[hash] ? hash : 'live';
+    let raw = (location.hash || '#/live').replace(/^#\/?/, '');
+    // Consolidated pages redirect to their Analytics tab (deep links still work).
+    const REDIRECT = { privacy: 'analytics/privacy', quality: 'analytics/quality' };
+    if (!raw.includes('/') && REDIRECT[raw]) raw = REDIRECT[raw];
+    const [seg, sub] = raw.split('/');
+    const route = ROUTES[seg] ? seg : 'live';
     const page = ROUTES[route];
+    // A `#/analytics/<tab>` deep link opens Analytics on that tab.
+    if (route === 'analytics' && sub && Analytics.TABS.some((t) => t.k === sub)) Analytics.tab = sub;
     if (activePage && activePage.teardown) activePage.teardown();
     activePage = page;
     setActiveNav(route);
@@ -2412,7 +2497,7 @@
      BOOT
      ========================================================================= */
   function applyBrand() {
-    document.title = BRAND.wordmark + ' — Studio';
+    document.title = BRAND.wordmark + ' · Studio';
     setText('#wmName', BRAND.wordmark);
     setText('#wmSub', BRAND.tagline);
   }
@@ -2427,7 +2512,7 @@
     if (!TOKEN) {
       showBanner('No Studio token found. The desktop app opens with one automatically; if you opened this URL by hand, append ?token=<your-install-token>.', 'danger');
     } else {
-      // Auto-check for a newer release (GitHub release metadata only — nothing
+      // Auto-check for a newer release (GitHub release metadata only · nothing
       // about the user leaves the device). Fail-soft: never blocks the UI.
       checkForUpdate();
     }

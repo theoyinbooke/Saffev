@@ -1,69 +1,79 @@
 /* =============================================================================
-   Studio Design Tokens — "Calm Instrument"
-   Source of truth for the web Studio. Canonical; spec in 05-design-system.md.
-   Mirrors the Rust CLI palette in design/cli_palette.rs (same token names).
+   Studio Design Tokens — "Saffev Design System" (warm paper / warm ink)
+   Source of truth for the web Studio.
 
-   Behavior:
-   - Default follows the OS color scheme (prefers-color-scheme).
-   - Setting [data-theme="light"] or [data-theme="dark"] on <html> forces a mode.
-   - Light uses soft shadows; dark uses hairline borders (shadows resolve to none).
+   A quiet, exact language for watching local AI. The product lives almost
+   entirely on a warm neutral ramp; colour is rationed and only ever carries
+   meaning. Structure comes from rules and whitespace, not shadows — one soft
+   elevation is reserved for things that float (drawer, dropdown, modal).
 
-   Fonts: self-hosted woff2 via studio-web/fonts.css (no CDN) for offline /
-   privacy — the tool ships on-device and never calls a font CDN.
+   Behaviour:
+   - Default follows the OS colour scheme (prefers-color-scheme).
+   - [data-theme="light"|"dark"] on <html> forces a mode.
+
+   Fonts: self-hosted Geist + Geist Mono woff2 via fonts.css (no CDN) — the tool
+   ships on-device and never calls a font host.
    ============================================================================= */
 
 /* ---- LIGHT (default) ------------------------------------------------------ */
 :root {
-  /* surfaces & lines */
-  --bg:            #F6F1EA;  /* app canvas — warm cream */
-  --surface:       #FFFFFF;  /* cards, panels */
-  --surface-2:     #FBF7F1;  /* nested surface, inputs, terminal chrome */
-  --surface-3:     #F3ECE2;  /* hover/pressed tint */
-  --border:        #E9E3DA;  /* card/input borders */
-  --divider:       #F1EBE3;  /* hairline separators, list rows */
+  /* surfaces & lines — warm paper */
+  --bg:            #F5F0E8;  /* paper — app canvas */
+  --surface:       #FFFFFF;  /* raised — cards, panels */
+  --surface-2:     #FBF8F2;  /* soft — nested surfaces, soft panels */
+  --surface-3:     #EFE9DE;  /* sunken — hover/press tint, segmented bg, port fields */
+  --border:        #E6E0D5;  /* hair — card/input borders */
+  --line:          #D8D1C4;  /* rule — stronger separators */
+  --divider:       #EEE7DB;  /* row hairline in tables/lists */
 
-  /* brand — primary (teal) */
-  --brand:         #0F766E;  /* primary actions, active nav, brand, CLI prompt — 5.5:1 on white */
-  --brand-soft:    #DCF1EC;  /* active-nav fill, soft chips, tints */
-  --brand-press:   #115E59;  /* pressed / emphasis */
+  /* brand green — the live path (actions, healthy, the number to notice) */
+  --brand:         #11766E;  /* accent — text, dots, active nav, the live path */
+  --brand-fill:    #11766E;  /* solid button fill (same in dark — stays green) */
+  --brand-soft:    #DDEDEB;  /* accent tint — active-nav fill, soft chips */
+  --brand-press:   #0E655E;  /* pressed / emphasis */
   --on-brand:      #FFFFFF;  /* text/icon on a filled brand surface */
 
-  /* semantic status (strong + soft) */
-  --safe:          #1F9D63;  --safe-soft:   #DDF2E7;  /* clean·on-device·not-exposed·healthy */
-  --warn:          #C5821E;  --warn-soft:   #F8E9CD;  /* caution·approaching·exposed-warning */
-  --danger:        #CE4B47;  --danger-soft: #F7DBD9;  /* PII flagged·error·blocked */
-  --gold:          #D99E2B;  --gold-soft:   #F8EBCD;  /* secondary accent·API-key·highlight */
+  /* signals — three quiet meanings, each a solid + a tint */
+  --safe:          #11766E;  --safe-soft:   #DDEDEB;  /* healthy · ok · pass (= brand) */
+  --warn:          #B0821F;  --warn-soft:   #F3E6C9;  /* attention · slow · dry-run */
+  --danger:        #BD564E;  --danger-soft: #F5DDD7;  /* finding · PII · failed */
+  --gold:          #B0821F;  --gold-soft:   #F3E6C9;  /* secondary accent (folds into amber) */
 
-  /* text */
-  --text:          #221F1B;  /* primary content, headings, values */
-  --text-2:        #6F685E;  /* supporting text, labels */
-  --text-3:        #A99F92;  /* metadata, placeholders, disabled, CLI comments */
+  /* text — warm ink */
+  --text:          #1C1A16;  /* ink — primary content, headings, values */
+  --text-2:        #6F6A60;  /* second — supporting text, labels */
+  --text-3:        #9A9388;  /* muted — metadata, placeholders, disabled */
 
-  /* shape */
-  --r-sm:  10px;  --r-md: 14px;  --r-lg: 20px;  --r-xl: 28px;  --r-full: 999px;
+  /* terminal surface (always dark, both themes) */
+  --terminal:      #1C1813;
 
-  /* spacing (6-step scale) */
+  /* shape — crisp corners (8px default) */
+  --r-sm:  6px;  --r-md: 8px;  --r-lg: 12px;  --r-xl: 16px;  --r-full: 999px;
+
+  /* spacing — 4px base */
   --space-xs: 4px;  --space-sm: 8px;  --space-md: 16px;
-  --space-lg: 24px; --space-xl: 32px; --space-xxl: 48px;
+  --space-lg: 24px; --space-xl: 48px; --space-xxl: 80px;
 
-  /* elevation (light only) + focus */
-  --shadow:    0 1px 2px rgba(48,36,22,.04), 0 10px 30px rgba(48,36,22,.06);
-  --shadow-sm: 0 1px 2px rgba(48,36,22,.05);
-  --ring:      0 0 0 4px rgba(15,118,110,.18);
+  /* elevation — one soft shadow for floating things; cards use rules, not shadow */
+  --shadow:    0 12px 34px -14px rgba(28,26,22,.28);
+  --shadow-sm: 0 1px 2px rgba(28,26,22,.10);
+  --ring:      0 0 0 3px rgba(17,118,110,.22);
 
-  /* type */
-  --font-display: "Bricolage Grotesque", ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
-  --font-body:    "Hanken Grotesk", ui-rounded, system-ui, sans-serif;
-  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* type — Geist for everything you read; Geist Mono for the data */
+  --font-display: "Geist", system-ui, -apple-system, sans-serif;
+  --font-body:    "Geist", system-ui, -apple-system, sans-serif;
+  --font-mono:    "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
 
-  /* type scale (rem @ 15px base) */
-  --fs-display-xl: 2.30rem;  --fs-display: 2.05rem;  --fs-h3: 1.18rem;
-  --fs-body: 0.95rem;        --fs-small: 0.82rem;    --fs-data: 0.86rem;
-  --fs-label: 0.62rem;       /* mono, uppercase, .16em tracking */
+  /* type scale */
+  --fs-display-xl: 3.2rem;   --fs-display: 2.0rem;   --fs-h3: 1.125rem;
+  --fs-body: 0.9375rem;      --fs-small: 0.8125rem;  --fs-data: 0.8125rem;
+  --fs-label: 0.6875rem;     /* mono, uppercase, .16em tracking */
 
-  /* atmosphere washes (apply on body bg-image; subtle, must not lower contrast) */
-  --wash-brand: color-mix(in srgb, var(--brand) 12%, transparent);
-  --wash-gold:  color-mix(in srgb, var(--gold)  14%, transparent);
+  /* atmosphere washes — soft corner glows on the canvas (top-right brand,
+     top-left amber). Subtle on paper; stronger in dark to lift the surface off
+     pure black. Applied on the body background-image (must not lower contrast). */
+  --wash-brand: color-mix(in oklab, var(--brand) 8%, transparent);
+  --wash-gold:  color-mix(in oklab, var(--gold) 9%, transparent);
 
   color-scheme: light;
 }
@@ -71,47 +81,56 @@
 /* ---- DARK (auto via OS, unless [data-theme="light"] forces light) --------- */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
-    --border:    #38322A;  --divider:    #2C2720;
-    --brand:     #4FD1C5;  --brand-soft: #16403B;  --brand-press:#6FE0D4;  --on-brand:  #08201C;
-    --safe:      #57C98C;  --safe-soft:  #1E3F2E;
-    --warn:      #E7B25A;  --warn-soft:  #3D3115;
-    --danger:    #E27875;  --danger-soft:#3E2422;
-    --gold:      #E9C064;  --gold-soft:  #3B2F14;
-    --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
-    --shadow: none;  --shadow-sm: none;
-    --ring:   0 0 0 4px rgba(79,209,197,.24);
+    --bg:        #161310;  --surface:    #1A1610;  --surface-2: #201B15;  --surface-3: #272118;
+    --border:    #2C261E;  --line:       #342D23;  --divider:   #241F18;
+    --brand:     #5CC4B3;  --brand-fill: #11766E;  --brand-soft:#16332E;  --brand-press:#7FD6C6;  --on-brand: #FFFFFF;
+    --safe:      #5CC4B3;  --safe-soft:  #16332E;
+    --warn:      #D7A24E;  --warn-soft:  #38301D;
+    --danger:    #E08A80;  --danger-soft:#3A231F;
+    --gold:      #D7A24E;  --gold-soft:  #38301D;
+    --text:      #F1EBE0;  --text-2:     #B3AA9A;  --text-3:    #7E7566;
+    --shadow:    0 16px 38px -14px rgba(0,0,0,.66);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+    --ring:      0 0 0 3px rgba(92,196,179,.30);
+    --wash-brand: color-mix(in oklab, var(--brand) 20%, transparent);
+    --wash-gold:  color-mix(in oklab, var(--gold) 15%, transparent);
     color-scheme: dark;
   }
 }
 
 /* ---- DARK (forced) -------------------------------------------------------- */
 :root[data-theme="dark"] {
-  --bg:        #181512;  --surface:    #221E18;  --surface-2: #2A251E;  --surface-3: #322B22;
-  --border:    #38322A;  --divider:    #2C2720;
-  --brand:     #4FD1C5;  --brand-soft: #16403B;  --brand-press:#6FE0D4;  --on-brand:  #08201C;
-  --safe:      #57C98C;  --safe-soft:  #1E3F2E;
-  --warn:      #E7B25A;  --warn-soft:  #3D3115;
-  --danger:    #E27875;  --danger-soft:#3E2422;
-  --gold:      #E9C064;  --gold-soft:  #3B2F14;
-  --text:      #F3EEE6;  --text-2:     #ABA294;  --text-3:    #7C7466;
-  --shadow: none;  --shadow-sm: none;
-  --ring:   0 0 0 4px rgba(79,209,197,.24);
+  --bg:        #161310;  --surface:    #1A1610;  --surface-2: #201B15;  --surface-3: #272118;
+  --border:    #2C261E;  --line:       #342D23;  --divider:   #241F18;
+  --brand:     #5CC4B3;  --brand-fill: #11766E;  --brand-soft:#16332E;  --brand-press:#7FD6C6;  --on-brand: #FFFFFF;
+  --safe:      #5CC4B3;  --safe-soft:  #16332E;
+  --warn:      #D7A24E;  --warn-soft:  #38301D;
+  --danger:    #E08A80;  --danger-soft:#3A231F;
+  --gold:      #D7A24E;  --gold-soft:  #38301D;
+  --text:      #F1EBE0;  --text-2:     #B3AA9A;  --text-3:    #7E7566;
+  --shadow:    0 16px 38px -14px rgba(0,0,0,.66);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --ring:      0 0 0 3px rgba(92,196,179,.30);
   color-scheme: dark;
 }
 
-/* ---- minimal base (optional — delete if your reset handles it) ------------ */
+/* ---- minimal base --------------------------------------------------------- */
 body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
-  transition: background .4s ease, color .4s ease;
+  text-rendering: optimizeLegibility;
+  transition: background .35s ease, color .35s ease;
+  /* soft corner glows — a warm green at top-right, amber at top-left. Fixed to
+     the viewport so they stay in the corners as content scrolls. */
   background-image:
-    radial-gradient(1100px 520px at 88% -8%, var(--wash-brand), transparent 70%),
-    radial-gradient(900px 480px at -6% 8%, var(--wash-gold),  transparent 70%);
+    radial-gradient(1000px 500px at 92% -10%, var(--wash-brand), transparent 68%),
+    radial-gradient(880px 460px at -6% 6%, var(--wash-gold), transparent 66%);
+  background-attachment: fixed;
 }
+::selection { background: color-mix(in oklab, var(--brand) 18%, transparent); }
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.num  { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.num  { font-family: var(--font-display); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
 :where(a, button, input, [tabindex]):focus-visible { outline: none; box-shadow: var(--ring); }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

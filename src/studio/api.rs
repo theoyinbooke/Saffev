@@ -1205,7 +1205,7 @@ fn build_insights(
                 severity: "info".into(),
                 title: format!("{} is your fastest model", fast),
                 detail: format!(
-                    "{} decodes at ~{:.0} tok/s vs ~{:.0} tok/s for {} — prefer it for latency-sensitive work.",
+                    "{} decodes at ~{:.0} tok/s vs ~{:.0} tok/s for {}. Prefer it for latency-sensitive work.",
                     fast, ft, st, slow
                 ),
             });
@@ -1245,7 +1245,7 @@ fn build_insights(
                 severity: "warn".into(),
                 title: "Many responses hit the length limit".into(),
                 detail: format!(
-                    "{}% of responses stopped at the token cap — consider raising num_predict / max_tokens.",
+                    "{}% of responses stopped at the token cap. Consider raising num_predict / max_tokens.",
                     (len.count * 100 / total_fr)
                 ),
             });
@@ -1411,7 +1411,7 @@ pub async fn update_post(
         Ok(outcome) => {
             let message = if outcome.updated {
                 format!(
-                    "v{} installed — restart Saffev to run the new version",
+                    "v{} installed. Restart Saffev to run the new version",
                     outcome.new_version
                 )
             } else {

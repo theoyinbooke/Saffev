@@ -172,11 +172,7 @@ mod tests {
     /// correct content-type, so the binary ships its own fonts.
     #[tokio::test]
     async fn self_hosted_fonts_are_embedded_and_served() {
-        for file in [
-            "fonts/bricolage-grotesque.woff2",
-            "fonts/hanken-grotesk.woff2",
-            "fonts/jetbrains-mono.woff2",
-        ] {
+        for file in ["fonts/geist-sans.woff2", "fonts/geist-mono.woff2"] {
             let asset =
                 StudioAssets::get(file).unwrap_or_else(|| panic!("missing embedded font: {file}"));
             // woff2 files start with the "wOF2" magic signature.
@@ -197,13 +193,13 @@ mod tests {
         }
     }
 
-    /// `fonts.css` declares an @font-face for each of the three families the
-    /// Studio's design tokens reference.
+    /// `fonts.css` declares an @font-face for each family the Studio's design
+    /// tokens reference.
     #[test]
-    fn fonts_css_declares_all_three_families() {
+    fn fonts_css_declares_all_families() {
         let asset = StudioAssets::get("fonts.css").expect("missing fonts.css");
         let css = String::from_utf8_lossy(&asset.data);
-        for family in ["Bricolage Grotesque", "Hanken Grotesk", "JetBrains Mono"] {
+        for family in ["Geist", "Geist Mono"] {
             assert!(
                 css.contains(family),
                 "fonts.css missing @font-face for {family}"
