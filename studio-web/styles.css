@@ -184,6 +184,9 @@ a{color:inherit}
 }
 .trow:last-child{border-bottom:0}
 .trow:hover{background:var(--surface-2)}
+/* Failed exchange (transport error or HTTP >= 400): subtle danger marker. */
+.trow.failed{box-shadow:inset 3px 0 0 var(--danger)}
+.trow.failed .cell-endpoint,.trow.failed .cell-model{color:var(--danger)}
 .trow:focus-visible{outline:none;box-shadow:var(--ring);border-radius:var(--r-sm)}
 .tcell{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tcell.r{text-align:right;font-family:var(--font-mono);font-variant-numeric:tabular-nums}

@@ -102,6 +102,18 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE pii_findings ADD COLUMN label TEXT;
     "#,
+    // --- v3: capture request outcome (HTTP status + transport failures) ---
+    //
+    // v1 recorded only the timing/tokens of a finished exchange, so a failed call
+    // (upstream unreachable, timeout, HTTP 4xx/5xx, mid-stream error) was
+    // indistinguishable from a success — exactly the case a developer opens the
+    // tool to see. `status` is the upstream HTTP status (NULL when we never got
+    // one); `error_kind` is a transport-level failure tag (`upstream_unreachable`
+    // / `stream_error`), NULL for a normal HTTP response.
+    r#"
+    ALTER TABLE responses ADD COLUMN status INTEGER;
+    ALTER TABLE responses ADD COLUMN error_kind TEXT;
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

@@ -61,6 +61,13 @@ pub struct HistoryItem {
     pub pii_count: u32,
     /// Distinct PII kinds present (for badges), e.g. `["email","api_key"]`.
     pub pii_kinds: Vec<PiiKind>,
+    /// Upstream HTTP status, if a response was received (`null` = never reached
+    /// the engine).
+    pub status: Option<u16>,
+    /// Transport-level failure tag (`upstream_unreachable` / `stream_error`), or
+    /// `null` for a normal HTTP response. A row is "failed" when `error_kind` is
+    /// set OR `status >= 400`.
+    pub error_kind: Option<String>,
 }
 
 /// `GET /api/live` — current snapshot of recent activity + headline KPIs.
@@ -385,6 +392,8 @@ pub struct AnalyticsReport {
     pub p99_latency_ms: Option<u32>,
     pub avg_ttft_ms: Option<u32>,
     pub pii_findings: u64,
+    /// Requests that failed (transport error, or HTTP status >= 400) in-window.
+    pub failed_requests: u64,
     pub active_apps: u64,
     pub active_models: u64,
     /// Estimated $ saved vs cloud pricing (see `cost_basis`).

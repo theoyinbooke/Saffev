@@ -154,6 +154,14 @@ pub struct ResponseMeta {
     pub ttft_ms: Option<u32>,
     /// Total generation time (millis).
     pub total_ms: Option<u32>,
+    /// Upstream HTTP status code, if a response was received (`None` when the
+    /// engine was never reached).
+    pub status: Option<u16>,
+    /// Transport-level failure tag when the exchange didn't complete as a normal
+    /// HTTP response: `upstream_unreachable` (never connected) or `stream_error`
+    /// (failed mid-stream). `None` for a normal HTTP response (including 4xx/5xx —
+    /// those are conveyed by `status`).
+    pub error_kind: Option<String>,
 }
 
 /// `payloads` row — raw text; written only when `payload_storage` is on.
@@ -630,8 +638,9 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             )?;
             conn.execute(
                 "INSERT INTO responses \
-                 (request_id, finish_reason, output_tokens, output_tokens_src, ttft_ms, total_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                 (request_id, finish_reason, output_tokens, output_tokens_src, ttft_ms, total_ms, \
+                  status, error_kind) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 rusqlite::params![
                     r.request_id,
                     r.finish_reason,
@@ -639,6 +648,8 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                     token_source_str(r.output_tokens_src),
                     r.ttft_ms,
                     r.total_ms,
+                    r.status,
+                    r.error_kind,
                 ],
             )?;
         }
@@ -737,7 +748,7 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
            r.id, r.ts, r.source_app, r.source_confidence, r.engine, r.model, r.endpoint, \
            r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
            resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
-           resp.ttft_ms, resp.total_ms, \
+           resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, \
            {pii_count_expr} \
          FROM requests r \
          LEFT JOIN responses resp ON resp.request_id = r.id \
@@ -783,11 +794,13 @@ fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
                 .unwrap_or(TokenSource::Exact),
             ttft_ms: row.get(16)?,
             total_ms: row.get(17)?,
+            status: row.get(18)?,
+            error_kind: row.get(19)?,
         }),
         None => None,
     };
 
-    let pii_count: i64 = row.get(18)?;
+    let pii_count: i64 = row.get(20)?;
 
     Ok(HistoryRow {
         request,
@@ -1183,6 +1196,8 @@ mod tests {
             output_tokens_src: TokenSource::Estimated,
             ttft_ms: Some(30),
             total_ms: Some(110),
+            status: Some(200),
+            error_kind: None,
         }));
         store.flush().await.unwrap();
 

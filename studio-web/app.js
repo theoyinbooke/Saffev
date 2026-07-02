@@ -378,11 +378,25 @@
   }
 
   // One clickable row. opts: { columns, streaming, enter }.
+  // A request "failed" if it never reached the engine / errored mid-stream
+  // (errorKind set) or the engine returned an HTTP error (status >= 400).
+  function isFailed(item) {
+    return !!(item && (item.errorKind || (item.status != null && item.status >= 400)));
+  }
+  // Short human label for a failed exchange (for badges/drawer).
+  function failLabel(item) {
+    if (item.errorKind === 'upstream_unreachable') return 'unreachable';
+    if (item.errorKind === 'stream_error') return 'stream error';
+    if (item.errorKind) return item.errorKind;
+    if (item.status != null && item.status >= 400) return 'HTTP ' + item.status;
+    return 'error';
+  }
+
   function reqRow(item, opts) {
     opts = opts || {};
     const cols = opts.columns || HIST_COLS;
     const row = el('div', {
-      class: 'trow' + (opts.streaming ? ' streaming' : '') + (opts.enter ? ' enter' : ''),
+      class: 'trow' + (opts.streaming ? ' streaming' : '') + (opts.enter ? ' enter' : '') + (isFailed(item) ? ' failed' : ''),
       'data-id': item.id, role: 'button', tabindex: '0',
     });
     cols.forEach((k) => row.appendChild(reqCell(k, item)));
@@ -413,6 +427,8 @@
     kv('Output tokens', it.outputTokens != null ? (it.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.outputTokens) : '—');
     kv('Latency', it.latencyMs != null ? it.latencyMs + 'ms' : '—');
     kv('TTFT', it.ttftMs != null ? it.ttftMs + 'ms' : '—');
+    kv('Status', it.status != null ? String(it.status) : (it.errorKind ? '—' : '—'));
+    if (isFailed(it)) kv('Outcome', failLabel(it));
     kv('Time', new Date(it.ts).toLocaleString());
 
     const body = el('div', {}, [
@@ -1054,7 +1070,8 @@
   function cliBlock() {
     const pre =
       '<span class="p">~</span> <span class="v">' + esc(BRAND.command) + ' status</span>\n' +
-      '<span class="g">●</span> proxy      <span class="c">:11434</span> <span class="m">▸</span> ollama <span class="c">:11999</span>      <span class="g">healthy</span>\n' +
+      '<span class="g">●</span> proxy      <span class="c">:8088</span> <span class="m">▸</span> engine <span class="c">:11434</span>      <span class="g">healthy</span>\n' +
+      '<span class="g">●</span> mode       cooperative <span class="m">·</span> captures traffic sent to the proxy\n' +
       '<span class="g">●</span> privacy    metadata-only <span class="m">·</span> encrypted (keyring)\n' +
       '<span class="g">●</span> exposure   localhost-only  <span class="g">✓ not exposed</span>\n' +
       '<span class="p">~</span> <span class="v">_</span>';
@@ -1341,7 +1358,7 @@
 
       // engine cards
       if (!ev.engines || ev.engines.length === 0) {
-        view.appendChild(emptyState('No engines detected', 'Start your local LLM engine (e.g. Ollama on :11434) and refresh.'));
+        view.appendChild(emptyState('No engines detected', 'Start your local LLM engine (Ollama on :11434 or LM Studio on :1234) and refresh.'));
         return;
       }
       const grid = el('section', { class: 'grid', style: 'grid-template-columns:repeat(auto-fill,minmax(320px,1fr))' });
@@ -1578,11 +1595,21 @@
     return head;
   }
 
+  // Map an engine's wire name to a display label, or null when unrecognized /
+  // absent (callers fall back to the generic "Ollama or LM Studio" wording).
+  function engineDisplayName(name) {
+    const n = (name || '').toLowerCase();
+    if (n === 'ollama') return 'Ollama';
+    if (n === 'lmstudio' || n === 'lm studio') return 'LM Studio';
+    return null;
+  }
+
   const About = {
     title: 'About & integrate',
     sub: 'What Saffev is, what it does, and how to point your apps — and AI agents — at it.',
     tab: 'overview',
     version: '', proxyPort: 8088, studioPort: 7100,
+    engineName: null, upstreamPort: null,
     TABS: [
       { k: 'overview', l: 'Overview', icon: ICON.eye },
       { k: 'start', l: 'Quick start', icon: ICON.download },
@@ -1594,6 +1621,9 @@
       // Best-effort live values; fail-soft to the documented defaults.
       try { const h = await api('/health'); this.version = h.version || ''; } catch (e) {}
       try { const s = await api('/settings'); this.proxyPort = s.proxyPort || this.proxyPort; this.studioPort = s.studioPort || this.studioPort; } catch (e) {}
+      // Detect the running engine so copy + the flow diagram name the real one
+      // (Ollama or LM Studio); fall back to generic wording when unknown.
+      try { const ev = await api('/engines'); const e0 = ev.engines && ev.engines[0]; if (e0) { this.engineName = engineDisplayName(e0.engine); this.upstreamPort = e0.publicPort || null; } } catch (e) {}
       hideBanner();
 
       const bar = el('div', { class: 'tabbar reveal', role: 'tablist', 'aria-label': 'About sections' });
@@ -1631,7 +1661,7 @@
       return el('div', { class: 'card reveal about-hero' }, [
         el('span', { class: 'about-badge', html: ICON.eye + '<span>A glass box for local AI</span>' }),
         el('h2', { class: 'about-h1', text: 'See exactly what your apps send to local models — and keep it on this device.' }),
-        el('p', { class: 'about-lead', text: 'Saffev is a transparent proxy that sits in front of your local LLM engine (like Ollama). Every request your apps make passes through it, so you can watch the traffic live, catch leaked personal data, and confirm nothing is exposed to the network — all on this device, encrypted, with no telemetry.' }),
+        el('p', { class: 'about-lead', text: 'Saffev is a transparent proxy that sits in front of your local LLM engine — Ollama or LM Studio. Every request your apps make passes through it, so you can watch the traffic live, catch leaked personal data and failed calls, and confirm nothing is exposed to the network — all on this device, encrypted, with no telemetry.' }),
         el('div', { class: 'about-chips' }, [
           aboutChip(ICON.shield, 'On-device only'),
           aboutChip(ICON.check, 'Encrypted at rest'),
@@ -1643,12 +1673,12 @@
 
     features() {
       const grid = el('div', { class: 'feat-grid' }, [
-        featureCard(ICON.pulse, 'brand', 'Live traffic', 'A real-time stream of every request your apps make to local models — app, model, endpoint, latency, tokens.'),
+        featureCard(ICON.pulse, 'brand', 'Live traffic', 'A real-time stream of every request your apps make to local models — app, model, endpoint, latency, tokens, and HTTP status (failed calls flagged).'),
         featureCard(ICON.clock, 'gold', 'History', 'Every proxied exchange, searchable and filterable, kept on-device with a retention policy you control.'),
         featureCard(ICON.shieldAlert, 'danger', 'Privacy lens', 'Deterministic detection of PII — email, credit card, API keys, IP, phone — flagged as it flows by.'),
         featureCard(ICON.globe, 'safe', 'Exposure doctor', 'Confirms the engine and Studio are bound to localhost only and not reachable from the network.'),
-        featureCard(ICON.eye, 'brand', 'PII masking', 'Optionally redact high-confidence PII from requests before they reach the model (dry-run first).'),
-        featureCard(ICON.server, 'gold', 'Cooperative & Gateway', 'Cooperative: apps point at Saffev (universal, zero-config). Gateway: Saffev supervises the engine port.'),
+        featureCard(ICON.eye, 'brand', 'PII masking', 'Optionally redact high-confidence PII from requests — and non-streamed responses — before it reaches the model or your app (dry-run first).'),
+        featureCard(ICON.server, 'gold', 'Cooperative & Gateway', 'Cooperative: apps point at Saffev (universal, zero-config, Ollama + LM Studio). Gateway: Saffev supervises the engine port (Ollama on Linux).'),
       ]);
       return el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
         aboutSection(ICON.sparkles, 'What it does', 'Six things, all local'),
@@ -1657,12 +1687,17 @@
     },
 
     howItWorks(proxyPort) {
+      // Name the real engine when detected; else stay engine-neutral.
+      const engineTitle = this.engineName || 'Your engine';
+      const engineDesc = this.upstreamPort
+        ? ':' + this.upstreamPort + ' · untouched'
+        : 'Ollama :11434 / LM Studio :1234 · untouched';
       const flow = el('div', { class: 'flow' }, [
         el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: 'Your app' }), el('div', { class: 'flow-d', text: 'set base URL → Saffev' })]),
         el('div', { class: 'flow-arrow', html: ICON.chevR }),
         el('div', { class: 'flow-node brandnode' }, [el('div', { class: 'flow-t', text: 'Saffev' }), el('div', { class: 'flow-d', text: ':' + proxyPort + ' · observes + guards' })]),
         el('div', { class: 'flow-arrow', html: ICON.chevR }),
-        el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: 'Ollama' }), el('div', { class: 'flow-d', text: ':11434 · untouched' })]),
+        el('div', { class: 'flow-node' }, [el('div', { class: 'flow-t', text: engineTitle }), el('div', { class: 'flow-d', text: engineDesc })]),
       ]);
       return el('div', { class: 'card reveal', style: 'animation-delay:.09s' }, [
         aboutSection(ICON.plug, 'How it works', 'Cooperative mode — a transparent pass-through'),
@@ -1696,32 +1731,33 @@
     agentPrompt(proxyUrl, studioUrl) {
       const prompt =
 'You are integrating an existing app with "Saffev" — a local, on-device AI observability\n' +
-'& safety proxy that sits in front of a local LLM engine (e.g. Ollama). Saffev runs in\n' +
-'"cooperative" mode: it listens on a local proxy port and transparently forwards every\n' +
-'request to the real engine, recording only metadata on-device (no raw prompt/response\n' +
-'unless the user opts in). It is a pure pass-through: request/response shapes, headers,\n' +
-'model names, and streaming are unchanged.\n' +
+'& safety proxy that sits in front of a local LLM engine (Ollama or LM Studio). Saffev\n' +
+'runs in "cooperative" mode: it listens on a local proxy port and transparently forwards\n' +
+'every request to the real engine, recording only metadata on-device (no raw prompt/\n' +
+'response unless the user opts in). It is a pure pass-through: request/response shapes,\n' +
+'headers, model names, and streaming are unchanged.\n' +
 '\n' +
 'GOAL\n' +
-'Make THIS app send its local-LLM / Ollama traffic THROUGH Saffev’s proxy instead of\n' +
-'talking to the engine directly, without changing any app behavior.\n' +
+'Make THIS app send its local-LLM traffic THROUGH Saffev’s proxy instead of talking to\n' +
+'the engine directly, without changing any app behavior.\n' +
 '\n' +
 'CONTEXT\n' +
-'- Saffev proxy URL: ' + proxyUrl + '   (forwards to the real Ollama on :11434)\n' +
+'- Saffev proxy URL: ' + proxyUrl + '   (forwards to your real engine — Ollama on\n' +
+'  :11434 or LM Studio on :1234)\n' +
 '- Saffev Studio (dashboard): ' + studioUrl + '\n' +
 '- The exact proxy URL is also printed by:  saffev status\n' +
 '\n' +
 'STEPS\n' +
 '1. Find where this app configures its model endpoint. Look for:\n' +
 '   - env vars: OLLAMA_HOST, OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENAI_API_BASE\n' +
-'   - hardcoded URLs containing :11434, "localhost:11434", or "127.0.0.1:11434"\n' +
+'   - hardcoded URLs containing :11434 or :1234 (localhost / 127.0.0.1)\n' +
 '   - SDK clients (ollama, openai, langchain, llamaindex, …) set with a base URL\n' +
 '2. Repoint the base URL at the Saffev proxy. Prefer an env var so it is reversible:\n' +
-'       OLLAMA_BASE_URL=' + proxyUrl + '\n' +
-'   If the app uses the OpenAI-compatible API, use:\n' +
-'       OPENAI_BASE_URL=' + proxyUrl + '/v1\n' +
+'       OLLAMA_BASE_URL=' + proxyUrl + '            (Ollama-style clients)\n' +
+'       OPENAI_BASE_URL=' + proxyUrl + '/v1         (OpenAI-compatible clients / LM Studio)\n' +
 '   If the URL is hardcoded, replace ONLY the origin (host:port) with ' + proxyUrl + ';\n' +
 '   keep the path (e.g. /api/chat, /v1/chat/completions) exactly as-is.\n' +
+'   Tip: `saffev run -- <your start command>` injects these env vars for you — no edits.\n' +
 '3. Do NOT change request bodies, headers, model names, or streaming behavior.\n' +
 '4. Restart the app.\n' +
 '\n' +
@@ -1731,7 +1767,8 @@
 '\n' +
 'RULES\n' +
 '- Only use the PROXY port (from ' + proxyUrl + '); never point the app at the Studio port.\n' +
-'- Keep a one-line way to revert (point the base URL back at http://localhost:11434).\n' +
+'- Keep a one-line way to revert (point the base URL back at the engine — e.g.\n' +
+'  http://localhost:11434 for Ollama, http://localhost:1234 for LM Studio).\n' +
 '- Nothing about the user or the traffic leaves the device.\n' +
 '\n' +
 'OUTPUT\n' +
@@ -1891,6 +1928,7 @@
         anKpi('gold', ICON.bolt, 'Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'meta', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
         anKpi('brand', ICON.clock, 'Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
         anKpi('danger', ICON.shieldAlert, 'PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
+        anKpi(d.failedRequests > 0 ? 'danger' : 'gold', ICON.shieldAlert, 'Failed', fmtNum(d.failedRequests || 0), el('div', { class: 'meta', text: 'errors + HTTP ≥ 400' }), null),
       ]);
       panel.appendChild(kpis);
       const cost = el('div', { class: 'card reveal an-cost' }, [
