@@ -1109,6 +1109,8 @@ async fn run_servers(cfg: &Config) -> Result<()> {
 
     // Eval channel for logger -> async eval worker (safety guard + judge).
     let (eval_tx, eval_rx) = crate::proxy::eval_channel();
+    // Shared quality-judge runtime metrics (worker writes, Studio reads).
+    let eval_metrics = std::sync::Arc::new(crate::proxy::EvalMetrics::default());
 
     // Studio live-event broadcast channel.
     let (events, _events_rx) =
@@ -1130,6 +1132,7 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         store,
         token,
         events: events.clone(),
+        eval_metrics: eval_metrics.clone(),
     };
 
     // Drain the tee into the store off the request path.
@@ -1141,6 +1144,7 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         proxy_state.config.clone(),
         events,
         proxy_state.upstream.clone(),
+        eval_metrics,
         eval_rx,
     );
 

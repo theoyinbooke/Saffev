@@ -164,7 +164,11 @@ mod tests {
         // A thinking model that ran out of tokens mid-JSON (no closing brace).
         let reply = "<think> the answer is Paris, relevant and clear </think>\n{\n\"relevance\": \"good\",\n\"coherence\": \"good\",";
         let s = parse_scores(reply);
-        assert_eq!(s.len(), 2, "both complete fields recovered despite truncation");
+        assert_eq!(
+            s.len(),
+            2,
+            "both complete fields recovered despite truncation"
+        );
         assert!(s.iter().all(|x| x.band == "good"));
     }
 

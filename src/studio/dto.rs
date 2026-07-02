@@ -182,10 +182,34 @@ pub struct HistoryDetail {
     pub payloads_disabled: bool,
 }
 
+/// One time bucket in the Quality page series.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityBucket {
+    /// Bucket start (unix millis).
+    pub ts: i64,
+    /// Distinct exchanges flagged by the safety guard in this bucket.
+    pub flagged: u64,
+    /// Quality scores banded `good` in this bucket.
+    pub good: u64,
+    /// Quality scores banded `weak` in this bucket.
+    pub weak: u64,
+}
+
 /// `GET /api/quality` — the eval pipeline's safety/quality summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualityReport {
+    /// Window length (millis) + when computed + bucket width, for the series.
+    pub range_ms: i64,
+    pub generated_ts: i64,
+    pub bucket_ms: i64,
+    /// Time series over the window (ascending).
+    pub series: Vec<QualityBucket>,
+    /// Requests in the window (coverage denominator).
+    pub requests_in_window: u64,
+    /// Distinct exchanges judged in the window (coverage numerator).
+    pub judged_in_window: u64,
     /// Whether the eval pipeline is enabled.
     pub eval_enabled: bool,
     /// Whether the deterministic safety guard is on.
@@ -202,6 +226,12 @@ pub struct QualityReport {
     pub total_judged: u64,
     /// Quality scores bucketed by metric (good vs weak counts).
     pub eval_by_metric: Vec<MetricBands>,
+    /// Judge calls currently in flight (contention gauge).
+    pub judge_inflight: u32,
+    /// Judge calls that ran to completion (lifetime).
+    pub judge_completed: u64,
+    /// Judge calls dropped because all concurrency slots were busy (lifetime).
+    pub judge_dropped: u64,
     /// Recent flagged exchanges (for the table).
     pub recent_flagged: Vec<HistoryItem>,
 }

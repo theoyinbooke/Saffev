@@ -61,6 +61,9 @@ pub struct StudioState {
     pub token: Arc<str>,
     /// Broadcast sender feeding the SSE `/api/stream` endpoint with live events.
     pub events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    /// Shared quality-judge runtime metrics (in-flight / completed / dropped),
+    /// surfaced on `/api/quality`.
+    pub eval_metrics: Arc<crate::proxy::EvalMetrics>,
 }
 
 /// The Studio server.
