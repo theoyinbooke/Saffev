@@ -155,6 +155,9 @@ a{color:inherit}
 .card .hrow .spacer{flex:1}
 .tag{font-family:var(--font-mono);font-size:.64rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--text-2);background:var(--surface-2);border:1px solid var(--border);padding:4px 9px;border-radius:var(--r-full)}
 .tag.live{color:var(--safe);background:var(--safe-soft);border-color:transparent;display:inline-flex;align-items:center;gap:6px}
+.tag.oktag{color:var(--safe);background:var(--safe-soft);border-color:transparent}
+.card.engine.inactive{opacity:.82}
+.card.engine.inactive .expnote{color:var(--text-2);background:var(--surface-2);font-weight:500}
 .tag.live.off{color:var(--text-3);background:var(--surface-2);border-color:var(--border)}
 .tag.live .blip{width:7px;height:7px;border-radius:var(--r-full);background:var(--safe);animation:blip 1.6s ease-in-out infinite}
 .tag.live.off .blip{background:var(--text-3);animation:none}
@@ -187,6 +190,16 @@ a{color:inherit}
 /* Failed exchange (transport error or HTTP >= 400): subtle danger marker. */
 .trow.failed{box-shadow:inset 3px 0 0 var(--danger)}
 .trow.failed .cell-endpoint,.trow.failed .cell-model{color:var(--danger)}
+.cell-status{color:var(--text-2);font-family:var(--font-mono);font-size:.76rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cell-status.bad{color:var(--danger);font-weight:600}
+/* Per-finding action chip in the detail drawer. */
+.actchip{font-family:var(--font-mono);font-size:.62rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:var(--r-full);background:var(--surface-2);color:var(--text-2)}
+.actchip.act-masked{background:var(--safe-soft);color:var(--safe)}
+.actchip.act-would_mask{background:var(--gold-soft);color:var(--gold)}
+/* "Restart to apply" notice for mode/port changes. */
+.expnote.warn-expnote{color:var(--gold);background:var(--gold-soft)}
+/* Analytics coverage footer. */
+.an-asof{margin-top:14px;font-size:.76rem;color:var(--text-2);font-family:var(--font-mono);text-align:center}
 .trow:focus-visible{outline:none;box-shadow:var(--ring);border-radius:var(--r-sm)}
 .tcell{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tcell.r{text-align:right;font-family:var(--font-mono);font-variant-numeric:tabular-nums}

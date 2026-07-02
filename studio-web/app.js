@@ -333,16 +333,28 @@
      same `--gtc` grid-template + identical gap/padding. Set `--gtc` on the
      enclosing `.ttable` wrapper (see gtcFor) so both inherit it.
      ------------------------------------------------------------------------- */
+  // Accessible on/off switch (role=switch + aria-checked). Every toggle handler
+  // re-renders its container, so the control is rebuilt with the fresh state.
+  function switchBtn(on, ariaLabel, opts) {
+    opts = opts || {};
+    const attrs = { class: 'switch' + (on ? ' on' : ''), role: 'switch', 'aria-checked': on ? 'true' : 'false', 'aria-label': ariaLabel };
+    if (opts.title) attrs.title = opts.title;
+    const b = el('button', attrs);
+    if (opts.disabled) b.setAttribute('disabled', '');
+    return b;
+  }
+
   const REQ_COLS = {
-    app:      { label: 'Source',   w: 'minmax(110px,1.3fr)', r: false },
-    model:    { label: 'Model',    w: 'minmax(78px,1fr)',    r: false },
-    endpoint: { label: 'Endpoint', w: 'minmax(86px,1.1fr)',  r: false },
+    app:      { label: 'Source',   w: 'minmax(104px,1.3fr)', r: false },
+    model:    { label: 'Model',    w: 'minmax(74px,1fr)',    r: false },
+    endpoint: { label: 'Endpoint', w: 'minmax(82px,1.1fr)',  r: false },
+    status:   { label: 'Status',   w: 'minmax(72px,auto)',   r: false },
     lat:      { label: 'Latency',  w: '68px',                r: true },
     tokens:   { label: 'Tokens',   w: 'minmax(86px,auto)',   r: true },
     time:     { label: 'Time',     w: '92px',                r: true },
   };
-  const LIVE_COLS = ['app', 'model', 'endpoint', 'lat', 'tokens', 'time'];
-  const HIST_COLS = ['app', 'model', 'endpoint', 'lat', 'tokens', 'time'];
+  const LIVE_COLS = ['app', 'model', 'endpoint', 'status', 'lat', 'tokens', 'time'];
+  const HIST_COLS = ['app', 'model', 'endpoint', 'status', 'lat', 'tokens', 'time'];
   function gtcFor(cols) { return cols.map((k) => REQ_COLS[k].w).join(' '); }
 
   // Column header strip. Lives ABOVE the scrolling body so it stays fixed.
@@ -367,6 +379,14 @@
     }
     if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '—' });
     if (key === 'endpoint') return el('div', { class: 'tcell cell-endpoint', title: item.endpoint || '', text: item.endpoint || '—' });
+    if (key === 'status') {
+      // Failed → the reason (red); otherwise the HTTP status (muted), or blank.
+      if (isFailed(item)) {
+        const lbl = failLabel(item);
+        return el('div', { class: 'tcell cell-status bad', title: lbl, text: lbl });
+      }
+      return el('div', { class: 'tcell cell-status', text: item.status != null ? String(item.status) : '' });
+    }
     if (key === 'lat') return el('div', { class: 'tcell r cell-lat', text: item.latencyMs != null ? item.latencyMs + 'ms' : '' });
     if (key === 'tokens') {
       const up = item.inputTokens != null ? (item.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(item.inputTokens) + '↑' : '';
@@ -383,6 +403,11 @@
   function isFailed(item) {
     return !!(item && (item.errorKind || (item.status != null && item.status >= 400)));
   }
+  // Human label for a PII finding's action (snake_case from /history/:id).
+  function piiActionLabel(a) {
+    return a === 'masked' ? 'masked' : a === 'would_mask' ? 'would mask' : 'observed';
+  }
+
   // Short human label for a failed exchange (for badges/drawer).
   function failLabel(item) {
     if (item.errorKind === 'upstream_unreachable') return 'unreachable';
@@ -427,7 +452,7 @@
     kv('Output tokens', it.outputTokens != null ? (it.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.outputTokens) : '—');
     kv('Latency', it.latencyMs != null ? it.latencyMs + 'ms' : '—');
     kv('TTFT', it.ttftMs != null ? it.ttftMs + 'ms' : '—');
-    kv('Status', it.status != null ? String(it.status) : (it.errorKind ? '—' : '—'));
+    kv('Status', it.status != null ? String(it.status) : (it.errorKind ? 'no response' : '—'));
     if (isFailed(it)) kv('Outcome', failLabel(it));
     kv('Time', new Date(it.ts).toLocaleString());
 
@@ -440,12 +465,17 @@
 
     // findings
     if (detail.findings && detail.findings.length) {
-      const fl = el('div', { class: 'payblk' }, [el('h4', { text: 'PII findings (observe-only)' })]);
+      // Header reflects what actually happened to this exchange's findings.
+      const anyMasked = detail.findings.some((f) => f.action === 'masked');
+      const anyWould = detail.findings.some((f) => f.action === 'would_mask');
+      const hdr = anyMasked ? 'PII findings (some redacted)' : anyWould ? 'PII findings (dry-run — would redact)' : 'PII findings (observe-only)';
+      const fl = el('div', { class: 'payblk' }, [el('h4', { text: hdr })]);
       const list = el('div', { class: 'findlist' });
       detail.findings.forEach((f) => {
         const r = el('div', { class: 'find' });
         r.appendChild(el('span', { class: 'piibadge' + (f.kind === 'api_key' ? ' key' : ''), text: piiShort(f.kind) }));
         r.appendChild(el('span', { text: piiLabel(f.kind, f.label) + ' · ' + f.confidence + ' confidence' }));
+        r.appendChild(el('span', { class: 'actchip act-' + (f.action || 'observed'), text: piiActionLabel(f.action) }));
         r.appendChild(el('span', { class: 'where', text: f.side + ' [' + f.start + '–' + f.end + ']' }));
         list.appendChild(r);
       });
@@ -783,7 +813,14 @@
         this.renderEngine(ev);
         this.renderExposureHero(ev.exposure);
         setEnginePill(ev);
-      } catch (e) { /* banner already covers hard failures */ }
+      } catch (e) {
+        // Don't leave the cards stuck on their loading text — show a small
+        // error/retry state instead.
+        const engBox = $('#liveEngine');
+        if (engBox) { engBox.innerHTML = ''; engBox.appendChild(el('div', { class: 'state sm', text: 'Could not load engine — retrying…' })); }
+        const heroBox = $('#exposureHero');
+        if (heroBox) { heroBox.innerHTML = ''; heroBox.appendChild(el('div', { class: 'state sm', text: 'Exposure check unavailable' })); }
+      }
 
       // masking state (best-effort) — keeps the Live toggle in sync with Settings.
       try {
@@ -857,7 +894,7 @@
       const txt = on
         ? 'Masking is <b>on</b> · ' + (this.masking.dryRun ? 'dry-run (observing)' : 'live (redacting)')
         : 'Masking is <b>off</b> — observe only';
-      const sw = el('button', { class: 'switch' + (on ? ' on' : ''), 'aria-label': 'Toggle PII masking', title: on ? 'Masking on — click to turn off' : 'Masking off — click to turn on' });
+      const sw = switchBtn(on, 'Toggle PII masking', { title: on ? 'Masking on — click to turn off' : 'Masking off — click to turn on' });
       sw.addEventListener('click', () => this.toggleMasking(!on, sw));
       bar.innerHTML = '';
       bar.appendChild(el('div', { class: 't', html: txt }));
@@ -877,21 +914,24 @@
     renderEngine(ev) {
       const card = $('#liveEngine');
       if (!card) return;
-      const eng = (ev.engines && ev.engines[0]) || null;
+      // Show the ACTIVE (proxied) engine, not just the first detected one.
+      const engines = ev.engines || [];
+      const eng = engines.find((e) => e.isActive) || engines[0] || null;
       card.innerHTML = '';
       if (!eng) {
         card.appendChild(el('div', { class: 'state sm', text: 'No engine detected.' }));
         return;
       }
+      const name = engineDisplayName(eng.engine) || eng.engine;
       const healthPill = healthToPill(eng.health);
       card.appendChild(el('div', { class: 'hrow' }, [
         el('h3', { text: 'Engine' }), el('div', { class: 'spacer' }),
         el('span', { class: 'pill ' + healthPill.cls, style: 'box-shadow:none', html: '<span class="dot"></span> ' + esc(eng.health) }),
       ]));
       card.appendChild(el('div', { class: 'top' }, [
-        el('div', { class: 'logo', html: ICON.ollama }),
+        el('div', { class: 'logo', html: ICON.server }),
         el('div', {}, [
-          el('div', { class: 'nm', text: eng.engine + (eng.version ? ' ' + eng.version : '') }),
+          el('div', { class: 'nm', text: name + (eng.version ? ' ' + eng.version : '') }),
           el('div', { class: 'st', text: ev.mode + ' · ' + eng.adoptionState }),
         ]),
       ]));
@@ -1095,14 +1135,14 @@
   const History = {
     title: 'History',
     sub: 'Every proxied exchange — searchable, filterable, on-device.',
-    q: '', piiOnly: false, pageSize: 25,
+    q: '', piiOnly: false, failedOnly: false, pageSize: 25,
     pages: [],        // fetched pages: array of arrays of HistoryItem (each non-empty)
     pageIndex: 0,     // which fetched page is currently shown (0-based)
     exhausted: false, // true once the last fetch returned < pageSize (no more pages)
     loading: false,
 
     async render(view) {
-      this.q = ''; this.piiOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
+      this.q = ''; this.piiOnly = false; this.failedOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
       view.innerHTML = '';
 
       // toolbar: search + PII-only + rows-per-page drop-down
@@ -1113,13 +1153,17 @@
         (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.piiOnly = c.checked; this.reload(); }); return c; })(),
         document.createTextNode('PII only'),
       ]);
+      const failToggle = el('label', { class: 'chk' }, [
+        (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.failedOnly = c.checked; this.reload(); }); return c; })(),
+        document.createTextNode('Failed only'),
+      ]);
       const sizeSel = dropdown(
         [10, 25, 50, 100].map((n) => ({ value: n, label: n + ' / page' })),
         this.pageSize,
         (v) => { this.pageSize = parseInt(v, 10); this.reload(); },
         { ariaLabel: 'Rows per page', align: 'right' }
       );
-      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle, sizeSel]);
+      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle, failToggle, sizeSel]);
 
       // bounded, internally-scrolling list card (columnar table; header fixed above the scroll body)
       const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
@@ -1162,6 +1206,7 @@
       const params = new URLSearchParams();
       if (this.q) params.set('q', this.q);
       if (this.piiOnly) params.set('piiOnly', 'true');
+      if (this.failedOnly) params.set('failedOnly', 'true');
       params.set('limit', String(this.pageSize));
       const last = this.pages[this.pages.length - 1];
       if (last && last.length) params.set('beforeTs', String(last[last.length - 1].ts));
@@ -1253,11 +1298,17 @@
         kpiCard('warn', ICON.pulse, 'On request', el('div', { class: 'val num', text: fmtNum(reqSide) }), el('div', { class: 'meta', text: 'outbound to the model' })),
         kpiCard('brand', ICON.clock, 'On response', el('div', { class: 'val num', text: fmtNum(respSide) }), el('div', { class: 'meta', text: 'returned from the model' })),
         (() => {
-          const masking = !!s.maskingEnabled;
-          return el('div', { class: 'card kpi hero' + (masking ? '' : ''), style: '' }, [
+          const on = !!s.maskingEnabled;
+          const live = on && !s.maskingDryRun;
+          // Three honest states: off, dry-run (observing), live (redacting).
+          const valText = !on ? 'Observe-only' : live ? 'Live' : 'Dry-run';
+          const metaText = !on ? 'Nothing is altered — detection only'
+            : live ? 'High-confidence PII is redacted'
+            : 'Enabled, but observing — nothing redacted yet';
+          return el('div', { class: 'card kpi hero' }, [
             el('div', { class: 'label' }, [el('span', { class: 'ic safe', html: ICON.shield }), document.createTextNode(' Masking')]),
-            el('div', { class: 'val' }, [el('span', { class: 'check', html: masking ? ICON.check : ICON.shield }), document.createTextNode(masking ? 'On' : 'Observe-only')]),
-            el('div', { class: 'meta', text: masking ? 'Findings are masked' : 'Nothing is altered — detection only' }),
+            el('div', { class: 'val' }, [el('span', { class: 'check', html: live ? ICON.check : ICON.shield }), document.createTextNode(valText)]),
+            el('div', { class: 'meta', text: metaText }),
           ]);
         })(),
       ]);
@@ -1367,43 +1418,52 @@
     },
 
     engineCard(eng, mode, exp) {
-      const adopted = eng.adoptionState === 'adopted' || eng.adoptionState === 'cooperative';
+      const active = !!eng.isActive;
+      const managed = eng.adoptionState === 'adopted' || eng.adoptionState === 'cooperative';
       const healthPill = healthToPill(eng.health);
-      const card = el('div', { class: 'card engine reveal' });
+      const name = engineDisplayName(eng.engine) || eng.engine;
+      const card = el('div', { class: 'card engine reveal' + (active ? '' : ' inactive') });
       card.appendChild(el('div', { class: 'hrow' }, [
-        el('h3', { text: 'Engine' }), el('div', { class: 'spacer' }),
-        el('span', { class: 'pill ' + healthPill.cls, style: 'box-shadow:none', html: '<span class="dot"></span> ' + esc(eng.health) }),
+        el('h3', { text: name }), el('div', { class: 'spacer' }),
+        el('span', { class: 'tag' + (active ? ' oktag' : ''), text: active ? 'proxied' : 'detected' }),
+        el('span', { class: 'pill ' + healthPill.cls, style: 'box-shadow:none;margin-left:8px', html: '<span class="dot"></span> ' + esc(eng.health) }),
       ]));
       card.appendChild(el('div', { class: 'top' }, [
-        el('div', { class: 'logo', html: ICON.ollama }),
+        el('div', { class: 'logo', html: ICON.server }),
         el('div', {}, [
-          el('div', { class: 'nm', text: eng.engine + (eng.version ? ' ' + eng.version : '') }),
-          el('div', { class: 'st', text: mode + ' · ' + eng.adoptionState }),
+          el('div', { class: 'nm', text: name + (eng.version ? ' ' + eng.version : '') }),
+          el('div', { class: 'st', text: active ? (mode + ' · Saffev forwards here') : 'running · not proxied' }),
         ]),
       ]));
       const portsLine = el('div', { class: 'ports' });
-      portsLine.innerHTML = '<span class="muted">public</span> :' + esc(eng.publicPort) +
+      portsLine.innerHTML = '<span class="muted">port</span> :' + esc(eng.publicPort) +
         (eng.shadowPort != null ? ' <span class="arr">→</span> <span class="muted">shadow</span> :' + esc(eng.shadowPort) : '');
       card.appendChild(portsLine);
-      card.appendChild(el('div', { class: 'expnote' + (exp.exposed ? ' danger' : ''), html: (exp.exposed ? ICON.alert : ICON.check) + ' ' + esc(exposureLine(exp)) }));
 
-      // adopt / revert buttons
-      const btnrow = el('div', { class: 'btnrow' });
-      if (adopted) {
-        const revertBtn = el('button', { class: 'btn', html: ICON.revert + ' Revert' });
-        revertBtn.addEventListener('click', () => this.doRevert(eng.engine, revertBtn));
-        const stateBtn = el('button', { class: 'btn primary', disabled: true, html: ICON.check + ' ' + (eng.adoptionState === 'cooperative' ? 'Cooperative' : 'Adopted') });
-        btnrow.appendChild(revertBtn);
-        btnrow.appendChild(stateBtn);
+      if (active) {
+        card.appendChild(el('div', { class: 'expnote' + (exp.exposed ? ' danger' : ''), html: (exp.exposed ? ICON.alert : ICON.check) + ' ' + esc(exposureLine(exp)) }));
+        // adopt / revert buttons
+        const btnrow = el('div', { class: 'btnrow' });
+        if (managed) {
+          const revertBtn = el('button', { class: 'btn', html: ICON.revert + ' Revert' });
+          revertBtn.addEventListener('click', () => this.doRevert(eng.engine, revertBtn));
+          const stateBtn = el('button', { class: 'btn primary', disabled: true, html: ICON.check + ' ' + (eng.adoptionState === 'cooperative' ? 'Cooperative' : 'Adopted') });
+          btnrow.appendChild(revertBtn);
+          btnrow.appendChild(stateBtn);
+        } else {
+          const coopBtn = el('button', { class: 'btn', text: 'Cooperative' });
+          coopBtn.addEventListener('click', () => this.doAdopt(eng.engine, true, coopBtn));
+          const adoptBtn = el('button', { class: 'btn primary', html: ICON.check + ' Adopt (Gateway)' });
+          adoptBtn.addEventListener('click', () => this.doAdopt(eng.engine, false, adoptBtn));
+          btnrow.appendChild(coopBtn);
+          btnrow.appendChild(adoptBtn);
+        }
+        card.appendChild(btnrow);
       } else {
-        const coopBtn = el('button', { class: 'btn', text: 'Cooperative' });
-        coopBtn.addEventListener('click', () => this.doAdopt(eng.engine, true, coopBtn));
-        const adoptBtn = el('button', { class: 'btn primary', html: ICON.check + ' Adopt (Gateway)' });
-        adoptBtn.addEventListener('click', () => this.doAdopt(eng.engine, false, adoptBtn));
-        btnrow.appendChild(coopBtn);
-        btnrow.appendChild(adoptBtn);
+        // A second running engine Saffev isn't forwarding to. Explain how to
+        // route it — no adopt/revert (only the active upstream is managed).
+        card.appendChild(el('div', { class: 'expnote', html: ICON.plug + ' Saffev is forwarding to the active engine. To trace this one, run an app through it with <span class="kv">saffev run</span>, or set <span class="kv">upstream = ' + esc(eng.publicPort) + '</span> in your config and restart.' }));
       }
-      card.appendChild(btnrow);
       return card;
     },
 
@@ -1434,10 +1494,16 @@
     sub: 'Local configuration — written to the on-device config file.',
     saving: false,
     tab: 'general',  // preserved across re-draws so a toggle doesn't jump tabs
+    _restartNote: null,       // set when a restart-required field was changed
+    _pendingUpdate: null,     // requested restart-required values (mode/ports)
 
     async render(view) {
       view.innerHTML = '';
       view.appendChild(loadingState('Loading settings…'));
+      // Fresh load = the running config; any prior pending change is either
+      // applied (post-restart) or moot.
+      this._restartNote = null;
+      this._pendingUpdate = null;
       let s;
       try { s = await api('/settings'); hideBanner(); }
       catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load settings', e.message || '')); return; }
@@ -1447,6 +1513,14 @@
 
     draw(view, s) {
       view.innerHTML = '';
+      // Reflect a pending restart-required change (mode/ports) in the controls,
+      // even though the backend still reports the currently-RUNNING value.
+      if (this._pendingUpdate) s = Object.assign({}, s, this._pendingUpdate);
+      if (this._restartNote) {
+        view.appendChild(el('div', { class: 'card reveal', style: 'margin-bottom:14px' }, [
+          el('div', { class: 'expnote warn-expnote', html: ICON.bolt + ' ' + esc(this._restartNote) }),
+        ]));
+      }
       const TABS = [
         { key: 'general', label: 'General', icon: ICON.server },
         { key: 'privacy', label: 'Privacy & data', icon: ICON.shield },
@@ -1486,7 +1560,7 @@
     panelPrivacy(panel, view, s) {
       // Privacy & storage
       const privCard = el('div', { class: 'card reveal' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Privacy & storage' })])]);
-      const sw = el('button', { class: 'switch' + (s.payloadStorage ? ' on' : ''), 'aria-label': 'Toggle payload storage' });
+      const sw = switchBtn(s.payloadStorage, 'Toggle payload storage');
       sw.addEventListener('click', async () => {
         const next = !sw.classList.contains('on');
         if (next) {
@@ -1506,23 +1580,27 @@
       if (s.payloadStorage) payRow.querySelector('.hint').classList.add('danger-note');
       privCard.appendChild(payRow);
       const retVal = retentionText(s.retention);
+      const retItems = [['age30', 'Age · 30 days'], ['age7', 'Age · 7 days'], ['age90', 'Age · 90 days'], ['size500', 'Size · 500 MB'], ['unlimited', 'Unlimited']].map(([v, t]) => ({ value: v, label: t }));
+      const curKey = retentionKey(s.retention);
+      // A config-file value outside the presets (e.g. Age · 14 days) would else
+      // silently show the first option — surface the actual current value.
+      if (!retItems.some((i) => i.value === curKey)) retItems.unshift({ value: curKey, label: retVal + ' (current)' });
       const retSel = dropdown(
-        [['age30', 'Age · 30 days'], ['age7', 'Age · 7 days'], ['age90', 'Age · 90 days'], ['size500', 'Size · 500 MB'], ['unlimited', 'Unlimited']].map(([v, t]) => ({ value: v, label: t })),
-        retentionKey(s.retention), (v) => this.save(view, { retention: retentionFromKey(v) }), { ariaLabel: 'Retention' }
+        retItems,
+        curKey, (v) => this.save(view, { retention: retentionFromKey(v) }), { ariaLabel: 'Retention' }
       );
       privCard.appendChild(setRow('Retention', 'How long exchanges are kept before pruning. Currently: ' + retVal + '.', el('div', { class: 'ctl' }, [retSel])));
       panel.appendChild(privCard);
 
       // PII masking (opt-in redaction, dry-run by default)
       const maskCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'PII masking' })])]);
-      const mEnable = el('button', { class: 'switch' + (s.maskingEnabled ? ' on' : ''), 'aria-label': 'Toggle PII masking' });
+      const mEnable = switchBtn(s.maskingEnabled, 'Toggle PII masking');
       mEnable.addEventListener('click', () => { const next = !mEnable.classList.contains('on'); this.save(view, { maskingEnabled: next }); });
       const enHint = s.maskingEnabled
         ? 'On — high-confidence PII detectors feed the masking pipeline.'
         : 'Off — observe-only (default). Traffic is never altered.';
       maskCard.appendChild(setRow('Enable masking', enHint, el('div', { class: 'ctl' }, [mEnable])));
-      const mDry = el('button', { class: 'switch' + (s.maskingDryRun ? ' on' : ''), 'aria-label': 'Toggle masking dry-run' });
-      if (!s.maskingEnabled) mDry.setAttribute('disabled', '');
+      const mDry = switchBtn(s.maskingDryRun, 'Toggle masking dry-run', { disabled: !s.maskingEnabled });
       mDry.addEventListener('click', async () => {
         if (!s.maskingEnabled) return;
         const next = !mDry.classList.contains('on');
@@ -1562,6 +1640,14 @@
       try {
         const updated = await api('/settings', { method: 'PUT', body: update });
         hideBanner();
+        // Mode/ports don't apply live — settings_put persists them but returns the
+        // STILL-RUNNING values, so the control would silently snap back. Surface a
+        // persistent "restart to apply" note and keep the requested value shown.
+        if (updated.restartRequired && updated.restartRequired.length) {
+          this._pendingUpdate = Object.assign({}, this._pendingUpdate, update);
+          this._restartNote = updated.restartNote
+            || ('Saved. Restart Saffev to apply: ' + updated.restartRequired.join(', ') + '.');
+        }
         this.draw(view, updated);
       } catch (e) { handleApiError(e); }
       this.saving = false;
@@ -1822,7 +1908,7 @@
     const up = pct > 0;
     return el('div', { class: 'delta ' + (up === goodUp ? 'up' : 'down'), text: (up ? '▲ ' : '▼ ') + Math.abs(pct) + '% vs prev' });
   }
-  const actionLabel = (a) => ({ Observed: 'Observed', WouldMask: 'Would mask (dry-run)', Masked: 'Masked' }[a] || a);
+  const actionLabel = (a) => ({ observed: 'Observed', would_mask: 'Would mask (dry-run)', masked: 'Masked' }[a] || a);
   function dataTable(headers, rows) {
     const gtc = headers.map((h, i) => (i === 0 ? 'minmax(120px,1.4fr)' : '1fr')).join(' ');
     const t = el('div', { class: 'ttable', style: '--gtc:' + gtc });
@@ -1928,7 +2014,7 @@
         anKpi('gold', ICON.bolt, 'Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'meta', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
         anKpi('brand', ICON.clock, 'Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '—', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
         anKpi('danger', ICON.shieldAlert, 'PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
-        anKpi(d.failedRequests > 0 ? 'danger' : 'gold', ICON.shieldAlert, 'Failed', fmtNum(d.failedRequests || 0), el('div', { class: 'meta', text: 'errors + HTTP ≥ 400' }), null),
+        anKpi(d.failedRequests > 0 ? 'danger' : 'gold', ICON.shieldAlert, 'Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
       ]);
       panel.appendChild(kpis);
       const cost = el('div', { class: 'card reveal an-cost' }, [
@@ -1938,7 +2024,13 @@
       ]);
       const activity = anCard('Activity', 'requests over time', C.lineArea({ series: [{ name: 'Requests', values: d.series.map((b) => b.requests), color: 'var(--brand)' }], xLabels: xl }));
       panel.appendChild(el('section', { class: 'an-grid' }, [activity, cost]));
+      // Failures over time — only worth a chart when there are any.
+      if ((d.failedRequests || 0) > 0) {
+        panel.appendChild(anCard('Failures over time', 'errors + HTTP ≥ 400', C.lineArea({ series: [{ name: 'Failed', values: d.series.map((b) => b.failed || 0), color: 'var(--danger)' }], xLabels: xl }), true));
+      }
       panel.appendChild(this.insightsCard(d));
+      // Coverage footer: what this window actually spans.
+      panel.appendChild(el('div', { class: 'an-asof', text: fmtNum(d.activeApps) + ' apps · ' + fmtNum(d.activeModels) + ' models · as of ' + new Date(d.generatedTs).toLocaleString() }));
     },
 
     insightsCard(d) {
@@ -2082,11 +2174,13 @@
     const txt = $('#enginePillText');
     const pill = $('#enginePill');
     if (!txt || !pill) return;
-    const eng = ev.engines && ev.engines[0];
+    const engines = ev.engines || [];
+    // The header pill reflects the ACTIVE (proxied) engine, not just the first.
+    const eng = engines.find((e) => e.isActive) || engines[0];
     if (!eng) { txt.textContent = 'no engine'; pill.className = 'pill mutedpill'; return; }
     const h = eng.health;
     pill.className = 'pill ' + (h === 'healthy' ? '' : h === 'starting' ? 'warnpill' : 'dangerpill');
-    txt.textContent = eng.engine + ' · ' + eng.adoptionState;
+    txt.textContent = (engineDisplayName(eng.engine) || eng.engine) + ' · ' + eng.adoptionState;
   }
   function setBusy(btn, busy) {
     if (!btn) return;

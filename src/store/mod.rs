@@ -737,6 +737,12 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
         wheres.push("(SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) > 0".into());
     }
 
+    if query.failed_only {
+        // A failed exchange: a transport error (error_kind set) or an HTTP error
+        // status (>= 400) on the joined response row.
+        wheres.push("(resp.error_kind IS NOT NULL OR resp.status >= 400)".into());
+    }
+
     let where_clause = if wheres.is_empty() {
         String::new()
     } else {
@@ -1046,6 +1052,8 @@ pub struct HistoryQuery {
     pub q: Option<String>,
     /// Only rows with at least one PII finding.
     pub pii_only: bool,
+    /// Only failed exchanges (transport error, or HTTP status >= 400).
+    pub failed_only: bool,
     /// Max rows to return.
     pub limit: Option<u32>,
     /// Return rows with `ts` strictly before this (millis) — cursor paging.
@@ -1326,6 +1334,7 @@ mod tests {
         let pii = store
             .history(HistoryQuery {
                 pii_only: true,
+                failed_only: false,
                 ..Default::default()
             })
             .await

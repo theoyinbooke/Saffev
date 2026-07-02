@@ -359,6 +359,7 @@ async fn collect_stats(cfg: &Config) -> Option<Stats> {
             .history(crate::store::HistoryQuery {
                 q: None,
                 pii_only: false,
+                failed_only: false,
                 limit: Some(1000),
                 before_ts: None,
             })
@@ -1619,6 +1620,7 @@ pub async fn logs(cli: &Cli, follow: bool) -> Result<()> {
                 .history(crate::store::HistoryQuery {
                     q: None,
                     pii_only: false,
+                    failed_only: false,
                     limit: Some(50),
                     before_ts: None,
                 })
@@ -1655,6 +1657,7 @@ pub async fn logs(cli: &Cli, follow: bool) -> Result<()> {
                     .history(crate::store::HistoryQuery {
                         q: None,
                         pii_only: false,
+                        failed_only: false,
                         limit: Some(200),
                         before_ts: None,
                     })
