@@ -281,6 +281,34 @@ impl Config {
         self.data_dir.join(DB_FILE_NAME)
     }
 
+    /// Display host for user-facing URLs: a loopback/unspecified bind renders as
+    /// `localhost`; an explicit external bind renders as its address.
+    pub fn display_host(&self) -> String {
+        let bind = self.ports.bind;
+        if bind.is_unspecified() || bind.is_loopback() {
+            "localhost".to_string()
+        } else {
+            bind.to_string()
+        }
+    }
+
+    /// Base URL apps point at for **native (Ollama)** traffic — `http://host:proxy`.
+    /// This is where `OLLAMA_HOST` / `OLLAMA_BASE_URL` should point.
+    pub fn proxy_base_url(&self) -> String {
+        format!("http://{}:{}", self.display_host(), self.ports.proxy)
+    }
+
+    /// **OpenAI-compatible** base URL — the proxy base plus `/v1`. LM Studio and
+    /// any OpenAI-SDK client point here (`OPENAI_BASE_URL`).
+    pub fn openai_base_url(&self) -> String {
+        format!("{}/v1", self.proxy_base_url())
+    }
+
+    /// The Studio web UI URL — `http://host:studio`.
+    pub fn studio_url(&self) -> String {
+        format!("http://{}:{}", self.display_host(), self.ports.studio)
+    }
+
     /// Load config from the default data dir, creating defaults if absent.
     ///
     /// On first run (no file yet) this writes out a default config so the file
@@ -461,24 +489,29 @@ impl Config {
     /// First run = no config file on disk yet. We pick a working layout instead
     /// of erroring on the well-known engine port:
     /// - mode = Cooperative (engine untouched; the app points at the proxy),
-    /// - upstream = the well-known engine port (11434), kept as the default,
+    /// - upstream = `upstream_port`, the engine's real port as detected by the
+    ///   caller (Ollama `11434` / LM Studio `1234`); kept exactly where it is,
     /// - proxy = the first *free* TCP port from [`FIRST_RUN_PROXY_CANDIDATES`]
     ///   (the engine's own 11434 is deliberately excluded so the proxy never
     ///   collides with it),
     /// - studio = the first free port scanning up from [`FIRST_RUN_STUDIO_SCAN_START`].
     ///
+    /// Passing [`DEFAULT_UPSTREAM_PORT`] reproduces the Ollama-default behavior
+    /// (used when nothing is detected, so a later-started engine still works).
+    ///
     /// Returns the resolved (validated) config. Does **not** persist it — the
     /// caller decides when to write so a dry/probe path can resolve without
     /// touching disk.
-    pub fn resolve_first_run(data_dir: PathBuf) -> Result<Config> {
+    pub fn resolve_first_run(data_dir: PathBuf, upstream_port: u16) -> Result<Config> {
         let mut cfg = Config::default();
         cfg.mode = Mode::Cooperative;
         cfg.data_dir = data_dir;
 
         let bind = cfg.ports.bind;
-        // Upstream stays at the well-known engine port (the whole point of
-        // Cooperative: leave the engine exactly where it is).
-        cfg.ports.upstream = DEFAULT_UPSTREAM_PORT;
+        // Upstream is left exactly where the engine already listens (the whole
+        // point of Cooperative). The caller detects Ollama vs LM Studio; we just
+        // record the port it found.
+        cfg.ports.upstream = upstream_port;
 
         // Proxy: first free candidate. Excludes 11434 by construction so it can
         // never land on the engine's port. Fall back to a non-colliding default
@@ -864,7 +897,8 @@ days = 14
     #[test]
     fn first_run_resolves_cooperative_with_distinct_free_ports() {
         let dir = unique_temp_dir("firstrun-resolve");
-        let cfg = Config::resolve_first_run(dir.clone()).expect("first-run resolves");
+        let cfg = Config::resolve_first_run(dir.clone(), DEFAULT_UPSTREAM_PORT)
+            .expect("first-run resolves");
 
         assert_eq!(cfg.mode, Mode::Cooperative);
         assert_eq!(cfg.data_dir, dir);
@@ -883,6 +917,31 @@ days = 14
         // The resolved layout must be internally valid (this is exactly what the
         // stock defaults fail — see defaults_are_cooperative_and_fail_validation).
         cfg.validate().expect("resolved first-run config validates");
+    }
+
+    /// First-run resolution against a detected **LM Studio** engine pins the
+    /// upstream to LM Studio's port (1234), not the Ollama default — and still
+    /// yields a valid, distinct proxy/studio layout.
+    #[test]
+    fn first_run_pins_lmstudio_upstream_when_detected() {
+        let dir = unique_temp_dir("firstrun-lmstudio");
+        let cfg = Config::resolve_first_run(dir.clone(), 1234).expect("first-run resolves");
+
+        assert_eq!(cfg.mode, Mode::Cooperative);
+        assert_eq!(
+            cfg.ports.upstream, 1234,
+            "upstream must follow the detected LM Studio port"
+        );
+        assert_ne!(
+            cfg.ports.proxy, 1234,
+            "proxy must not collide with upstream"
+        );
+        assert_ne!(
+            cfg.ports.studio, 1234,
+            "studio must not collide with upstream"
+        );
+        cfg.validate()
+            .expect("resolved LM Studio first-run config validates");
     }
 
     /// An existing user-authored config is left untouched: `config_file_exists`

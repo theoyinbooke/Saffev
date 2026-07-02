@@ -1,9 +1,11 @@
 //! CLI surface (04 §7.7) — mirrors `lms`/`ollama` ergonomics.
 //!
-//! `saffev adopt | status | start | stop | doctor | revert | logs | update`. Parsing is
-//! `clap` derive; each subcommand dispatches to a thin handler in [`commands`].
+//! `saffev adopt | status | start | stop | doctor | revert | logs | update | run
+//! | env | shell`. Parsing is `clap` derive; each subcommand dispatches to a thin
+//! handler in [`commands`].
 //! Output uses [`crate::ui::palette`] for the calm, status-dot-prefixed voice.
 
+pub mod capture;
 pub mod commands;
 pub mod daemon;
 
@@ -95,6 +97,44 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Run a command with its LLM traffic routed through Saffev (zero config).
+    ///
+    /// Injects the engine base-URL env vars (Ollama + OpenAI-compatible, so it
+    /// works with Ollama *and* LM Studio) into the child process, so its model
+    /// calls flow through the proxy and get traced — no per-app config edits.
+    /// Everything after `--` is the command and its arguments, e.g.
+    /// `saffev run -- python app.py`.
+    Run {
+        /// Start the Saffev daemon first if it isn't already running.
+        #[arg(long)]
+        start: bool,
+        /// Fail instead of running the command when the daemon isn't reachable
+        /// (default: warn and run anyway, so your work is never blocked).
+        #[arg(long)]
+        require: bool,
+        /// The command to run and its arguments (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Print shell `export` lines that route this shell's LLM traffic through
+    /// Saffev. Use as `eval "$(saffev env)"`.
+    Env {
+        /// Shell dialect to format for: bash | zsh | fish | powershell.
+        /// Auto-detected from `$SHELL` when omitted.
+        #[arg(long)]
+        shell: Option<String>,
+        /// Emit a JSON object of the variables instead of shell exports.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Launch an interactive shell with LLM traffic routed through Saffev.
+    ///
+    /// Everything you run from that shell is traced until you `exit`.
+    Shell {
+        /// Start the Saffev daemon first if it isn't already running.
+        #[arg(long)]
+        start: bool,
+    },
 }
 
 /// Parse argv and dispatch to the matching command handler.
@@ -120,5 +160,12 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Revert { engine } => commands::revert(&cli, engine).await,
         Command::Logs { follow } => commands::logs(&cli, follow).await,
         Command::Update { check } => commands::update(&cli, check).await,
+        Command::Run {
+            start,
+            require,
+            ref command,
+        } => commands::run_cmd(&cli, start, require, command.clone()).await,
+        Command::Env { ref shell, json } => commands::env_cmd(&cli, shell.clone(), json).await,
+        Command::Shell { start } => commands::shell_cmd(&cli, start).await,
     }
 }

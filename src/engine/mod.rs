@@ -165,6 +165,18 @@ mod tests {
         assert!(!ctrl.can_adopt());
     }
 
+    /// On Linux + Gateway the selected controller is the systemd one — which
+    /// *can* adopt (relocate the engine + own the public port). This guards the
+    /// wiring the `adopt`/`revert` commands rely on for transparent capture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_controller_is_systemd_in_gateway_mode_on_linux() {
+        let mut cfg = Config::default();
+        cfg.mode = crate::config::Mode::Gateway;
+        let ctrl = default_controller(&cfg);
+        assert!(ctrl.can_adopt());
+    }
+
     #[test]
     fn journal_entry_serde_round_trip() {
         // The journal is what revert replays; its serde shape is load-bearing.

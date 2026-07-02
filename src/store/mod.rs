@@ -385,6 +385,17 @@ impl Store {
         self.read(move |conn| query_history(conn, &query)).await
     }
 
+    /// Total number of requests ever recorded. Cheap `COUNT(*)`; used by the
+    /// Studio to distinguish "no traffic captured yet" (show onboarding) from a
+    /// merely empty recent window.
+    pub async fn request_count(&self) -> Result<u64> {
+        self.read(|conn| {
+            let n: i64 = conn.query_row("SELECT count(*) FROM requests", [], |row| row.get(0))?;
+            Ok(n.max(0) as u64)
+        })
+        .await
+    }
+
     /// Fetch the full payload for one record (History detail; only when stored).
     pub async fn payload(&self, request_id: &str) -> Result<Option<Payload>> {
         let request_id = request_id.to_string();

@@ -17,7 +17,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use crate::cli::{daemon, Cli, EngineArg};
+use crate::cli::{capture, daemon, Cli, EngineArg};
 use crate::config::{Config, HandoverPolicy, Mode, Retention};
 use crate::ui::palette::{ColorMode, Level, Painter};
 use crate::Result;
@@ -118,6 +118,17 @@ fn mode_str(mode: Mode) -> &'static str {
     match mode {
         Mode::Gateway => "gateway",
         Mode::Cooperative => "cooperative",
+    }
+}
+
+/// One-line explanation of what a mode actually *captures* — the thing users
+/// most often miss. Cooperative only sees traffic sent to the proxy port (so
+/// apps must be pointed at it, e.g. via `saffev run`); Gateway owns the engine's
+/// well-known port and captures everything transparently.
+fn capture_note(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Cooperative => "captures traffic sent to the proxy · route an app with `saffev run`",
+        Mode::Gateway => "captures all engine traffic transparently · apps need no change",
     }
 }
 
@@ -225,6 +236,8 @@ pub async fn status(cli: &Cli) -> Result<()> {
         p.label("mode"),
         p.value(mode_str(cfg.mode)),
     );
+    // Capture clarity: spell out exactly what this mode does and doesn't see.
+    println!("{}      {}", p.muted("·"), p.muted(capture_note(cfg.mode)));
 
     // --- privacy line -----------------------------------------------------
     let privacy_state = if cfg.payload_storage {
@@ -312,6 +325,12 @@ pub async fn status(cli: &Cli) -> Result<()> {
         }
         None => {
             println!("{} {}", p.prompt("~"), p.muted("no activity recorded yet"),);
+            println!(
+                "{} {} {}",
+                p.muted("·"),
+                p.muted("trace an app:"),
+                p.value("saffev run -- <your app>"),
+            );
         }
     }
 
@@ -417,7 +436,20 @@ pub async fn adopt(cli: &Cli, engine: EngineArg, cooperative: bool) -> Result<()
     .await
     .unwrap_or_default();
 
-    let can_gateway = !cooperative && controller_can_adopt(&cfg);
+    let mut can_gateway = !cooperative && controller_can_adopt(&cfg);
+
+    // Gateway/transparent adoption is Ollama-only: it relies on a clean systemd
+    // rebind of the engine's service, which LM Studio (a GUI app with no
+    // equivalent unit) doesn't offer. LM Studio is fully supported in Cooperative
+    // mode — point its OpenAI base URL at the proxy (or use `saffev run`).
+    if engine == EngineArg::Lmstudio && can_gateway {
+        println!(
+            "{} {}",
+            p.dot(Level::Warn),
+            p.warn("Gateway adoption isn't supported for LM Studio — using Cooperative mode."),
+        );
+        can_gateway = false;
+    }
 
     if !can_gateway {
         // Cooperative path: no system changes — print the copy-paste setup.
@@ -470,10 +502,16 @@ pub async fn adopt(cli: &Cli, engine: EngineArg, cooperative: bool) -> Result<()
 
     let db_path = cfg.db_path();
     let info_for_adopt = info.clone();
+    let cfg_for_adopt = cfg.clone();
     let journal = guard("adoption", async move {
         let store = crate::store::Store::open(&db_path).await?;
-        let controller = crate::engine::cooperative::CooperativeController;
-        crate::engine::adopt::run_adoption(&controller, &info_for_adopt, &store).await
+        // Use the mode-appropriate controller: on Linux + Gateway this is the
+        // SystemdController (relocates the engine to the shadow port, registers
+        // Saffev on the public port — transparent capture); everywhere else it's
+        // the cooperative no-op. `can_gateway` above already gates this branch to
+        // Gateway mode, so we never touch the system in Cooperative mode.
+        let controller = crate::engine::default_controller(&cfg_for_adopt);
+        crate::engine::adopt::run_adoption(controller.as_ref(), &info_for_adopt, &store).await
     })
     .await;
 
@@ -532,6 +570,7 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
 
     let db_path = cfg.db_path();
     let target = name.to_string();
+    let cfg_for_revert = cfg.clone();
     let result = guard("revert", async move {
         let store = crate::store::Store::open(&db_path).await?;
         let engines = store.engines().await?;
@@ -541,8 +580,11 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
         };
         let journal: Vec<crate::engine::JournalEntry> =
             serde_json::from_str(&record.journal_json).unwrap_or_default();
-        let controller = crate::engine::cooperative::CooperativeController;
-        crate::engine::EngineController::revert(&controller, &journal).await?;
+        // Mode-appropriate controller so a Gateway adoption is undone by the
+        // SystemdController (removes the drop-in + service, restores the engine
+        // to the public port); cooperative no-op otherwise.
+        let controller = crate::engine::default_controller(&cfg_for_revert);
+        crate::engine::EngineController::revert(controller.as_ref(), &journal).await?;
         Ok(true)
     })
     .await;
@@ -584,6 +626,33 @@ fn start_config_path(cli: &Cli) -> std::path::PathBuf {
     }
 }
 
+/// Detect which local engine to forward to on first run.
+///
+/// Probes the well-known engine ports ([`detect::KNOWN_PORTS`] — Ollama `11434`
+/// first, then LM Studio `1234`) and returns the port of the first **recognized**
+/// engine, preferring Ollama when both are up. An open-but-unrecognized port is
+/// ignored. When nothing recognizable answers, falls back to the Ollama default
+/// so a later-started engine still works without a config edit.
+async fn detect_upstream_port() -> u16 {
+    use crate::engine::detect;
+    use crate::engine::EngineKind;
+
+    let mut lmstudio_port: Option<u16> = None;
+    for &port in detect::KNOWN_PORTS {
+        if let Ok(Some(info)) = detect::probe_port(port).await {
+            match info.engine {
+                // Ollama wins outright (and KNOWN_PORTS lists it first anyway).
+                EngineKind::Ollama => return port,
+                EngineKind::LmStudio => {
+                    lmstudio_port.get_or_insert(port);
+                }
+                EngineKind::Unknown => {}
+            }
+        }
+    }
+    lmstudio_port.unwrap_or(crate::config::DEFAULT_UPSTREAM_PORT)
+}
+
 /// The config `start` should run with, plus whether this was a true first run.
 ///
 /// First run = no config file exists yet at the resolved path. We then
@@ -603,7 +672,13 @@ async fn resolve_start_config(cli: &Cli) -> (Config, bool) {
             .map(|d| d.to_path_buf())
             .unwrap_or_else(Config::default_data_dir);
 
-        match Config::resolve_first_run(data_dir) {
+        // Detect which local engine is actually running so Cooperative forwards
+        // to the right port — Ollama (11434) or LM Studio (1234). Falls back to
+        // the Ollama default when nothing is up yet, so a later-started engine
+        // still works without a config edit.
+        let upstream_port = detect_upstream_port().await;
+
+        match Config::resolve_first_run(data_dir, upstream_port) {
             Ok(cfg) => {
                 // Persist so subsequent runs are stable + fast. Best-effort: a
                 // failed write just means the next run re-resolves (still works).
@@ -944,6 +1019,15 @@ async fn print_start_summary(p: &Painter, cfg: &Config, first_run: bool) {
             );
         }
     }
+
+    // The easy way to route an app's traffic here — no per-app config edits.
+    // Works for Ollama and LM Studio alike.
+    println!(
+        "{} {} {}",
+        p.muted("·"),
+        p.muted("trace any app:"),
+        p.value("saffev run -- <your app>"),
+    );
 }
 
 /// Best-effort: open `url` in the OS default browser. Never blocks (spawns and
@@ -1305,6 +1389,18 @@ pub async fn doctor(cli: &Cli) -> Result<()> {
             );
         }
     }
+
+    // --- capture mode -----------------------------------------------------
+    // Make the Cooperative-vs-Gateway distinction explicit: which traffic is
+    // actually being captured, and (in Cooperative) how to route an app.
+    println!(
+        "{} {} {} {} {}",
+        p.dot(Level::Ok),
+        p.label("mode"),
+        p.value(mode_str(cfg.mode)),
+        p.muted("·"),
+        p.muted(capture_note(cfg.mode)),
+    );
 
     // --- port-conflict check on the public proxy port ---------------------
     let proxy_port = cfg.ports.proxy;
@@ -1713,6 +1809,227 @@ pub async fn update(cli: &Cli, check_only: bool) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Zero-config capture: `saffev run` / `env` / `shell`
+// ---------------------------------------------------------------------------
+
+/// Load the config the running daemon uses. Returns `None` on a true first run
+/// (no config file yet): the stock default proxy port is the *engine's* port, so
+/// injecting from a default config would misroute an app — callers must guide the
+/// user to `saffev start` instead.
+fn load_running_config(cli: &Cli) -> Option<Config> {
+    let path = start_config_path(cli);
+    if !Config::config_file_exists(&path) {
+        return None;
+    }
+    Config::load_from(&path).ok()
+}
+
+/// Resolve the proxy config to inject into a child, honoring `--start`/`--require`.
+///
+/// Fail-open by design: we inject **only when the proxy is actually reachable**,
+/// so we never point an app at a dead port and break its model calls. If the
+/// proxy is down we (a) exit non-zero under `--require`, or (b) warn and return
+/// `None` so the command still runs — just untraced. With `auto_start` we start
+/// the daemon in the background and wait briefly for it to answer.
+async fn resolve_capture_target(
+    cli: &Cli,
+    auto_start: bool,
+    require: bool,
+    p: &Painter,
+) -> Option<Config> {
+    if let Some(c) = load_running_config(cli) {
+        if port_listening(c.ports.bind, c.ports.proxy).await {
+            return Some(c);
+        }
+    }
+
+    if auto_start {
+        println!("{} {}", p.muted("·"), p.muted("starting Saffev…"));
+        // Background start (no browser); first run also persists a fresh config.
+        let _ = start(cli, false, true).await;
+        if let Some(c) = load_running_config(cli) {
+            for _ in 0..20 {
+                if port_listening(c.ports.bind, c.ports.proxy).await {
+                    return Some(c);
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+
+    if require {
+        println!(
+            "{} {} {}",
+            p.dot(Level::Err),
+            p.label("run"),
+            p.error("Saffev proxy is not reachable (--require) — run `saffev start` first."),
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "{} {}",
+        p.dot(Level::Warn),
+        p.warn("Saffev proxy isn't reachable — running without tracing (try `saffev start`, or pass --start)."),
+    );
+    None
+}
+
+/// Apply the capture env (+ a placeholder OpenAI key when the user has none) to a
+/// child process command, and print a one-line "tracing via …" confirmation.
+fn apply_capture_env(c: &mut tokio::process::Command, cfg: &Config, p: &Painter, suffix: &str) {
+    for (k, v) in capture::capture_env(cfg) {
+        c.env(k, v);
+    }
+    // OpenAI SDKs refuse to construct a client without *some* key. Set a
+    // placeholder only when the user hasn't provided one (never clobber a real key).
+    if std::env::var_os("OPENAI_API_KEY").is_none() {
+        c.env("OPENAI_API_KEY", capture::PLACEHOLDER_OPENAI_KEY);
+    }
+    println!(
+        "{} {} {}",
+        p.dot(Level::Ok),
+        p.label("tracing"),
+        p.muted(&format!("via {}{}", cfg.proxy_base_url(), suffix)),
+    );
+}
+
+/// `saffev run -- <cmd…>` — run a command with LLM traffic routed through Saffev.
+pub async fn run_cmd(
+    cli: &Cli,
+    auto_start: bool,
+    require: bool,
+    command: Vec<String>,
+) -> Result<()> {
+    let p = painter(cli);
+
+    let (program, args) = match command.split_first() {
+        Some((prog, rest)) => (prog.clone(), rest.to_vec()),
+        None => {
+            // clap enforces required=true; stay defensive.
+            println!(
+                "{} {}",
+                p.dot(Level::Err),
+                p.error("nothing to run — usage: saffev run -- <command> [args…]"),
+            );
+            return Ok(());
+        }
+    };
+
+    let target = resolve_capture_target(cli, auto_start, require, &p).await;
+
+    let mut c = tokio::process::Command::new(&program);
+    c.args(&args);
+    if let Some(cfg) = &target {
+        apply_capture_env(&mut c, cfg, &p, "");
+    }
+
+    // Child inherits our stdio. Block on it and propagate its exit code so
+    // `saffev run` is transparent in scripts and pipelines.
+    match c.status().await {
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(e) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("run"),
+                p.error(&format!("could not run `{program}`: {e}")),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `saffev shell` — launch an interactive shell with traffic routed through Saffev.
+pub async fn shell_cmd(cli: &Cli, auto_start: bool) -> Result<()> {
+    let p = painter(cli);
+    let target = resolve_capture_target(cli, auto_start, false, &p).await;
+
+    let program = interactive_shell();
+    let mut c = tokio::process::Command::new(&program);
+    if let Some(cfg) = &target {
+        apply_capture_env(&mut c, cfg, &p, " — type `exit` to stop");
+    } else {
+        println!(
+            "{} {}",
+            p.dot(Level::Warn),
+            p.warn("launching a normal shell (no tracing)."),
+        );
+    }
+
+    match c.status().await {
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(e) => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("shell"),
+                p.error(&format!("could not launch `{program}`: {e}")),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `saffev env` — print eval-able shell exports (stdout stays pure; notes go to
+/// stderr) that route this shell's LLM traffic through Saffev.
+pub async fn env_cmd(cli: &Cli, shell: Option<String>, json: bool) -> Result<()> {
+    let cfg = match load_running_config(cli) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "# Saffev isn't set up yet — run `saffev start` first, then: eval \"$(saffev env)\""
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Notes go to stderr so `eval "$(saffev env)"` only ever consumes exports.
+    if !port_listening(cfg.ports.bind, cfg.ports.proxy).await {
+        eprintln!(
+            "# note: Saffev proxy ({}) isn't responding yet — start it with `saffev start`.",
+            cfg.proxy_base_url()
+        );
+    }
+
+    if json {
+        println!("{}", capture::render_env_json(&cfg));
+        return Ok(());
+    }
+
+    let fmt = match shell {
+        Some(s) => match capture::EnvFormat::parse(&s) {
+            Some(f) => f,
+            None => {
+                eprintln!("# unknown --shell '{s}' (use bash|zsh|fish|powershell)");
+                std::process::exit(2);
+            }
+        },
+        None => default_env_format(),
+    };
+    print!("{}", capture::render_env(&cfg, fmt));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn default_env_format() -> capture::EnvFormat {
+    capture::EnvFormat::PowerShell
+}
+#[cfg(not(windows))]
+fn default_env_format() -> capture::EnvFormat {
+    capture::EnvFormat::detect()
+}
+
+#[cfg(windows)]
+fn interactive_shell() -> String {
+    std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+}
+#[cfg(not(windows))]
+fn interactive_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
 /// Apply an available update, rendering progress + the no-receipt guidance.
 /// Never panics: the typed [`crate::update::UpdateError`] is matched and printed.
 async fn apply_update(p: &Painter, current: &str) {
@@ -1895,5 +2212,16 @@ mod tests {
         assert!(out.is_none());
         let ok: Option<u32> = guard("ok", async { Ok(7u32) }).await;
         assert_eq!(ok, Some(7));
+    }
+
+    #[test]
+    fn capture_note_distinguishes_modes() {
+        let coop = capture_note(Mode::Cooperative);
+        let gw = capture_note(Mode::Gateway);
+        assert_ne!(coop, gw);
+        // Cooperative must point users at how to route an app; Gateway must say
+        // it's transparent. These strings are the fix for "the step people miss".
+        assert!(coop.contains("proxy") && coop.contains("saffev run"));
+        assert!(gw.contains("all engine traffic") && gw.contains("transparent"));
     }
 }
