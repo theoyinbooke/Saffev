@@ -127,6 +127,25 @@ a{color:inherit}
 .kpi.hero.dangerhero .check{background:var(--danger)}
 .kpi.hero .check svg{width:17px;height:17px}
 
+/* ---------- Live cockpit ---------- */
+/* Thin metric strip: hairline-separated figures (the design's "metric cells").
+   Numbers are the point, so labels/subs are quiet mono and the value is big + tabular. */
+.statbar{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;margin-bottom:16px}
+@media(max-width:760px){.statbar{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--surface);padding:15px 20px;display:flex;flex-direction:column;gap:3px}
+.stat-l{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3)}
+.stat-v{font-family:var(--font-display);font-weight:600;font-size:1.75rem;letter-spacing:-.03em;line-height:1.05;font-variant-numeric:tabular-nums}
+.stat-v small{font-family:var(--font-body);font-size:.82rem;font-weight:500;color:var(--text-3);letter-spacing:0}
+.stat-s{font-family:var(--font-mono);font-size:.66rem;color:var(--text-3)}
+/* The stream is the hero — it fills the height and scrolls internally; the slim
+   rail beside it carries "now" context (exposure, engine, privacy). */
+.cockpit{display:grid;grid-template-columns:1.75fr .92fr;gap:16px;align-items:start}
+.streamcard{display:flex;flex-direction:column;min-height:calc(100vh - 288px)}
+.streamcard .ttable{flex:1;min-height:0;display:flex;flex-direction:column}
+.streamcard #stream{flex:1;min-height:0;overflow-y:auto}
+.rail{display:flex;flex-direction:column;gap:16px}
+@media(max-width:1050px){.cockpit{grid-template-columns:1fr}.streamcard{min-height:0}.streamcard #stream{max-height:60vh}}
+
 /* ---------- two-column body ---------- */
 .body{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;align-items:start}
 .livebody{align-items:stretch}

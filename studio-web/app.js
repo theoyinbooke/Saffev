@@ -760,18 +760,24 @@
       view.innerHTML = '';
       // Onboarding slot · filled when no traffic has ever been captured.
       view.appendChild(el('div', { id: 'onboard' }));
-      // KPI section
-      const kpis = el('section', { class: 'grid kpis' }, [
-        kpiCard('brand', ICON.pulse, 'Requests today', el('div', { class: 'val num', id: 'kpiReq', text: '·' }), el('div', { class: 'meta', id: 'kpiReqMeta', text: 'since midnight' })),
-        kpiCard('gold', ICON.clock, 'Latency p50', el('div', { class: 'val num', id: 'kpiLat', html: '·' }), el('div', { class: 'meta mono', id: 'kpiLatMeta', text: 'recent window' })),
-        kpiCard('danger', ICON.shieldAlert, 'PII findings', el('div', { class: 'val num', id: 'kpiPii', text: '·' }), el('div', { class: 'meta', id: 'kpiPiiMeta', text: 'observe-only · today' })),
-        exposureHeroPlaceholder(),
-      ]);
-      kpis.className = 'grid kpis reveal';
-      view.appendChild(kpis);
 
-      // body: stream + side panels
-      const streamCard = el('div', { class: 'card reveal', style: 'animation-delay:.3s' }, [
+      // Thin metric strip — a single hairline-separated band of figures, so the
+      // stream (not the KPIs) is the hero. Matches the design's "metric cells".
+      const stat = (id, label, sub, valHtml) => el('div', { class: 'stat' }, [
+        el('div', { class: 'stat-l', text: label }),
+        el('div', { class: 'stat-v num', id, html: valHtml }),
+        el('div', { class: 'stat-s', text: sub }),
+      ]);
+      view.appendChild(el('section', { class: 'statbar reveal' }, [
+        stat('kpiReq', 'Requests', 'since midnight', '·'),
+        stat('kpiLat', 'Latency p50', 'recent window', '·'),
+        stat('kpiPii', 'PII findings', 'observing · today', '·'),
+        stat('kpiPulse', 'Throughput', 'req / min · live', '0'),
+      ]));
+
+      // Cockpit — the traffic stream is the hero (fills the height); a slim rail
+      // carries "now" context: exposure, engine, and the privacy lens.
+      const streamCard = el('div', { class: 'card streamcard reveal', style: 'animation-delay:.06s' }, [
         el('div', { class: 'hrow' }, [
           el('h3', { text: 'Traffic stream' }),
           el('div', { class: 'spacer' }),
@@ -782,23 +788,32 @@
           el('div', { class: 'stream', id: 'stream' }),
         ]),
       ]);
-
-      const side = el('div', { class: 'grid', style: 'align-content:start;gap:16px' }, [
-        el('div', { class: 'card reveal', id: 'livePrivacy', style: 'animation-delay:.36s' }, [
+      const rail = el('div', { class: 'rail reveal', style: 'animation-delay:.12s' }, [
+        exposureHeroPlaceholder(),
+        el('div', { class: 'card engine', id: 'liveEngine' }, [el('div', { class: 'state sm', text: 'Loading engine…' })]),
+        el('div', { class: 'card', id: 'livePrivacy' }, [
           el('div', { class: 'hrow' }, [el('h3', { text: 'Privacy lens' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'observe' })]),
           el('div', { id: 'livePrivacyBody' }, [el('div', { class: 'state sm', text: 'No findings yet.' })]),
         ]),
-        el('div', { class: 'card engine reveal', id: 'liveEngine', style: 'animation-delay:.42s' }, [
-          el('div', { class: 'state sm', text: 'Loading engine…' }),
-        ]),
       ]);
-
-      const body = el('section', { class: 'body livebody' }, [streamCard, side]);
-      view.appendChild(body);
+      view.appendChild(el('section', { class: 'cockpit' }, [streamCard, rail]));
       view.appendChild(cliBlock());
 
       await this.refresh();
       this.connectStream();
+      this.startPulse();
+    },
+
+    startPulse() {
+      this._pulse = this._pulse || [];
+      this.renderPulse();
+      this._pulseTimer = setInterval(() => this.renderPulse(), 1500);
+    },
+    renderPulse() {
+      const now = Date.now();
+      this._pulse = (this._pulse || []).filter((t) => now - t < 60000);
+      const c = $('#kpiPulse');
+      if (c) c.textContent = String(this._pulse.length);
     },
 
     async refresh() {
@@ -819,7 +834,7 @@
         if (stream) {
           stream.innerHTML = '';
           this.seen = {};
-          const recent = (snap.recent || []).slice(0, 8);
+          const recent = (snap.recent || []).slice(0, 14);
           if (recent.length === 0) {
             stream.appendChild(el('div', { class: 'state sm', style: 'padding:24px 6px', text: 'Waiting for traffic… run a prompt in any local-LLM app.' }));
           } else {
@@ -1081,11 +1096,13 @@
       if (msg.type === 'requestStarted') {
         // Traffic has arrived · retire the onboarding card for good.
         if (this._needOnboard) { this._needOnboard = false; this.renderOnboard(false); }
+        // Feed the throughput pulse (req/min over a rolling 60s window).
+        this._pulse = this._pulse || []; this._pulse.push(Date.now()); this.renderPulse();
         const it = msg.item;
         const row = reqRow(it, { columns: LIVE_COLS, streaming: it.stream, enter: true });
         this.seen[it.id] = row;
         stream.prepend(row);
-        while (stream.children.length > 8) {
+        while (stream.children.length > 14) {
           const last = stream.lastElementChild;
           if (last && last.dataset.id) delete this.seen[last.dataset.id];
           last.remove();
@@ -1130,7 +1147,7 @@
       updatePiiBadge(this.kpis.pii);
     },
 
-    teardown() { this.disconnectStream(); },
+    teardown() { this.disconnectStream(); if (this._pulseTimer) { clearInterval(this._pulseTimer); this._pulseTimer = null; } },
   };
 
   function exposureHeroPlaceholder() {
