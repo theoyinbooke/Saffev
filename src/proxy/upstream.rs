@@ -16,6 +16,8 @@
 //! - **Decoupled tee**: enqueues are best-effort drop-oldest; the logger never
 //!   backpressures the client.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -107,11 +109,11 @@ pub async fn forward_streaming(
     // before it reaches the engine — the high-value case (keep PII off the
     // model). Fail-open: any error here yields the ORIGINAL body + `Observed`.
     //
-    // SCOPE (v1): we mask the REQUEST body here (the full body is in hand). For
-    // NON-STREAMING responses, masking would happen on the response path; for
-    // STREAMING responses it is deferred because a PII span can straddle two
-    // chunks and we must never buffer the stream (the transparent-streaming
-    // invariant). See `mask_request_body` and the response path for details.
+    // SCOPE: we mask the REQUEST body here (the full body is in hand).
+    // NON-STREAMING responses are masked on the response path (buffered + redacted
+    // — see `buffer_and_mask_response`). STREAMING responses stay deferred: a PII
+    // span can straddle two chunks and we must never buffer a stream (the
+    // transparent-streaming invariant).
     let (forward_bytes, mask_action) = mask_request_body(state, &req_bytes);
 
     // Tee the request start with the ORIGINAL (unredacted) body so the logger
@@ -153,13 +155,17 @@ pub async fn forward_streaming(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, url = %url, "proxy: upstream request failed");
-            // Mark the exchange finished so the logger doesn't wait forever.
+            // Mark the exchange finished so the logger doesn't wait forever, and
+            // record WHY it failed: the engine was never reached.
             tee_drop_oldest(
                 state,
                 TeeEvent::ResponseFinished {
                     id: id.clone(),
                     ttft_ms: None,
                     total_ms: Some(elapsed_ms(start)),
+                    status: None,
+                    error_kind: Some("upstream_unreachable".to_string()),
+                    resp_mask_action: MaskAction::Observed,
                 },
             );
             return bad_gateway(&e);
@@ -170,6 +176,22 @@ pub async fn forward_streaming(
     let status = upstream_resp.status();
     let resp_headers = forward_response_headers(upstream_resp.headers());
 
+    // Non-streaming response masking (04 §7.6). When masking is LIVE and the
+    // upstream returned a single JSON body (not an SSE/NDJSON stream), buffer the
+    // whole body and redact response-side PII before forwarding — the response
+    // analogue of request masking. A non-streamed JSON response is not a stream,
+    // so this does NOT violate the transparent-streaming invariant. STREAMING
+    // responses are never buffered here (a span can straddle chunks) — response
+    // masking stays deferred for them; they observe-only.
+    let masking_live = {
+        let m = &state.config.load().masking;
+        m.enabled && !m.dry_run
+    };
+    if masking_live && response_is_json(upstream_resp.headers()) {
+        return buffer_and_mask_response(state, id, start, status, resp_headers, upstream_resp)
+            .await;
+    }
+
     // Wrap the upstream byte stream so each chunk is teed as it is forwarded —
     // unbuffered, token-by-token. This is the streaming-passthrough core.
     //
@@ -178,6 +200,12 @@ pub async fn forward_streaming(
     // types here — keeping `TeeEvent` unchanged.
     let tee = state.tee.clone();
     let stream_id = id.clone();
+
+    // Shared flag: set if the response stream errors mid-flight, read by the
+    // FinishGuard so the recorded outcome is `stream_error` rather than a clean
+    // finish (the client already got a truncated stream — fail-open).
+    let stream_errored = Arc::new(AtomicBool::new(false));
+    let errored_for_stream = stream_errored.clone();
 
     let byte_stream = upstream_resp.bytes_stream();
     let mapped = byte_stream.map(move |item| match item {
@@ -192,6 +220,7 @@ pub async fn forward_streaming(
             // client sees a truncated stream (fail-open: we do not panic, and the
             // bytes already delivered remain byte-identical).
             tracing::warn!(error = %e, "proxy: upstream stream error mid-flight");
+            errored_for_stream.store(true, Ordering::Relaxed);
             Err(std::io::Error::other(e))
         }
     });
@@ -210,6 +239,8 @@ pub async fn forward_streaming(
         id: finish_id,
         start,
         sent: false,
+        status: Some(status.as_u16()),
+        errored: stream_errored,
     };
     let guarded = StreamWithFinish {
         inner: mapped,
@@ -226,6 +257,97 @@ pub async fn forward_streaming(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "proxy: failed to build streaming response; failing open");
+            (StatusCode::BAD_GATEWAY, "saffev: response build error").into_response()
+        }
+    }
+}
+
+/// True when the upstream response is a single JSON body (safe to buffer +
+/// mask), as opposed to a stream (`text/event-stream` SSE / `application/x-ndjson`
+/// NDJSON). Absent/other content types are treated as NOT bufferable (observe).
+fn response_is_json(headers: &reqwest::header::HeaderMap) -> bool {
+    match headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(ct) => {
+            let ct = ct.to_ascii_lowercase();
+            ct.contains("application/json") && !ct.contains("ndjson")
+        }
+        None => false,
+    }
+}
+
+/// Buffer a NON-streamed response body, redact response-side PII (live masking),
+/// forward the redacted body, and tee the ORIGINAL for logging. Only reached when
+/// masking is live and the response is a single JSON body — see the call site.
+/// Fail-open: a read error finalizes the exchange and returns a 502.
+async fn buffer_and_mask_response(
+    state: &ProxyState,
+    id: String,
+    start: Instant,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+    upstream_resp: reqwest::Response,
+) -> Response {
+    let body_bytes = match upstream_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "proxy: failed to read response body for masking; failing open");
+            tee_drop_oldest(
+                state,
+                TeeEvent::ResponseFinished {
+                    id,
+                    ttft_ms: None,
+                    total_ms: Some(elapsed_ms(start)),
+                    status: Some(status.as_u16()),
+                    error_kind: Some("stream_error".to_string()),
+                    resp_mask_action: MaskAction::Observed,
+                },
+            );
+            return (StatusCode::BAD_GATEWAY, "saffev: response read error").into_response();
+        }
+    };
+
+    // Decide + apply response masking. Live-only here (dry-run/off never reach
+    // this path), so the action is `Masked` (redacted) or `Observed` (nothing
+    // maskable). Fail-open: worst case forwards the original bytes.
+    let (forward_bytes, resp_mask_action) = {
+        let cfg = state.config.load();
+        mask_body_with(
+            &cfg.masking,
+            &state.detector,
+            crate::brain::Side::Response,
+            &body_bytes,
+        )
+    };
+
+    // Tee the ORIGINAL (unredacted) body so the logger records the true findings
+    // + offsets, then finalize — carrying the mask action so response findings are
+    // stamped `masked`/`observed` to match what we forwarded.
+    send_chunk(&state.tee, &id, body_bytes.clone());
+    tee_drop_oldest(
+        state,
+        TeeEvent::ResponseFinished {
+            id: id.clone(),
+            ttft_ms: None,
+            total_ms: Some(elapsed_ms(start)),
+            status: Some(status.as_u16()),
+            error_kind: None,
+            resp_mask_action,
+        },
+    );
+
+    // content-length was stripped as hop-by-hop, so the redacted length is
+    // re-derived from the body we set.
+    let mut response = Response::builder().status(status);
+    if let Some(h) = response.headers_mut() {
+        *h = resp_headers;
+    }
+    match response.body(Body::from(forward_bytes)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "proxy: failed to build masked response; failing open");
             (StatusCode::BAD_GATEWAY, "saffev: response build error").into_response()
         }
     }
@@ -297,15 +419,25 @@ fn mask_request_body(state: &ProxyState, body: &Bytes) -> (Bytes, MaskAction) {
     // config snapshot on every request so a Studio settings change applies live,
     // without a restart. `.load()` is a cheap RCU read — fine on the hot path.
     let cfg = state.config.load();
-    mask_body_with(&cfg.masking, &state.detector, body)
+    mask_body_with(
+        &cfg.masking,
+        &state.detector,
+        crate::brain::Side::Request,
+        body,
+    )
 }
 
-/// Core of [`mask_request_body`], decoupled from [`ProxyState`] so it is unit
-/// testable without a live store/tee. See `mask_request_body` for behaviour +
-/// the fail-open / low-confidence guarantees.
+/// Core masking routine, decoupled from [`ProxyState`] so it is unit testable
+/// without a live store/tee. Used for both the request body ([`Side::Request`])
+/// and non-streamed response bodies ([`Side::Response`]); see `mask_request_body`
+/// for the behaviour / fail-open / low-confidence guarantees.
+///
+/// [`Side::Request`]: crate::brain::Side::Request
+/// [`Side::Response`]: crate::brain::Side::Response
 fn mask_body_with(
     masking: &crate::config::MaskingConfig,
     detector: &crate::brain::pii::Detector,
+    side: crate::brain::Side,
     body: &Bytes,
 ) -> (Bytes, MaskAction) {
     if !masking.enabled || body.is_empty() {
@@ -314,8 +446,8 @@ fn mask_body_with(
 
     if masking.dry_run {
         // Preview only: forward unchanged. The logger stamps `would_mask` on the
-        // request findings (it re-scans the original body), so we do no work here
-        // beyond signalling the action.
+        // findings (it re-scans the original body), so we do no work here beyond
+        // signalling the action.
         return (body.clone(), MaskAction::WouldMask);
     }
 
@@ -324,7 +456,7 @@ fn mask_body_with(
     // least one span was masked, otherwise we observe (never claim a no-op mask).
     let text = String::from_utf8_lossy(body);
     let kinds = masking.kinds.as_deref();
-    let findings = detector.scan(crate::brain::Side::Request, &text);
+    let findings = detector.scan(side, &text);
     let (redacted, masked) = crate::brain::pii::mask(&text, &findings, kinds);
     if masked == 0 {
         return (body.clone(), MaskAction::Observed);
@@ -415,6 +547,10 @@ struct FinishGuard {
     id: String,
     start: Instant,
     sent: bool,
+    /// Upstream HTTP status for this exchange (we got a response).
+    status: Option<u16>,
+    /// Set by the response stream if it errored mid-flight.
+    errored: Arc<AtomicBool>,
 }
 
 impl FinishGuard {
@@ -424,6 +560,14 @@ impl FinishGuard {
         }
         self.sent = true;
         let total = self.start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        // A mid-stream failure is a transport error even though we saw a 2xx
+        // status; record it so a truncated stream is distinguishable from a clean
+        // finish. HTTP 4xx/5xx are carried by `status`, not `error_kind`.
+        let error_kind = if self.errored.load(Ordering::Relaxed) {
+            Some("stream_error".to_string())
+        } else {
+            None
+        };
         // Best-effort enqueue; never block on drop.
         let _ = self.tee.try_send(TeeEvent::ResponseFinished {
             id: self.id.clone(),
@@ -431,6 +575,10 @@ impl FinishGuard {
             // arrival time; we pass None here and let the logger own the TTFT.
             ttft_ms: None,
             total_ms: Some(total),
+            status: self.status,
+            error_kind,
+            // Streamed responses are never masked here (deferred); observe-only.
+            resp_mask_action: MaskAction::Observed,
         });
     }
 }
@@ -551,7 +699,7 @@ mod tests {
             kinds: None,
         };
         let body = body_with_pii();
-        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
         assert_eq!(action, MaskAction::Observed);
         assert_eq!(out, body, "disabled masking must forward verbatim");
     }
@@ -564,7 +712,7 @@ mod tests {
             kinds: None,
         };
         let body = body_with_pii();
-        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
         assert_eq!(action, MaskAction::WouldMask);
         assert_eq!(
             out, body,
@@ -586,7 +734,7 @@ mod tests {
             kinds: None,
         };
         let body = body_with_pii();
-        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
         assert_eq!(action, MaskAction::Masked);
         let text = std::str::from_utf8(&out).unwrap();
         assert!(text.contains("[EMAIL]"), "email must be replaced: {text}");
@@ -604,7 +752,7 @@ mod tests {
             kinds: None,
         };
         let body = Bytes::from_static(br#"{"model":"llama3","messages":[]}"#);
-        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
         // Nothing maskable -> never claim a mask; forward original as observed.
         assert_eq!(action, MaskAction::Observed);
         assert_eq!(out, body);
@@ -618,7 +766,12 @@ mod tests {
             dry_run: false,
             kinds: None,
         };
-        let (out, action) = mask_body_with(&cfg, &detector(), &Bytes::new());
+        let (out, action) = mask_body_with(
+            &cfg,
+            &detector(),
+            crate::brain::Side::Request,
+            &Bytes::new(),
+        );
         assert_eq!(action, MaskAction::Observed);
         assert!(out.is_empty());
     }
@@ -633,7 +786,7 @@ mod tests {
         };
         let body =
             Bytes::from_static(br#"{"content":"reach me at jane@example.com via 192.168.1.100"}"#);
-        let (out, action) = mask_body_with(&cfg, &detector(), &body);
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
         assert_eq!(action, MaskAction::Masked);
         let text = std::str::from_utf8(&out).unwrap();
         assert!(text.contains("[IP]"), "IP masked: {text}");
@@ -657,5 +810,46 @@ mod tests {
         let start = Instant::now();
         let ms = elapsed_ms(start);
         assert!(ms < 1000, "fresh instant should be ~0 ms");
+    }
+
+    // --- Non-streaming response masking (#3) --------------------------------
+
+    #[test]
+    fn masking_live_redacts_response_body() {
+        // The response analogue of `masking_live_redacts_request_body`: a
+        // non-streamed JSON completion echoing PII is redacted before the client
+        // sees it, and stamped Masked.
+        let cfg = MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            kinds: None,
+        };
+        let body = Bytes::from_static(
+            br#"{"choices":[{"message":{"content":"sure, email jane@example.com"}}]}"#,
+        );
+        let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Response, &body);
+        assert_eq!(action, MaskAction::Masked);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains("[EMAIL]"), "email masked in response: {text}");
+        assert!(!text.contains("jane@example.com"));
+    }
+
+    #[test]
+    fn response_is_json_detects_json_not_streams() {
+        let json = |ct: &'static str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static(ct),
+            );
+            response_is_json(&h)
+        };
+        assert!(json("application/json"));
+        assert!(json("application/json; charset=utf-8"));
+        // Streaming content types must NOT be buffered.
+        assert!(!json("text/event-stream"));
+        assert!(!json("application/x-ndjson"));
+        // Absent content type: not bufferable (observe).
+        assert!(!response_is_json(&reqwest::header::HeaderMap::new()));
     }
 }

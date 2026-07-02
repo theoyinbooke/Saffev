@@ -1,6 +1,6 @@
 [package]
 name = "saffev"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Saffev — a transparent, on-device proxy + Studio in front of a local LLM engine (observe-only, fail-open)."
@@ -87,6 +87,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 dirs = "5.0"
 once_cell = "1.19"
 time = { version = "0.3", features = ["formatting", "macros"] }
+tiktoken-rs = "0.11.0"
 
 [profile.release]
 strip = true

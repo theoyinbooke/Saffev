@@ -101,6 +101,8 @@ pub(crate) fn item_from_parts(
         ttft_ms: resp.and_then(|r| r.ttft_ms),
         pii_count,
         pii_kinds,
+        status: resp.and_then(|r| r.status),
+        error_kind: resp.and_then(|r| r.error_kind.clone()),
     }
 }
 
@@ -535,6 +537,16 @@ pub async fn analytics(
         .collect();
     let pii_findings = in_findings.len() as u64;
 
+    // Failed exchanges in-window: transport error (error_kind set) or HTTP >= 400.
+    let failed_requests = cur
+        .iter()
+        .filter(|r| {
+            r.response.as_ref().is_some_and(|resp| {
+                resp.error_kind.is_some() || resp.status.is_some_and(|s| s >= 400)
+            })
+        })
+        .count() as u64;
+
     // ---- deltas (previous window) ----
     let prev_total_requests = prev.len() as u64;
     let prev_total_tokens: u64 = prev
@@ -851,6 +863,7 @@ pub async fn analytics(
         p99_latency_ms,
         avg_ttft_ms,
         pii_findings,
+        failed_requests,
         active_apps: by_app.len() as u64,
         active_models: by_model.len() as u64,
         est_cost_saved_usd: (est_cost_saved_usd * 100.0).round() / 100.0,
@@ -1566,6 +1579,8 @@ mod tests {
             output_tokens_src: TokenSource::Estimated,
             ttft_ms: Some(15),
             total_ms: Some(120),
+            status: Some(200),
+            error_kind: None,
         }
     }
 

@@ -76,6 +76,17 @@ pub enum TeeEvent {
         ttft_ms: Option<u32>,
         /// Total time (millis).
         total_ms: Option<u32>,
+        /// Upstream HTTP status, if a response was received (`None` = never
+        /// reached the engine).
+        status: Option<u16>,
+        /// Transport-level failure tag (`upstream_unreachable` / `stream_error`),
+        /// or `None` for a normal HTTP response.
+        error_kind: Option<String>,
+        /// What masking did to the **response** body. `Observed` for streamed
+        /// responses (response masking is deferred there) and when masking is
+        /// off; `Masked` when a non-streamed response body was redacted before
+        /// forwarding. Lets the logger stamp response-side findings correctly.
+        resp_mask_action: MaskAction,
     },
 }
 
@@ -347,12 +358,25 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                 id,
                 ttft_ms,
                 total_ms,
+                status,
+                error_kind,
+                resp_mask_action,
             } => {
                 if let Some(entry) = inflight.remove(&id) {
                     // Re-read at finish-time so a mid-exchange Studio toggle is
                     // honoured for the response-side payload write too.
                     let payload_storage = state.config.load().payload_storage;
-                    on_response_finished(&state, payload_storage, id, entry, ttft_ms, total_ms);
+                    on_response_finished(
+                        &state,
+                        payload_storage,
+                        id,
+                        entry,
+                        ttft_ms,
+                        total_ms,
+                        status,
+                        error_kind,
+                        resp_mask_action,
+                    );
                 }
             }
         }
@@ -506,6 +530,7 @@ fn on_request_started(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_response_finished(
     state: &ProxyState,
     payload_storage: bool,
@@ -513,6 +538,9 @@ fn on_response_finished(
     entry: InFlight,
     _ttft_from_event: Option<u32>,
     total_ms: Option<u32>,
+    status: Option<u16>,
+    error_kind: Option<String>,
+    resp_mask_action: MaskAction,
 ) {
     let response_bytes = entry.response_buf.freeze();
     let response_text = lossy_str(&response_bytes);
@@ -531,7 +559,20 @@ fn on_response_finished(
 
     let (output_tokens, output_tokens_src) = match out_count {
         Some(tc) => (Some(tc.value), tc.source),
-        None => (None, TokenSource::Estimated),
+        None => {
+            // Engine reported no output usage (e.g. OpenAI streaming without
+            // `include_usage`). Estimate from the generated text so the row shows
+            // a `~count` instead of nothing. Off the hot path (logger task).
+            let completion = crate::tokens::extract_completion_text(&response_bytes);
+            if completion.is_empty() {
+                (None, TokenSource::Estimated)
+            } else {
+                (
+                    Some(crate::tokens::estimate_count(&completion)),
+                    TokenSource::Estimated,
+                )
+            }
+        }
     };
 
     // Engine-reported INPUT usage (e.g. Ollama `prompt_eval_count`) rides on the
@@ -539,10 +580,22 @@ fn on_response_finished(
     // unknown. Backfill it now (targeted UPDATE) and surface it on the live item.
     let (input_tokens, input_tokens_src) = match in_count {
         Some(tc) => (Some(tc.value), tc.source),
-        None => (
-            entry.request_meta.input_tokens,
-            entry.request_meta.input_tokens_src,
-        ),
+        None => match entry.request_meta.input_tokens {
+            Some(v) => (Some(v), entry.request_meta.input_tokens_src),
+            // No engine-reported input usage anywhere: estimate from the prompt
+            // text of the original request body (off the hot path).
+            None => {
+                let prompt = crate::tokens::extract_prompt_text(&entry.request_body);
+                if prompt.is_empty() {
+                    (None, TokenSource::Estimated)
+                } else {
+                    (
+                        Some(crate::tokens::estimate_count(&prompt)),
+                        TokenSource::Estimated,
+                    )
+                }
+            }
+        },
     };
     if input_tokens.is_some() && input_tokens != entry.request_meta.input_tokens {
         state.store.enqueue(WriteOp::RequestUsage {
@@ -561,6 +614,8 @@ fn on_response_finished(
         output_tokens_src,
         ttft_ms,
         total_ms: total,
+        status,
+        error_kind,
     };
 
     // Response-side PII findings (computed before building the live item so the
@@ -596,11 +651,23 @@ fn on_response_finished(
 
     state.store.enqueue(WriteOp::Response(response_meta));
 
-    // Persist response-side findings + surface them live.
+    // Persist response-side findings + surface them live. The action reflects
+    // what masking did to the RESPONSE body: `masked` when a non-streamed body
+    // was redacted before forwarding, else `observed` (streamed responses are not
+    // masked). Only HIGH-confidence findings in the allow-list are ever masked.
     if !resp_findings.is_empty() {
+        let cfg = state.config.load();
+        let mask_kinds = cfg.masking.kinds.as_deref();
         let records: Vec<PiiFindingRecord> = resp_findings
             .iter()
-            .map(|f| PiiFindingRecord::from_finding(&id, f, PiiAction::Observed))
+            .map(|f| {
+                let action = match resp_mask_action {
+                    MaskAction::Observed => PiiAction::Observed,
+                    other if crate::brain::pii::should_mask(f, mask_kinds) => other.to_pii_action(),
+                    _ => PiiAction::Observed,
+                };
+                PiiFindingRecord::from_finding(&id, f, action)
+            })
             .collect();
         for rec in &records {
             let _ = state.events.send(dto::StreamEvent::Pii {
