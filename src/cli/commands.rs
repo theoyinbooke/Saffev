@@ -1107,6 +1107,9 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     // Tee channel for proxy -> logger.
     let (tee, rx) = crate::proxy::tee_channel();
 
+    // Eval channel for logger -> async eval worker (safety guard + judge).
+    let (eval_tx, eval_rx) = crate::proxy::eval_channel();
+
     // Studio live-event broadcast channel.
     let (events, _events_rx) =
         tokio::sync::broadcast::channel(crate::studio::STREAM_CHANNEL_CAPACITY);
@@ -1120,16 +1123,25 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         // Same broadcast channel the Studio SSE endpoint subscribes to, so live
         // exchanges from the proxy reach the Live page in real time.
         events: events.clone(),
+        eval_tx,
     };
     let studio_state = crate::studio::StudioState {
         config,
         store,
         token,
-        events,
+        events: events.clone(),
     };
 
     // Drain the tee into the store off the request path.
     crate::proxy::ProxyServer::spawn_logger(proxy_state.clone(), rx);
+
+    // Drain the eval channel: run the safety guard (+ judge later) off the path.
+    crate::proxy::spawn_eval_worker(
+        proxy_state.store.clone(),
+        proxy_state.config.clone(),
+        events,
+        eval_rx,
+    );
 
     // Run both servers concurrently under a shared graceful-shutdown signal.
     //

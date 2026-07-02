@@ -208,6 +208,65 @@ pub struct CustomPattern {
     pub confidence: crate::brain::Confidence,
 }
 
+/// Evaluation pipeline config (safety guard + quality judge).
+///
+/// **Off by default** (observe-only ethos + no engine contention unless opted
+/// in). Judging is always async, sampled, and concurrency-gated — never inline.
+/// Hot-reloadable like [`MaskingConfig`]: the running eval worker reads the live
+/// snapshot per record, so enabling it needs no restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalConfig {
+    /// Master switch. `false` (default) = nothing is evaluated; zero judge calls.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fraction of exchanges sent to the (expensive) LLM judge, `0.0..=1.0`.
+    /// The cheap deterministic safety guard runs on all exchanges when enabled;
+    /// this only rate-limits the model-backed judge.
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f32,
+    /// Run the deterministic safety guard (cheap, no model). Default on when eval
+    /// is enabled.
+    #[serde(default = "default_true")]
+    pub safety: bool,
+    /// Run the model-backed quality judge (Phase 4). Default off.
+    #[serde(default)]
+    pub quality: bool,
+    /// Model the LLM judge asks (on the user's own engine). `None` = use a small
+    /// default. Also the slot a purpose-trained localized guard plugs into.
+    #[serde(default)]
+    pub judge_model: Option<String>,
+    /// Max concurrent judge calls — the VRAM-contention guard. Default 1.
+    #[serde(default = "default_eval_concurrency")]
+    pub max_concurrency: u32,
+    /// Per-judge-call timeout (millis).
+    #[serde(default = "default_eval_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+fn default_sample_rate() -> f32 {
+    0.1
+}
+fn default_eval_concurrency() -> u32 {
+    1
+}
+fn default_eval_timeout_ms() -> u32 {
+    20_000
+}
+
+impl Default for EvalConfig {
+    fn default() -> Self {
+        EvalConfig {
+            enabled: false,
+            sample_rate: default_sample_rate(),
+            safety: true,
+            quality: false,
+            judge_model: None,
+            max_concurrency: default_eval_concurrency(),
+            timeout_ms: default_eval_timeout_ms(),
+        }
+    }
+}
+
 /// The full Saffev configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -244,6 +303,10 @@ pub struct Config {
     /// Opt-in PII masking (04 §5, §7.6). Defaults to observe-only.
     #[serde(default)]
     pub masking: MaskingConfig,
+
+    /// Opt-in evaluation pipeline (safety guard + quality judge). Off by default.
+    #[serde(default)]
+    pub eval: EvalConfig,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -261,6 +324,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             custom_patterns: Vec::new(),
             masking: MaskingConfig::default(),
+            eval: EvalConfig::default(),
         }
     }
 }
@@ -424,6 +488,19 @@ impl Config {
             }
         }
 
+        // Eval sampling must be a valid fraction; concurrency at least 1.
+        if !(0.0..=1.0).contains(&self.eval.sample_rate) {
+            return Err(Error::Config(format!(
+                "eval.sample_rate must be between 0.0 and 1.0 (got {})",
+                self.eval.sample_rate
+            )));
+        }
+        if self.eval.max_concurrency == 0 {
+            return Err(Error::Config(
+                "eval.max_concurrency must be at least 1".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -565,6 +642,53 @@ mod tests {
         assert_eq!(loaded.masking.enabled, expected.masking.enabled);
         assert_eq!(loaded.masking.dry_run, expected.masking.dry_run);
         assert_eq!(loaded.masking.kinds, expected.masking.kinds);
+    }
+
+    /// Eval defaults must be observe-only: disabled, safety-on-when-enabled,
+    /// quality-off, and a sane sample rate / concurrency.
+    #[test]
+    fn eval_defaults_are_off() {
+        let cfg = Config::default();
+        assert!(!cfg.eval.enabled, "eval must be off by default");
+        assert!(cfg.eval.safety, "safety guard is on once eval is enabled");
+        assert!(!cfg.eval.quality, "quality judge is off by default");
+        assert_eq!(
+            cfg.eval.max_concurrency, 1,
+            "contention guard defaults to 1"
+        );
+        assert!((0.0..=1.0).contains(&cfg.eval.sample_rate));
+    }
+
+    #[test]
+    fn eval_validation_rejects_bad_sample_rate_and_zero_concurrency() {
+        let mut cfg = Config::default();
+        cfg.mode = Mode::Cooperative;
+        cfg.ports.proxy = 8088; // make ports valid
+        cfg.eval.sample_rate = 1.5;
+        assert!(cfg.validate().is_err(), "sample_rate > 1 must fail");
+        cfg.eval.sample_rate = 0.2;
+        cfg.eval.max_concurrency = 0;
+        assert!(cfg.validate().is_err(), "zero concurrency must fail");
+    }
+
+    /// Older configs with no `[eval]` table load with eval off (serde default).
+    #[test]
+    fn eval_section_absent_defaults_off() {
+        let dir = unique_temp_dir("eval-absent");
+        let path = dir.join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "mode = \"cooperative\"\ndata_dir = {:?}\n[ports]\nproxy = 8088\nupstream = 11434\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).expect("loads");
+        assert!(!cfg.eval.enabled);
+        assert!(cfg.eval.safety);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Masking defaults must keep observe-only behaviour: disabled, and even if

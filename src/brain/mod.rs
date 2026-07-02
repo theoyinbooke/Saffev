@@ -11,6 +11,7 @@
 //!   No model-based judge ships in v0, and judges are *never* called inline —
 //!   only via the async sampler.
 
+pub mod guard;
 pub mod pii;
 
 use serde::{Deserialize, Serialize};

@@ -132,6 +132,20 @@ pub fn tee_channel() -> (TeeSender, TeeReceiver) {
     tokio::sync::mpsc::channel(TEE_CAPACITY)
 }
 
+/// Sender onto the bounded eval channel (logger -> async eval worker).
+pub type EvalSender = tokio::sync::mpsc::Sender<crate::brain::JudgeRecord>;
+/// Receiver half consumed by the eval worker.
+pub type EvalReceiver = tokio::sync::mpsc::Receiver<crate::brain::JudgeRecord>;
+
+/// Bounded eval channel capacity (records). Best-effort `try_send` from the
+/// logger — a full queue drops the record so the logger never blocks.
+pub const EVAL_CAPACITY: usize = 512;
+
+/// Create the bounded eval channel with [`EVAL_CAPACITY`].
+pub fn eval_channel() -> (EvalSender, EvalReceiver) {
+    tokio::sync::mpsc::channel(EVAL_CAPACITY)
+}
+
 /// Shared state every proxy handler closes over.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -152,6 +166,11 @@ pub struct ProxyState {
     /// in real time. `send` is non-blocking and a no-op when no client is
     /// connected (Err is ignored).
     pub events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    /// Sender onto the bounded eval channel. The logger hands sampled records to
+    /// the async eval worker here (best-effort, drop-oldest). Present even when
+    /// eval is off — the logger only sends when `config.eval.enabled`, so eval
+    /// stays hot-reloadable (enable without restart).
+    pub eval_tx: EvalSender,
 }
 
 /// The proxy server. Owns its `axum` router + the upstream client.
@@ -263,6 +282,83 @@ impl ProxyServer {
 
 pub mod handlers;
 pub mod upstream;
+
+// ---------------------------------------------------------------------------
+// Eval worker — drains the eval channel, runs the safety guard (+ judge later).
+// ---------------------------------------------------------------------------
+
+/// Spawn the async **eval worker**: drains the eval channel and runs the safety
+/// guard on each record (Phase 3). The model-backed judge (Phase 4) will run here
+/// too, behind a concurrency semaphore. Fully off the request path; fail-open.
+pub fn spawn_eval_worker(
+    store: Store,
+    config: ConfigHandle,
+    events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    rx: EvalReceiver,
+) {
+    tokio::spawn(run_eval_worker(store, config, events, rx));
+}
+
+async fn run_eval_worker(
+    store: Store,
+    config: ConfigHandle,
+    events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    mut rx: EvalReceiver,
+) {
+    while let Some(rec) = rx.recv().await {
+        // Re-read live config: eval may have been toggled off since enqueue.
+        let cfg = config.load();
+        if !cfg.eval.enabled {
+            continue;
+        }
+        if cfg.eval.safety {
+            run_safety_guard(&store, &events, &rec);
+        }
+        // Phase 4: model-backed quality judge (semaphore-gated) runs here.
+    }
+    tracing::debug!("proxy: eval channel closed, worker exiting");
+}
+
+/// Run the deterministic safety guard over a record's text; persist + publish any
+/// flags. Fail-open: nothing here can disturb the request path.
+fn run_safety_guard(
+    store: &Store,
+    events: &tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    rec: &crate::brain::JudgeRecord,
+) {
+    let mut text = String::new();
+    if let Some(p) = &rec.prompt {
+        text.push_str(p);
+        text.push('\n');
+    }
+    if let Some(r) = &rec.response {
+        text.push_str(r);
+    }
+    let cats = crate::brain::guard::DeterministicGuard::scan(&text);
+    if cats.is_empty() {
+        return;
+    }
+    let ts = now_millis();
+    let records: Vec<crate::store::SafetyFindingRecord> = cats
+        .iter()
+        .map(|c| crate::store::SafetyFindingRecord {
+            record_id: rec.record_id.clone(),
+            guard_model: crate::brain::guard::GUARD_MODEL.to_string(),
+            category: (*c).to_string(),
+            verdict: crate::brain::guard::VERDICT_FLAGGED.to_string(),
+            score: None,
+            ts,
+        })
+        .collect();
+    for r in &records {
+        let _ = events.send(dto::StreamEvent::Safety {
+            id: rec.record_id.clone(),
+            category: r.category.clone(),
+            verdict: r.verdict.clone(),
+        });
+    }
+    store.enqueue(crate::store::WriteOp::SafetyFindings(records));
+}
 
 // ---------------------------------------------------------------------------
 // Async logger — drains the tee, assembles records, enqueues writes.
@@ -686,8 +782,27 @@ fn on_response_finished(
         state.store.enqueue(WriteOp::Payload(crate::store::Payload {
             request_id: id.clone(),
             prompt: Some(prompt_text),
-            response: Some(response_text),
+            response: Some(response_text.clone()),
         }));
+    }
+
+    // Eval pipeline (async, off the request hot path): when enabled, hand a record
+    // to the eval worker. Best-effort `try_send` — a full queue drops it
+    // (fail-open); we never block the logger. The prompt/response text is passed
+    // transiently to the worker and is NOT persisted here (payload storage is a
+    // separate, explicit opt-in above).
+    if state.config.load().eval.enabled {
+        let prompt = crate::tokens::extract_prompt_text(&entry.request_body);
+        let response = crate::tokens::extract_completion_text(&response_bytes);
+        let jr = crate::brain::JudgeRecord {
+            record_id: id.clone(),
+            prompt: (!prompt.is_empty()).then_some(prompt),
+            response: (!response.is_empty()).then_some(response),
+            context: None,
+        };
+        if state.eval_tx.try_send(jr).is_err() {
+            tracing::debug!("proxy: eval queue full/closed, dropping record (fail-open)");
+        }
     }
 
     tracing::debug!(

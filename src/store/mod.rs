@@ -235,6 +235,44 @@ impl PiiFindingRecord {
     }
 }
 
+/// `safety_findings` row — a guard's banded verdict on one exchange (eval
+/// pipeline). Written by the async eval worker, never inline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyFindingRecord {
+    /// FK to `requests.id`.
+    pub record_id: String,
+    /// The guard that produced this (e.g. `deterministic:v1`, or a model name).
+    pub guard_model: String,
+    /// Safety category flagged (e.g. `self_harm`, `violence`, `hate`).
+    pub category: String,
+    /// Banded verdict — deliberately not a precise score (`flagged` / `safe`).
+    pub verdict: String,
+    /// Optional numeric score when a model provides one (`None` for deterministic).
+    pub score: Option<f32>,
+    /// When this was evaluated (unix millis).
+    pub ts: i64,
+}
+
+/// `eval_scores` row — a judge's banded quality score on one exchange (eval
+/// pipeline). Written by the async eval worker, never inline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalScoreRecord {
+    /// FK to `requests.id`.
+    pub record_id: String,
+    /// The judge that produced this (model name).
+    pub judge_model: String,
+    /// Metric name (e.g. `relevance`, `coherence`).
+    pub metric: String,
+    /// Banded verdict (e.g. `good` / `weak`); avoids over-precise numerics.
+    pub band: String,
+    /// Optional short rationale.
+    pub rationale: Option<String>,
+    /// Whether this record was reached via sampling (vs evaluated in full).
+    pub sampled: bool,
+    /// When this was evaluated (unix millis).
+    pub ts: i64,
+}
+
 /// A fully-assembled history row for the Studio (`GET /api/history`), joining
 /// request + response metadata and a finding summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +283,8 @@ pub struct HistoryRow {
     pub response: Option<ResponseMeta>,
     /// Count of PII findings on this exchange (for the list badge).
     pub pii_count: u32,
+    /// Count of safety findings on this exchange (for the list badge).
+    pub safety_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +312,10 @@ pub enum WriteOp {
     Payload(Payload),
     /// Insert a batch of PII findings for one record.
     PiiFindings(Vec<PiiFindingRecord>),
+    /// Insert a batch of safety findings for one record (eval pipeline).
+    SafetyFindings(Vec<SafetyFindingRecord>),
+    /// Insert a batch of eval scores for one record (eval pipeline).
+    EvalScores(Vec<EvalScoreRecord>),
     /// Upsert a setting key/value.
     Setting { key: String, value: String },
 }
@@ -435,6 +479,68 @@ impl Store {
             )?;
             let rows = stmt
                 .query_map([], row_to_pii_finding)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// All safety findings (eval pipeline). The Studio buckets them by category.
+    pub async fn safety_findings(&self) -> Result<Vec<SafetyFindingRecord>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT record_id, guard_model, category, verdict, score, ts \
+                 FROM safety_findings",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_safety)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Safety findings for one exchange (History detail drawer).
+    pub async fn safety_for(&self, record_id: &str) -> Result<Vec<SafetyFindingRecord>> {
+        let record_id = record_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT record_id, guard_model, category, verdict, score, ts \
+                 FROM safety_findings WHERE record_id = ?1",
+            )?;
+            let rows = stmt
+                .query_map([&record_id], row_to_safety)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// All eval scores (eval pipeline). The Studio buckets them by metric/band.
+    pub async fn eval_scores(&self) -> Result<Vec<EvalScoreRecord>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT record_id, judge_model, metric, band, rationale, sampled, ts \
+                 FROM eval_scores",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_eval)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Eval scores for one exchange (History detail drawer).
+    pub async fn eval_for(&self, record_id: &str) -> Result<Vec<EvalScoreRecord>> {
+        let record_id = record_id.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT record_id, judge_model, metric, band, rationale, sampled, ts \
+                 FROM eval_scores WHERE record_id = ?1",
+            )?;
+            let rows = stmt
+                .query_map([&record_id], row_to_eval)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -685,6 +791,49 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             }
             tx.commit()?;
         }
+        WriteOp::SafetyFindings(findings) => {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO safety_findings \
+                     (record_id, guard_model, category, verdict, score, ts) \
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                )?;
+                for f in findings {
+                    stmt.execute(rusqlite::params![
+                        f.record_id,
+                        f.guard_model,
+                        f.category,
+                        f.verdict,
+                        f.score,
+                        f.ts,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
+        WriteOp::EvalScores(scores) => {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO eval_scores \
+                     (record_id, judge_model, metric, band, rationale, sampled, ts) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                )?;
+                for s in scores {
+                    stmt.execute(rusqlite::params![
+                        s.record_id,
+                        s.judge_model,
+                        s.metric,
+                        s.band,
+                        s.rationale,
+                        s.sampled as i64,
+                        s.ts,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
         WriteOp::Setting { key, value } => {
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2) \
@@ -732,6 +881,8 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
 
     let pii_count_expr =
         "(SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) AS pii_count";
+    let safety_count_expr =
+        "(SELECT count(*) FROM safety_findings sf WHERE sf.record_id = r.id) AS safety_count";
 
     if query.pii_only {
         wheres.push("(SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) > 0".into());
@@ -755,7 +906,7 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
            r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
            resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
            resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, \
-           {pii_count_expr} \
+           {pii_count_expr}, {safety_count_expr} \
          FROM requests r \
          LEFT JOIN responses resp ON resp.request_id = r.id \
          {where_clause} \
@@ -807,11 +958,38 @@ fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
     };
 
     let pii_count: i64 = row.get(20)?;
+    let safety_count: i64 = row.get(21)?;
 
     Ok(HistoryRow {
         request,
         response,
         pii_count: pii_count as u32,
+        safety_count: safety_count as u32,
+    })
+}
+
+/// Map a `safety_findings` row.
+fn row_to_safety(row: &rusqlite::Row<'_>) -> rusqlite::Result<SafetyFindingRecord> {
+    Ok(SafetyFindingRecord {
+        record_id: row.get(0)?,
+        guard_model: row.get(1)?,
+        category: row.get(2)?,
+        verdict: row.get(3)?,
+        score: row.get(4)?,
+        ts: row.get(5)?,
+    })
+}
+
+/// Map an `eval_scores` row.
+fn row_to_eval(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvalScoreRecord> {
+    Ok(EvalScoreRecord {
+        record_id: row.get(0)?,
+        judge_model: row.get(1)?,
+        metric: row.get(2)?,
+        band: row.get(3)?,
+        rationale: row.get(4)?,
+        sampled: row.get::<_, i64>(5)? != 0,
+        ts: row.get(6)?,
     })
 }
 
@@ -1280,6 +1458,56 @@ mod tests {
         assert_eq!(summary[0].start_off, 5);
         assert_eq!(summary[0].action, PiiAction::Observed);
         assert_eq!(summary[0].value_hash, "abc123");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn safety_and_eval_round_trip_and_history_count() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        store.enqueue(WriteOp::Request(req("r1", 1000)));
+        store.enqueue(WriteOp::SafetyFindings(vec![SafetyFindingRecord {
+            record_id: "r1".into(),
+            guard_model: "deterministic:v1".into(),
+            category: "self_harm".into(),
+            verdict: "flagged".into(),
+            score: None,
+            ts: 1000,
+        }]));
+        store.enqueue(WriteOp::EvalScores(vec![EvalScoreRecord {
+            record_id: "r1".into(),
+            judge_model: "qwen3.5:2b".into(),
+            metric: "relevance".into(),
+            band: "good".into(),
+            rationale: Some("on topic".into()),
+            sampled: true,
+            ts: 1000,
+        }]));
+        store.flush().await.unwrap();
+
+        // History carries the safety count for the row badge.
+        let rows = store.history(HistoryQuery::default()).await.unwrap();
+        assert_eq!(rows[0].safety_count, 1);
+        assert_eq!(rows[0].pii_count, 0);
+
+        // Aggregate + per-record reads.
+        let all_safety = store.safety_findings().await.unwrap();
+        assert_eq!(all_safety.len(), 1);
+        assert_eq!(all_safety[0].category, "self_harm");
+        assert_eq!(all_safety[0].verdict, "flagged");
+
+        let for_r1 = store.safety_for("r1").await.unwrap();
+        assert_eq!(for_r1.len(), 1);
+        assert!(store.safety_for("nope").await.unwrap().is_empty());
+
+        let evals = store.eval_scores().await.unwrap();
+        assert_eq!(evals.len(), 1);
+        assert_eq!(evals[0].metric, "relevance");
+        assert_eq!(evals[0].band, "good");
+        assert!(evals[0].sampled);
+        assert_eq!(store.eval_for("r1").await.unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }
