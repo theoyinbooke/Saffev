@@ -470,42 +470,81 @@ pub async fn privacy(
     }))
 }
 
-/// `GET /api/quality` — the eval pipeline's safety/quality summary.
+/// `GET /api/quality` — the eval pipeline's safety/quality summary + time series.
 pub async fn quality(
     State(state): State<StudioState>,
+    Query(params): Query<AnalyticsParams>,
 ) -> Result<Json<dto::QualityReport>, Response> {
-    let cfg = state.config.load();
-    let safety = state.store.safety_findings().await.map_err(internal)?;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::Ordering::Relaxed;
 
+    let cfg = state.config.load();
+    let now = now_millis();
+    let range_ms = params
+        .range_ms
+        .unwrap_or(ANALYTICS_DEFAULT_RANGE_MS)
+        .clamp(ANALYTICS_MIN_RANGE_MS, ANALYTICS_MAX_RANGE_MS);
+    let start = now - range_ms;
+    let bucket_ms = analytics_bucket_ms(range_ms);
+    let n_buckets = ((range_ms + bucket_ms - 1) / bucket_ms).max(1) as usize;
+    let bidx =
+        |ts: i64| -> usize { (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1) };
+
+    // Safety findings in the window → by category + per-bucket distinct-flagged.
+    let safety = state.store.safety_findings().await.map_err(internal)?;
     let mut by_cat: BTreeMap<String, u64> = BTreeMap::new();
-    let mut flagged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    // Track (bucket, record) pairs so a record with 2 categories counts once.
+    let mut bkt_flagged: Vec<BTreeSet<&str>> = vec![BTreeSet::new(); n_buckets];
     for f in &safety {
+        if f.ts < start {
+            continue;
+        }
         *by_cat.entry(f.category.clone()).or_insert(0) += 1;
         flagged.insert(f.record_id.clone());
+        bkt_flagged[bidx(f.ts)].insert(f.record_id.as_str());
     }
     let by_category = named_counts_sorted(by_cat);
     let total_flagged = flagged.len() as u64;
 
-    // Quality-judge summary: per-metric good/weak + distinct judged records.
+    // Eval scores in the window → per-metric good/weak + per-bucket good/weak.
     let evals = state.store.eval_scores().await.map_err(internal)?;
-    let mut judged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut judged: BTreeSet<String> = BTreeSet::new();
     let mut metric_bands: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut bkt_good = vec![0u64; n_buckets];
+    let mut bkt_weak = vec![0u64; n_buckets];
     for e in &evals {
+        if e.ts < start {
+            continue;
+        }
         judged.insert(e.record_id.clone());
         let entry = metric_bands.entry(e.metric.clone()).or_insert((0, 0));
+        let i = bidx(e.ts);
         if e.band == "good" {
             entry.0 += 1;
+            bkt_good[i] += 1;
         } else {
             entry.1 += 1;
+            bkt_weak[i] += 1;
         }
     }
     let total_judged = judged.len() as u64;
+    let judged_in_window = total_judged;
     let eval_by_metric: Vec<dto::MetricBands> = metric_bands
         .into_iter()
         .map(|(metric, (good, weak))| dto::MetricBands { metric, good, weak })
         .collect();
 
-    // Recent flagged exchanges for the table (join safety back to history rows).
+    let series: Vec<dto::QualityBucket> = (0..n_buckets)
+        .map(|i| dto::QualityBucket {
+            ts: start + (i as i64) * bucket_ms,
+            flagged: bkt_flagged[i].len() as u64,
+            good: bkt_good[i],
+            weak: bkt_weak[i],
+        })
+        .collect();
+
+    // Recent flagged exchanges + in-window request count (coverage denominator).
     let rows = state
         .store
         .history(HistoryQuery {
@@ -514,6 +553,7 @@ pub async fn quality(
         })
         .await
         .map_err(internal)?;
+    let requests_in_window = rows.iter().filter(|r| r.request.ts >= start).count() as u64;
     let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
     let recent_flagged: Vec<dto::HistoryItem> = rows
         .iter()
@@ -530,7 +570,14 @@ pub async fn quality(
         })
         .collect();
 
+    let m = &state.eval_metrics;
     Ok(Json(dto::QualityReport {
+        range_ms,
+        generated_ts: now,
+        bucket_ms,
+        series,
+        requests_in_window,
+        judged_in_window,
         eval_enabled: cfg.eval.enabled,
         safety_enabled: cfg.eval.safety,
         quality_enabled: cfg.eval.quality,
@@ -539,6 +586,9 @@ pub async fn quality(
         by_category,
         total_judged,
         eval_by_metric,
+        judge_inflight: m.inflight.load(Relaxed),
+        judge_completed: m.completed.load(Relaxed),
+        judge_dropped: m.dropped.load(Relaxed),
         recent_flagged,
     }))
 }
@@ -2010,6 +2060,7 @@ mod tests {
             store,
             token: "test-token".into(),
             events,
+            eval_metrics: std::sync::Arc::new(crate::proxy::EvalMetrics::default()),
         };
         (state, config)
     }

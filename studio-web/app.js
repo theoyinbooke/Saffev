@@ -1141,11 +1141,12 @@
     ]);
   }
 
-  function kpiCard(role, icon, label, valNode, metaNode) {
+  function kpiCard(role, icon, label, valNode, metaNode, spark) {
     return el('div', { class: 'card kpi reveal' }, [
       el('div', { class: 'label' }, [el('span', { class: 'ic ' + role, html: icon }), document.createTextNode(' ' + label)]),
       valNode,
       metaNode,
+      spark ? el('div', { class: 'kpi-spark' }, [spark]) : null,
     ]);
   }
 
@@ -2279,16 +2280,33 @@
   const Quality = {
     title: 'Quality & Safety',
     sub: 'Sampled safety + quality evaluation of your local model traffic — async, on-device.',
+    rangeMs: 24 * 60 * 60 * 1000,
+    RANGES: [
+      { value: 3600000, label: 'Last hour' },
+      { value: 86400000, label: 'Last 24 hours' },
+      { value: 604800000, label: 'Last 7 days' },
+      { value: 2592000000, label: 'Last 30 days' },
+    ],
     async render(view) {
+      this._view = view;
       view.innerHTML = '';
-      view.appendChild(loadingState('Loading evaluations…'));
+      const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.draw(); }, { ariaLabel: 'Time range', align: 'right' });
+      view.appendChild(el('div', { class: 'an-head reveal' }, [el('div', { class: 'spacer' }), el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
+      view.appendChild(el('div', { id: 'qBody' }));
+      await this.draw();
+    },
+    async draw() {
+      const body = $('#qBody');
+      if (!body) return;
+      body.innerHTML = '';
+      body.appendChild(loadingState('Loading evaluations…'));
       let d;
-      try { d = await api('/quality'); hideBanner(); }
-      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
-      view.innerHTML = '';
+      try { d = await api('/quality?rangeMs=' + this.rangeMs); hideBanner(); }
+      catch (e) { handleApiError(e); body.innerHTML = ''; body.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
+      body.innerHTML = '';
 
       if (!d.evalEnabled) {
-        view.appendChild(el('div', { class: 'card reveal' }, [
+        body.appendChild(el('div', { class: 'card reveal' }, [
           aboutSection(ICON.shieldAlert, 'Evaluation is off', 'Turn it on to score traffic for safety'),
           el('p', { class: 'about-p', text: 'The eval pipeline scores sampled exchanges for safety (and, optionally, quality) — asynchronously and on-device, never blocking your model. It is off by default.' }),
           el('a', { class: 'btn primary', href: '#/settings', html: ICON.check + '<span>Enable in Settings</span>' }),
@@ -2296,24 +2314,44 @@
         return;
       }
 
-      const kpis = el('section', { class: 'grid kpis reveal' }, [
-        kpiCard(d.totalFlagged > 0 ? 'danger' : 'safe', ICON.shieldAlert, 'Flagged exchanges', el('div', { class: 'val num', text: fmtNum(d.totalFlagged) }), el('div', { class: 'meta', text: 'safety guard' })),
-        kpiCard('brand', ICON.shield, 'Safety guard', el('div', { class: 'val', text: d.safetyEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'deterministic:v1' })),
-        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: fmtNum(d.totalJudged || 0) + ' judged · sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' })),
-      ]);
-      view.appendChild(kpis);
-
       const C = window.SaffevCharts;
-      const catCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+      const coverage = d.requestsInWindow > 0 ? Math.round((d.judgedInWindow / d.requestsInWindow) * 100) : 0;
+      const kpis = el('section', { class: 'grid kpis reveal' }, [
+        kpiCard(d.totalFlagged > 0 ? 'danger' : 'safe', ICON.shieldAlert, 'Flagged', el('div', { class: 'val num', text: fmtNum(d.totalFlagged) }), el('div', { class: 'meta', text: 'safety guard' }), C.sparkline(d.series.map((b) => b.flagged), { color: 'var(--danger)' })),
+        kpiCard('brand', ICON.check, 'Judged', el('div', { class: 'val num', text: fmtNum(d.judgedInWindow) }), el('div', { class: 'meta', text: coverage + '% of ' + fmtNum(d.requestsInWindow) + ' requests' }), C.sparkline(d.series.map((b) => b.good + b.weak), { color: 'var(--brand)' })),
+        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' }), null),
+        kpiCard(d.judgeDropped > 0 ? 'warn' : 'safe', ICON.server, 'Judge load', el('div', { class: 'val num', text: fmtNum(d.judgeInflight) }), el('div', { class: 'meta', text: 'in-flight · ' + fmtNum(d.judgeDropped) + ' shed' }), null),
+      ]);
+      body.appendChild(kpis);
+
+      // Safety flags over time — only meaningful once there are flags.
+      const xl = d.series.map((b) => new Date(b.ts));
+      if (d.totalFlagged > 0) {
+        body.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+          el('div', { class: 'hrow' }, [el('h3', { text: 'Safety flags over time' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'safety' })]),
+          C.lineArea({ series: [{ name: 'Flagged', values: d.series.map((b) => b.flagged), color: 'var(--danger)' }], xLabels: xl }),
+        ]));
+      }
+      // Quality good/weak over time — only once the judge has scored anything.
+      if (d.totalJudged > 0) {
+        body.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.08s' }, [
+          el('div', { class: 'hrow' }, [el('h3', { text: 'Quality over time' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'judge' })]),
+          C.lineArea({ series: [
+            { name: 'Good', values: d.series.map((b) => b.good), color: 'var(--safe)' },
+            { name: 'Weak', values: d.series.map((b) => b.weak), color: 'var(--gold)' },
+          ], xLabels: xl }),
+        ]));
+      }
+
+      const catCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
         el('div', { class: 'hrow' }, [el('h3', { text: 'Flagged by category' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'safety' })]),
       ]);
-      if (!d.byCategory || !d.byCategory.length) catCard.appendChild(el('div', { class: 'expnote', html: ICON.check + ' No safety flags in the retained window.' }));
+      if (!d.byCategory || !d.byCategory.length) catCard.appendChild(el('div', { class: 'expnote', html: ICON.check + ' No safety flags in this window.' }));
       else catCard.appendChild(C.hbars({ items: d.byCategory.map((c) => ({ label: safetyLabel(c.name), value: c.count, suffix: ' flag', color: 'var(--danger)' })) }));
-      view.appendChild(catCard);
+      body.appendChild(catCard);
 
-      // Quality scores by metric (only when the judge has produced any).
       if (d.evalByMetric && d.evalByMetric.length) {
-        const qCard = el('div', { class: 'card reveal', style: 'animation-delay:.08s' }, [
+        const qCard = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [
           el('div', { class: 'hrow' }, [el('h3', { text: 'Quality by metric' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'judge' })]),
         ]);
         d.evalByMetric.forEach((m) => {
@@ -2325,10 +2363,10 @@
             el('div', { class: 'ct', text: pct + '%' }),
           ]));
         });
-        view.appendChild(qCard);
+        body.appendChild(qCard);
       }
 
-      const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
+      const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.14s' }, [
         el('div', { class: 'hrow' }, [el('h3', { text: 'Recent flagged exchanges' }), el('div', { class: 'spacer' })]),
       ]);
       if (!d.recentFlagged || !d.recentFlagged.length) {
@@ -2339,7 +2377,7 @@
         d.recentFlagged.forEach((it) => listBody.appendChild(reqRow(it, { columns: HIST_COLS })));
         listCard.appendChild(tbl);
       }
-      view.appendChild(listCard);
+      body.appendChild(listCard);
     },
     teardown() {},
   };

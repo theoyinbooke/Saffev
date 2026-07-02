@@ -287,6 +287,38 @@ pub mod upstream;
 // Eval worker — drains the eval channel, runs the safety guard (+ judge later).
 // ---------------------------------------------------------------------------
 
+/// Runtime counters for the quality judge, shared with the Studio so
+/// `/api/quality` can show judge load and drops-under-contention. Cheap atomics.
+#[derive(Debug, Default)]
+pub struct EvalMetrics {
+    /// Judge calls currently in flight (bounded by `max_concurrency`).
+    pub inflight: std::sync::atomic::AtomicU32,
+    /// Judge calls that were dispatched and ran to completion.
+    pub completed: std::sync::atomic::AtomicU64,
+    /// Judge calls skipped because every concurrency slot was busy — the
+    /// contention guard shedding load (the safety guard still ran on the record).
+    pub dropped: std::sync::atomic::AtomicU64,
+}
+
+/// Reserve a judge concurrency slot **without blocking**. On success returns the
+/// permit (held for the call's lifetime); on contention records a drop and
+/// returns `None`. This is the load-shedding contention guard: excess judges are
+/// dropped, never queued unboundedly.
+fn reserve_judge_slot(
+    sem: &Arc<tokio::sync::Semaphore>,
+    metrics: &EvalMetrics,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match sem.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            metrics
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// Spawn the async **eval worker**: drains the eval channel and runs the safety
 /// guard (Phase 3) + the model-backed quality judge (Phase 4) on each record.
 /// The judge is sampled, timed out, and gated by a concurrency semaphore so it
@@ -298,9 +330,12 @@ pub fn spawn_eval_worker(
     config: ConfigHandle,
     events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
     upstream: Arc<str>,
+    metrics: Arc<EvalMetrics>,
     rx: EvalReceiver,
 ) {
-    tokio::spawn(run_eval_worker(store, config, events, upstream, rx));
+    tokio::spawn(run_eval_worker(
+        store, config, events, upstream, metrics, rx,
+    ));
 }
 
 async fn run_eval_worker(
@@ -308,8 +343,11 @@ async fn run_eval_worker(
     config: ConfigHandle,
     events: tokio::sync::broadcast::Sender<dto::StreamEvent>,
     upstream: Arc<str>,
+    metrics: Arc<EvalMetrics>,
     mut rx: EvalReceiver,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
+
     // Contention guard: at most `max_concurrency` judge calls in flight. Sized
     // once at startup (changing it is restart-required — the safe default is 1).
     let max = config.load().eval.max_concurrency.max(1) as usize;
@@ -325,9 +363,10 @@ async fn run_eval_worker(
         if cfg.eval.safety {
             run_safety_guard(&store, &events, &rec);
         }
-        // Quality judge: model-backed, opt-in, sampled, concurrency-gated. Spawned
-        // so the loop keeps draining the safety guard while judges queue on the
-        // semaphore. Runs only with a configured judge model.
+        // Quality judge: model-backed, opt-in, sampled, concurrency-gated. We
+        // reserve a slot in the LOOP (non-blocking): if all slots are busy the
+        // judge is dropped for this record — shedding load rather than queueing
+        // unboundedly. On success we spawn so the loop keeps draining.
         if cfg.eval.quality {
             if let Some(model) = cfg
                 .eval
@@ -336,22 +375,23 @@ async fn run_eval_worker(
                 .filter(|m| !m.trim().is_empty())
             {
                 if sampled(&rec.record_id, cfg.eval.sample_rate) {
-                    let backend = EngineBackend {
-                        base: upstream.clone(),
-                        model,
-                        timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
-                    };
-                    let sem = judge_sem.clone();
-                    let store = store.clone();
-                    let rec = rec.clone();
-                    tokio::spawn(async move {
-                        // Acquire a permit INSIDE the task so the worker loop never
-                        // blocks; excess judges simply queue here.
-                        let Ok(_permit) = sem.acquire_owned().await else {
-                            return;
+                    if let Some(permit) = reserve_judge_slot(&judge_sem, &metrics) {
+                        let backend = EngineBackend {
+                            base: upstream.clone(),
+                            model,
+                            timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
                         };
-                        run_quality_judge(&store, &backend, &rec).await;
-                    });
+                        let store = store.clone();
+                        let rec = rec.clone();
+                        let metrics = metrics.clone();
+                        metrics.inflight.fetch_add(1, Relaxed);
+                        tokio::spawn(async move {
+                            let _permit = permit; // held for the call's lifetime
+                            run_quality_judge(&store, &backend, &rec).await;
+                            metrics.inflight.fetch_sub(1, Relaxed);
+                            metrics.completed.fetch_add(1, Relaxed);
+                        });
+                    }
                 }
             }
         }
@@ -1110,6 +1150,40 @@ fn millis_between(start: Instant, end: Instant) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserve_judge_slot_sheds_load_beyond_capacity() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let metrics = EvalMetrics::default();
+        // First two reservations succeed; the rest are dropped (load shed).
+        let p1 = reserve_judge_slot(&sem, &metrics);
+        let p2 = reserve_judge_slot(&sem, &metrics);
+        assert!(
+            p1.is_some() && p2.is_some(),
+            "capacity reservations succeed"
+        );
+        assert!(
+            reserve_judge_slot(&sem, &metrics).is_none(),
+            "over-capacity dropped"
+        );
+        assert!(reserve_judge_slot(&sem, &metrics).is_none());
+        assert_eq!(metrics.dropped.load(Relaxed), 2, "two drops recorded");
+        // Releasing a permit frees a slot for the next judge.
+        drop(p1);
+        assert!(reserve_judge_slot(&sem, &metrics).is_some());
+    }
+
+    #[test]
+    fn sampled_is_deterministic_and_respects_bounds() {
+        assert!(sampled("x", 1.0), "rate 1.0 always samples");
+        assert!(!sampled("x", 0.0), "rate 0.0 never samples");
+        // Same id + rate → same decision (stable sampling).
+        assert_eq!(
+            sampled("some-uuid-1234", 0.5),
+            sampled("some-uuid-1234", 0.5)
+        );
+    }
 
     #[test]
     fn parse_request_meta_ollama_chat() {

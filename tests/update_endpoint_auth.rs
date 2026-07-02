@@ -47,6 +47,7 @@ async fn test_router() -> axum::Router {
         store,
         token: TOKEN.into(),
         events,
+        eval_metrics: std::sync::Arc::new(saffev::proxy::EvalMetrics::default()),
     };
     StudioServer::new(state).router()
 }
