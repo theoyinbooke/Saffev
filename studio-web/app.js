@@ -1202,28 +1202,38 @@
     loading: false,
 
     async render(view) {
-      this.q = ''; this.piiOnly = false; this.failedOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
+      this.q = ''; this.scope = 'all'; this.piiOnly = false; this.failedOnly = false; this.pages = []; this.pageIndex = 0; this.exhausted = false;
       view.innerHTML = '';
 
-      // toolbar: search + PII-only + rows-per-page drop-down
-      const search = el('input', { class: 'input', type: 'search', placeholder: 'Search app, model, or endpoint…', value: this.q });
+      // Forensic filter bar: a prominent search field + a segmented scope facet
+      // (All / With PII / Failed) + rows-per-page. Scope is exclusive — cleaner
+      // than two independent checkboxes.
+      const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
+      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search app, model, or endpoint…', value: this.q });
       let t;
       search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
-      const piiToggle = el('label', { class: 'chk' }, [
-        (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.piiOnly = c.checked; this.reload(); }); return c; })(),
-        document.createTextNode('PII only'),
-      ]);
-      const failToggle = el('label', { class: 'chk' }, [
-        (() => { const c = el('input', { type: 'checkbox' }); c.addEventListener('change', () => { this.failedOnly = c.checked; this.reload(); }); return c; })(),
-        document.createTextNode('Failed only'),
-      ]);
+      const searchField = el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]);
+
+      const SCOPES = [['all', 'All'], ['pii', 'With PII'], ['failed', 'Failed']];
+      const seg = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Filter scope', style: 'margin-bottom:0' });
+      SCOPES.forEach(([k, l]) => {
+        const b = el('button', { class: 'tab' + (this.scope === k ? ' active' : ''), type: 'button', 'data-scope': k, text: l });
+        b.addEventListener('click', () => {
+          if (this.scope === k) return;
+          this.scope = k; this.piiOnly = k === 'pii'; this.failedOnly = k === 'failed';
+          seg.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x.dataset.scope === k));
+          this.reload();
+        });
+        seg.appendChild(b);
+      });
+
       const sizeSel = dropdown(
         [10, 25, 50, 100].map((n) => ({ value: n, label: n + ' / page' })),
         this.pageSize,
         (v) => { this.pageSize = parseInt(v, 10); this.reload(); },
         { ariaLabel: 'Rows per page', align: 'right' }
       );
-      const toolbar = el('div', { class: 'toolbar reveal' }, [search, piiToggle, failToggle, sizeSel]);
+      const toolbar = el('div', { class: 'filterbar reveal' }, [searchField, seg, el('div', { class: 'spacer' }), sizeSel]);
 
       // bounded, internally-scrolling list card (columnar table; header fixed above the scroll body)
       const listCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
