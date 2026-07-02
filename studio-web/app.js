@@ -1440,7 +1440,7 @@
      ========================================================================= */
   const Engines = {
     title: 'Engines',
-    sub: 'Detected engines, exposure doctor, and adopt / revert controls.',
+    sub: 'How your apps reach the engine, and whether anything is exposed.',
     busy: false,
 
     async render(view) {
@@ -1451,38 +1451,64 @@
 
     async refresh(view) {
       view = view || $('#view');
-      let ev;
+      let ev, s = null;
       try { ev = await api('/engines'); hideBanner(); }
       catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load engines', e.message || '')); return; }
+      try { s = await api('/settings'); } catch (e) { /* proxy port is best-effort */ }
       view.innerHTML = '';
       setEnginePill(ev);
 
-      // exposure doctor hero
+      // Connection topology hero — the whole point of the page: how traffic flows
+      // (your apps → Saffev → engine), with exposure + mode woven onto the path.
       const exp = ev.exposure;
-      const heroCls = exp.exposed ? ' dangerhero' : '';
-      const hero = el('div', { class: 'card kpi hero' + heroCls + ' reveal' }, [
-        el('div', { class: 'label' }, [el('span', { class: 'ic ' + (exp.exposed ? 'danger' : 'safe'), html: exp.exposed ? ICON.shieldAlert : ICON.shield }), document.createTextNode(' Exposure doctor')]),
-        el('div', { class: 'val' }, [el('span', { class: 'check', html: exp.exposed ? ICON.alert : ICON.check }), document.createTextNode(exp.exposed ? 'Exposed' : 'Localhost only')]),
-        el('div', { class: 'meta', text: exposureLine(exp) }),
-        el('div', { class: 'meta mono', style: 'margin-top:6px', text: 'auth ' + (exp.tokenProtected ? 'protected' : 'unprotected') + (exp.boundTo ? ' · bound ' + exp.boundTo : '') }),
+      const safe = !exp.exposed;
+      const proxyPort = (s && s.proxyPort) || 8088;
+      const activeEng = (ev.engines || []).find((e) => e.isActive);
+      const engName = activeEng ? (engineDisplayName(activeEng.engine) || activeEng.engine) : 'Engine';
+      const engPort = activeEng ? activeEng.publicPort : (ev.mode === 'gateway' && activeEng && activeEng.shadowPort) || '11434';
+      const node = (t, d, brand) => el('div', { class: 'flow-node' + (brand ? ' brandnode' : '') }, [
+        el('div', { class: 'flow-t', text: t }), el('div', { class: 'flow-d', text: d }),
       ]);
-      const heroWrap = el('section', { class: 'grid', style: 'grid-template-columns:repeat(2,1fr);margin-bottom:16px' }, [
-        hero,
-        el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
-          el('div', { class: 'hrow' }, [el('h3', { text: 'Mode' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: ev.mode })]),
-          el('div', { class: 'muted', style: 'font-size:.86rem;margin-top:8px', text: ev.mode === 'gateway'
-            ? 'Gateway · Saffev supervises the engine and owns the public port, forwarding to a shadow port.'
-            : 'Cooperative · apps point at Saffev; the engine keeps running independently. Universal, zero-config.' }),
+      const arrow = () => el('div', { class: 'flow-arrow', html: ICON.chevR });
+      const topo = el('div', { class: 'card reveal' }, [
+        el('div', { class: 'hrow' }, [
+          el('h3', { text: 'Connection' }), el('div', { class: 'spacer' }),
+          el('span', { class: 'tag', text: ev.mode }),
+          el('span', { class: 'pill ' + (safe ? '' : 'dangerpill'), style: 'margin-left:8px', html: '<span class="dot"></span> ' + (safe ? 'localhost only' : 'exposed') }),
         ]),
+        el('div', { class: 'flow', style: 'margin-top:16px' }, [
+          node('Your apps', 'point base URL here', false), arrow(),
+          node('Saffev', ':' + proxyPort + ' · observing', true), arrow(),
+          node(engName, ':' + engPort + ' · untouched', false),
+        ]),
+        el('div', { class: 'expnote' + (safe ? '' : ' danger'), style: 'margin-top:14px', html: (safe ? ICON.check : ICON.alert) + ' ' + esc(exposureLine(exp)) + ' · auth ' + (exp.tokenProtected ? 'protected' : 'unprotected') }),
       ]);
-      view.appendChild(heroWrap);
+      view.appendChild(topo);
+
+      // Route an app + mode explainer (2-up, balanced).
+      const base = 'http://localhost:' + proxyPort;
+      const routeCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Route an app' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'no config edits' })]),
+        el('p', { class: 'about-p', style: 'margin-top:6px', text: 'Wrap any command so its LLM calls flow through Saffev:' }),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:2px' }); b.innerHTML = '<span class="muted">$</span> ' + esc(BRAND.command) + ' run <span class="arr">‹your app›</span>'; return b; })(),
+        el('p', { class: 'about-p', style: 'margin-top:12px', text: 'Or set the base URL manually:' }),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:2px' }); b.innerHTML = '<span class="muted">OpenAI</span> ' + esc(base) + '/v1'; return b; })(),
+        (() => { const b = el('div', { class: 'ports', style: 'margin-top:8px' }); b.innerHTML = '<span class="muted">Ollama</span> ' + esc(base); return b; })(),
+      ]);
+      const modeCard = el('div', { class: 'card reveal', style: 'animation-delay:.1s' }, [
+        el('div', { class: 'hrow' }, [el('h3', { text: 'Mode' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: ev.mode })]),
+        el('div', { class: 'muted', style: 'font-size:.86rem;margin-top:8px;line-height:1.6', text: ev.mode === 'gateway'
+          ? 'Gateway · Saffev supervises the engine and owns the public port, forwarding to a shadow port. Captures all engine traffic transparently.'
+          : 'Cooperative · apps point at Saffev; the engine keeps running independently. Universal and zero-config. Only sees traffic sent to the proxy port.' }),
+      ]);
+      view.appendChild(el('section', { class: 'grid', style: 'grid-template-columns:1fr 1fr;margin:16px 0' }, [routeCard, modeCard]));
 
       // engine cards
       if (!ev.engines || ev.engines.length === 0) {
         view.appendChild(emptyState('No engines detected', 'Start your local LLM engine (Ollama on :11434 or LM Studio on :1234) and refresh.'));
         return;
       }
-      const grid = el('section', { class: 'grid', style: 'grid-template-columns:repeat(auto-fill,minmax(320px,1fr))' });
+      const grid = el('section', { class: 'grid', style: 'grid-template-columns:repeat(auto-fit,minmax(320px,1fr))' });
       ev.engines.forEach((eng) => grid.appendChild(this.engineCard(eng, ev.mode, exp)));
       view.appendChild(grid);
     },
