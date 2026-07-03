@@ -505,6 +505,22 @@ pub struct RestartResult {
     pub restarting: bool,
 }
 
+/// `POST /api/demo` result — the one-click "send a test prompt" outcome. The
+/// demo fires a real chat request (with synthetic PII in the prompt) THROUGH the
+/// proxy to the local engine, so a captured exchange appears live in the Studio
+/// without the user touching a terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DemoResult {
+    /// True if the request reached the proxy (and was therefore captured),
+    /// regardless of whether the engine produced a completion.
+    pub captured: bool,
+    /// The model the demo used, if one was detected on the engine.
+    pub model: Option<String>,
+    /// Short human note for the UI (what happened / what to do next).
+    pub note: String,
+}
+
 /// Uniform error envelope for any failed `/api/*` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

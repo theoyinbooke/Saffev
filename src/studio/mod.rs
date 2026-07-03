@@ -111,6 +111,9 @@ impl StudioServer {
             // every other control route by the layers below.
             .route("/update", get(api::update_get).post(api::update_post))
             .route("/restart", post(api::restart))
+            // One-click "send a test prompt" — fires a captured request through
+            // the proxy so the first-run Studio populates without a terminal.
+            .route("/demo", post(api::demo))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
             // Host checked first (cheapest reject), then token, then CORS

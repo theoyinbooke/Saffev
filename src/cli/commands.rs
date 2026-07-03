@@ -1891,7 +1891,7 @@ async fn resolve_capture_target(
     println!(
         "{} {}",
         p.dot(Level::Warn),
-        p.warn("Saffev proxy isn't reachable — running without tracing (try `saffev start`, or pass --start)."),
+        p.warn("Saffev proxy isn't reachable — running without tracing. Run `saffev start`, or drop --no-start to auto-start."),
     );
     None
 }
