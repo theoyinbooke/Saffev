@@ -1158,13 +1158,20 @@
     ]);
   }
 
-  function kpiCard(role, icon, label, valNode, metaNode, spark) {
-    return el('div', { class: 'card kpi reveal' }, [
-      el('div', { class: 'label' }, [el('span', { class: 'ic ' + role, html: icon }), document.createTextNode(' ' + label)]),
-      valNode,
-      metaNode,
-      spark ? el('div', { class: 'kpi-spark' }, [spark]) : null,
+  // Metric-strip primitives (design's "metric cells") — one balanced hairline
+  // band, used for every KPI row (Live, Analytics Overview / Privacy / Quality).
+  // `sub` may be a string (→ mono .stat-s) or a prebuilt node (e.g. a delta).
+  function statCell(label, valueHtml, sub, spark) {
+    const subNode = typeof sub === 'string' ? el('div', { class: 'stat-s', text: sub }) : sub || null;
+    return el('div', { class: 'stat' }, [
+      el('div', { class: 'stat-l', text: label }),
+      el('div', { class: 'stat-v num', html: valueHtml }),
+      subNode,
+      spark ? el('div', { class: 'stat-spark' }, [spark]) : null,
     ]);
+  }
+  function statStrip(cols, cells) {
+    return el('section', { class: 'statbar reveal', style: '--cols:' + cols }, cells);
   }
 
   function cliBlock() {
@@ -1363,24 +1370,18 @@
       // KPI strip
       const reqSide = totalKinds.reduce((a, b) => a + (b.requestCount || 0), 0);
       const respSide = totalKinds.reduce((a, b) => a + (b.responseCount || 0), 0);
-      const kpis = el('section', { class: 'grid kpis reveal' }, [
-        kpiCard('danger', ICON.shieldAlert, 'Total findings', el('div', { class: 'val num', text: fmtNum(s.total) }), el('div', { class: 'meta', text: 'across retained window' })),
-        kpiCard('warn', ICON.pulse, 'On request', el('div', { class: 'val num', text: fmtNum(reqSide) }), el('div', { class: 'meta', text: 'outbound to the model' })),
-        kpiCard('brand', ICON.clock, 'On response', el('div', { class: 'val num', text: fmtNum(respSide) }), el('div', { class: 'meta', text: 'returned from the model' })),
-        (() => {
-          const on = !!s.maskingEnabled;
-          const live = on && !s.maskingDryRun;
-          // Three honest states: off, dry-run (observing), live (redacting).
-          const valText = !on ? 'Observe-only' : live ? 'Live' : 'Dry-run';
-          const metaText = !on ? 'Nothing is altered · detection only'
-            : live ? 'High-confidence PII is redacted'
-            : 'Enabled, but observing · nothing redacted yet';
-          return el('div', { class: 'card kpi hero' }, [
-            el('div', { class: 'label' }, [el('span', { class: 'ic safe', html: ICON.shield }), document.createTextNode(' Masking')]),
-            el('div', { class: 'val' }, [el('span', { class: 'check', html: live ? ICON.check : ICON.shield }), document.createTextNode(valText)]),
-            el('div', { class: 'meta', text: metaText }),
-          ]);
-        })(),
+      const on = !!s.maskingEnabled;
+      const live = on && !s.maskingDryRun;
+      // Three honest states: off, dry-run (observing), live (redacting).
+      const maskVal = !on ? 'Observe-only' : live ? 'Live' : 'Dry-run';
+      const maskSub = !on ? 'nothing is altered · detection only'
+        : live ? 'high-confidence PII is redacted'
+        : 'enabled, but observing · nothing redacted yet';
+      const kpis = statStrip(4, [
+        statCell('Total findings', fmtNum(s.total), 'across retained window'),
+        statCell('On request', fmtNum(reqSide), 'outbound to the model'),
+        statCell('On response', fmtNum(respSide), 'returned from the model'),
+        statCell('Masking', maskVal, maskSub),
       ]);
       view.appendChild(kpis);
 
@@ -2036,9 +2037,6 @@
       spark ? el('div', { class: 'kpi-spark' }, [spark]) : null,
     ]);
   }
-  function miniStat(label, value) {
-    return el('div', { class: 'card kpi reveal' }, [el('div', { class: 'label', text: label }), el('div', { class: 'val num', html: value })]);
-  }
   function deltaNode(cur, prev, goodUp) {
     if (prev == null || prev === 0) return el('div', { class: 'meta', text: cur > 0 ? 'new this period' : '·' });
     const pct = Math.round(((cur - prev) / prev) * 100);
@@ -2156,18 +2154,12 @@
       const xl = this.xLabels(d);
       // One balanced metric band (design's "metric cells"), even at 5 cells —
       // no orphan card. mono label · big tabular number · delta · sparkline.
-      const sCell = (label, valueHtml, subNode, spark) => el('div', { class: 'stat' }, [
-        el('div', { class: 'stat-l', text: label }),
-        el('div', { class: 'stat-v num', html: valueHtml }),
-        subNode || null,
-        spark ? el('div', { class: 'stat-spark' }, [spark]) : null,
-      ]);
-      const kpis = el('section', { class: 'statbar reveal', style: '--cols:5' }, [
-        sCell('Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
-        sCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), el('div', { class: 'stat-s', text: fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out' }), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
-        sCell('Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
-        sCell('PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
-        sCell('Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
+      const kpis = statStrip(5, [
+        statCell('Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
+        statCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out', C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
+        statCell('Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
+        statCell('PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
+        statCell('Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
       ]);
       panel.appendChild(kpis);
       const cost = el('div', { class: 'card reveal an-cost' }, [
@@ -2219,11 +2211,12 @@
     performance(panel, d) {
       const C = window.SaffevCharts;
       const xl = this.xLabels(d);
-      panel.appendChild(el('section', { class: 'grid kpis reveal' }, [
-        miniStat('p50 latency', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·'),
-        miniStat('p90 latency', d.p90LatencyMs != null ? d.p90LatencyMs + '<small>ms</small>' : '·'),
-        miniStat('p99 latency', d.p99LatencyMs != null ? d.p99LatencyMs + '<small>ms</small>' : '·'),
-        miniStat('avg TTFT', d.avgTtftMs != null ? d.avgTtftMs + '<small>ms</small>' : '·'),
+      const ms = (v) => (v != null ? v + '<small>ms</small>' : '·');
+      panel.appendChild(statStrip(4, [
+        statCell('p50 latency', ms(d.p50LatencyMs), 'median'),
+        statCell('p90 latency', ms(d.p90LatencyMs), '90th percentile'),
+        statCell('p99 latency', ms(d.p99LatencyMs), '99th percentile'),
+        statCell('avg TTFT', ms(d.avgTtftMs), 'time to first token'),
       ]));
       const grid = el('section', { class: 'an-grid' });
       grid.appendChild(anCard('Latency p50 over time', 'ms', C.lineArea({ series: [{ name: 'p50', values: d.series.map((b) => b.p50LatencyMs), color: 'var(--brand)' }], xLabels: xl }), true));
@@ -2397,11 +2390,11 @@
 
       const C = window.SaffevCharts;
       const coverage = d.requestsInWindow > 0 ? Math.round((d.judgedInWindow / d.requestsInWindow) * 100) : 0;
-      const kpis = el('section', { class: 'grid kpis reveal' }, [
-        kpiCard(d.totalFlagged > 0 ? 'danger' : 'safe', ICON.shieldAlert, 'Flagged', el('div', { class: 'val num', text: fmtNum(d.totalFlagged) }), el('div', { class: 'meta', text: 'safety guard' }), C.sparkline(d.series.map((b) => b.flagged), { color: 'var(--danger)' })),
-        kpiCard('brand', ICON.check, 'Judged', el('div', { class: 'val num', text: fmtNum(d.judgedInWindow) }), el('div', { class: 'meta', text: coverage + '% of ' + fmtNum(d.requestsInWindow) + ' requests' }), C.sparkline(d.series.map((b) => b.good + b.weak), { color: 'var(--brand)' })),
-        kpiCard('gold', ICON.bolt, 'Quality judge', el('div', { class: 'val', text: d.qualityEnabled ? 'On' : 'Off' }), el('div', { class: 'meta', text: 'sampling ' + Math.round((d.sampleRate || 0) * 100) + '%' }), null),
-        kpiCard(d.judgeDropped > 0 ? 'warn' : 'safe', ICON.server, 'Judge load', el('div', { class: 'val num', text: fmtNum(d.judgeInflight) }), el('div', { class: 'meta', text: 'in-flight · ' + fmtNum(d.judgeDropped) + ' shed' }), null),
+      const kpis = statStrip(4, [
+        statCell('Flagged', fmtNum(d.totalFlagged), 'safety guard', C.sparkline(d.series.map((b) => b.flagged), { color: 'var(--danger)' })),
+        statCell('Judged', fmtNum(d.judgedInWindow), coverage + '% of ' + fmtNum(d.requestsInWindow) + ' requests', C.sparkline(d.series.map((b) => b.good + b.weak), { color: 'var(--brand)' })),
+        statCell('Quality judge', d.qualityEnabled ? 'On' : 'Off', 'sampling ' + Math.round((d.sampleRate || 0) * 100) + '%'),
+        statCell('Judge load', fmtNum(d.judgeInflight), 'in-flight · ' + fmtNum(d.judgeDropped) + ' shed'),
       ]);
       body.appendChild(kpis);
 
