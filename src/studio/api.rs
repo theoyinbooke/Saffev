@@ -1452,6 +1452,140 @@ pub async fn restart(
     Ok(Json(dto::RestartResult { restarting: true }))
 }
 
+/// `POST /api/demo` — the one-click "send a test prompt" affordance.
+///
+/// Fires a real chat request **through the proxy** to the local engine, with
+/// synthetic PII in the prompt (a test email, a Luhn-valid test card, an IP), so
+/// a captured exchange appears live in the Studio — with the privacy lens lit up
+/// — without the user opening a terminal or re-routing an app. This is the
+/// zero-friction "aha": it converts the empty first-run dashboard into a working
+/// demonstration in one click.
+///
+/// Only ever contacts loopback (the proxy + the engine), consistent with the
+/// on-device invariant. Fail-soft: any error resolves to a `DemoResult` note,
+/// never a 500 — the worst case is a helpful message.
+pub async fn demo(State(state): State<StudioState>) -> Json<dto::DemoResult> {
+    let cfg = state.config.load();
+    let proxy = format!("http://127.0.0.1:{}", cfg.ports.proxy);
+    let engine = format!("http://127.0.0.1:{}", cfg.ports.upstream);
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let model = detect_demo_model(&client, &engine).await;
+
+    // Synthetic, obviously-fake PII so the privacy lens lights up on the request
+    // side regardless of whether the engine has a model installed. 4111… is the
+    // standard Visa test number (Luhn-valid).
+    let prompt = "Reply with just OK to confirm: email jane.doe@example.com, \
+                  card 4111 1111 1111 1111 was charged $12.00, from 192.168.1.42.";
+    let use_model = model.clone().unwrap_or_else(|| "llama3.2".to_string());
+    let body = serde_json::json!({
+        "model": use_model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+        "think": false,
+        "options": { "num_predict": 24 },
+    });
+
+    let sent = client
+        .post(format!("{proxy}/api/chat"))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await;
+
+    match sent {
+        Ok(_) => Json(dto::DemoResult {
+            captured: true,
+            model: model.clone(),
+            note: if model.is_some() {
+                "Sent a test prompt through Saffev. It appears above, with the email, card, and IP flagged by the privacy lens.".into()
+            } else {
+                "Sent a test prompt through Saffev. It appears above with PII flagged. No model is installed, so the engine call failed — pull one (e.g. `ollama pull llama3.2`) to see a full response.".into()
+            },
+        }),
+        Err(e) if e.is_connect() => Json(dto::DemoResult {
+            captured: false,
+            model,
+            note: "Could not reach Saffev's proxy. Is the daemon running?".into(),
+        }),
+        // A timeout still means the request reached the proxy and was captured
+        // (RequestStarted is teed before the engine is contacted).
+        Err(_) => Json(dto::DemoResult {
+            captured: true,
+            model,
+            note: "Sent — the request reached Saffev and was captured. The engine was slow or errored, but the exchange is above.".into(),
+        }),
+    }
+}
+
+/// Best-effort: pick an installed **generative** model on the engine (Ollama
+/// `/api/tags`, then OpenAI/LM-Studio `/v1/models`). Prefers a chat model —
+/// embedding models (which can't answer a chat request) are only used as a last
+/// resort. `None` if nothing is installed or the engine is unreachable.
+async fn detect_demo_model(client: &reqwest::Client, engine: &str) -> Option<String> {
+    let t = std::time::Duration::from_secs(3);
+    // `first non-embedding, else first` over a list of name strings.
+    let pick = |names: Vec<String>| -> Option<String> {
+        names
+            .iter()
+            .find(|n| !is_embedding_model(n))
+            .or_else(|| names.first())
+            .cloned()
+    };
+    if let Ok(v) = client
+        .get(format!("{engine}/api/tags"))
+        .timeout(t)
+        .send()
+        .await
+    {
+        if let Ok(j) = v.json::<serde_json::Value>().await {
+            let names: Vec<String> = j["models"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(n) = pick(names) {
+                return Some(n);
+            }
+        }
+    }
+    if let Ok(v) = client
+        .get(format!("{engine}/v1/models"))
+        .timeout(t)
+        .send()
+        .await
+    {
+        if let Ok(j) = v.json::<serde_json::Value>().await {
+            let names: Vec<String> = j["data"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(n) = pick(names) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Heuristic: does this model name look like an embedding model (which can't
+/// answer a chat request)? Used so the demo prefers a generative model.
+fn is_embedding_model(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("embed") || n.contains("minilm") || n.contains("nomic")
+}
+
 /// `GET /api/settings`
 ///
 /// Reads the **live** config snapshot (`state.config.load()`), so it reflects any

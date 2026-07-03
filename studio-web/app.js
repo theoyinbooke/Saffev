@@ -888,18 +888,44 @@
       host.innerHTML = '';
       if (!show) return;
       const proxyUrl = 'http://localhost:' + this.proxyPort;
+
+      // Primary path: one click, no terminal. Fires a captured request through
+      // the proxy so the stream + privacy lens light up immediately.
+      const demoBtn = el('button', { class: 'btn primary auto', html: ICON.bolt + '<span>Send a test prompt</span>' });
+      const demoNote = el('div', { class: 'onboard-note', hidden: true });
+      demoBtn.addEventListener('click', async () => {
+        setBusy(demoBtn, true);
+        demoNote.hidden = false;
+        demoNote.className = 'onboard-note';
+        demoNote.innerHTML = '<span class="spin sm"></span> Sending a test prompt through Saffev…';
+        try {
+          const r = await api('/demo', { method: 'POST' });
+          demoNote.className = 'onboard-note ' + (r.captured ? 'ok' : 'warn');
+          demoNote.innerHTML = (r.captured ? ICON.check : ICON.alert) + ' ' + esc(r.note);
+        } catch (e) {
+          demoNote.className = 'onboard-note warn';
+          demoNote.innerHTML = ICON.alert + ' ' + esc(e.message || 'Could not send the test prompt.');
+        }
+        setBusy(demoBtn, false);
+        // On success the Live SSE shows the row + retires this card automatically.
+      });
+
       host.appendChild(el('div', { class: 'card reveal' }, [
         el('div', { class: 'hrow' }, [
           el('h3', { text: 'No traffic captured yet' }),
           el('div', { class: 'spacer' }),
           el('span', { class: 'tag', text: 'setup' }),
         ]),
-        el('p', { class: 'about-p', text: 'Saffev only sees traffic that flows through its proxy (' + proxyUrl + '). The easiest way to route any app (Ollama or LM Studio) with no config edits:' }),
+        el('p', { class: 'about-p', text: 'Saffev shows every request your apps send to local models. See it work right now — one click, no terminal:' }),
+        el('div', { class: 'onboard-cta' }, [
+          demoBtn,
+          el('span', { class: 'onboard-cta-hint', text: 'Sends a sample prompt with fake PII through the proxy, so the traffic stream and privacy lens light up.' }),
+        ]),
+        demoNote,
+        el('div', { class: 'onboard-sep', html: '<span>then trace your own app</span>' }),
+        el('p', { class: 'about-p', text: 'Route any app through Saffev with no config edits:' }),
         copyBlock('saffev run -- <your app>', { title: 'terminal · traces any app' }),
-        el('p', { class: 'about-p', text: 'Or point the app’s base URL at the proxy yourself:' }),
-        copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env · Ollama' }),
-        copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env · LM Studio / OpenAI-compatible' }),
-        el('div', { class: 'meta', html: 'Then run a prompt · it appears here live. <a href="#/about">More ways to integrate →</a>' }),
+        el('div', { class: 'meta', html: 'Or set the base URL: <span class="kv">OLLAMA_BASE_URL=' + esc(proxyUrl) + '</span> · <span class="kv">OPENAI_BASE_URL=' + esc(proxyUrl) + '/v1</span> · <a href="#/about">more ways to integrate →</a>' }),
       ]));
     },
 
@@ -1871,6 +1897,7 @@
         panel.appendChild(this.quickStart(proxyUrl, studioUrl));
         panel.appendChild(this.pointApp(proxyUrl));
       } else if (this.tab === 'integrate') {
+        panel.appendChild(this.frameworkSnippets(proxyUrl));
         panel.appendChild(this.agentPrompt(proxyUrl, studioUrl));
         panel.appendChild(this.footer(this.version));
       } else {
@@ -1950,6 +1977,23 @@
         copyBlock('OLLAMA_BASE_URL=' + proxyUrl, { title: '.env  (Ollama)' }),
         el('p', { class: 'about-p', text: 'If your app uses the OpenAI-compatible API (including LM Studio):' }),
         copyBlock('OPENAI_BASE_URL=' + proxyUrl + '/v1', { title: '.env  (LM Studio / OpenAI-compatible)' }),
+      ]);
+    },
+
+    frameworkSnippets(proxyUrl) {
+      const openai = proxyUrl + '/v1';
+      const snip = (title, code) => copyBlock(code, { title });
+      return el('div', { class: 'card reveal' }, [
+        aboutSection(ICON.sparkles, 'Framework snippets', 'Copy-paste for popular setups'),
+        el('p', { class: 'about-p', text: 'Point the base URL at Saffev; it forwards to your real engine unchanged, so nothing else about your app changes.' }),
+        el('div', { class: 'snip-grid' }, [
+          snip('OpenAI SDK · Python', 'from openai import OpenAI\nclient = OpenAI(base_url="' + openai + '", api_key="local")'),
+          snip('OpenAI SDK · Node', 'import OpenAI from "openai";\nconst client = new OpenAI({\n  baseURL: "' + openai + '",\n  apiKey: "local",\n});'),
+          snip('Ollama · Python', 'from ollama import Client\nclient = Client(host="' + proxyUrl + '")'),
+          snip('LangChain · Python', 'from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(base_url="' + openai + '", api_key="local")'),
+          snip('LlamaIndex · Python', 'from llama_index.llms.openai_like import OpenAILike\nllm = OpenAILike(api_base="' + openai + '", api_key="local")'),
+          snip('curl', 'curl ' + proxyUrl + '/api/generate \\\n  -d \'{"model":"llama3.2","prompt":"hello"}\''),
+        ]),
       ]);
     },
 

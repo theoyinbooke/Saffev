@@ -105,9 +105,14 @@ pub enum Command {
     /// Everything after `--` is the command and its arguments, e.g.
     /// `saffev run -- python app.py`.
     Run {
-        /// Start the Saffev daemon first if it isn't already running.
-        #[arg(long)]
+        /// Deprecated: auto-start is now the default. Kept as a no-op so existing
+        /// scripts don't break.
+        #[arg(long, hide = true)]
         start: bool,
+        /// Don't auto-start the daemon. If it isn't running, warn and run the
+        /// command untraced (your work is never blocked).
+        #[arg(long)]
+        no_start: bool,
         /// Fail instead of running the command when the daemon isn't reachable
         /// (default: warn and run anyway, so your work is never blocked).
         #[arg(long)]
@@ -131,9 +136,12 @@ pub enum Command {
     ///
     /// Everything you run from that shell is traced until you `exit`.
     Shell {
-        /// Start the Saffev daemon first if it isn't already running.
-        #[arg(long)]
+        /// Deprecated: auto-start is now the default. Kept as a no-op.
+        #[arg(long, hide = true)]
         start: bool,
+        /// Don't auto-start the daemon; open the shell untraced if it isn't up.
+        #[arg(long)]
+        no_start: bool,
     },
 }
 
@@ -161,11 +169,12 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Logs { follow } => commands::logs(&cli, follow).await,
         Command::Update { check } => commands::update(&cli, check).await,
         Command::Run {
-            start,
+            start: _,
+            no_start,
             require,
             ref command,
-        } => commands::run_cmd(&cli, start, require, command.clone()).await,
+        } => commands::run_cmd(&cli, !no_start, require, command.clone()).await,
         Command::Env { ref shell, json } => commands::env_cmd(&cli, shell.clone(), json).await,
-        Command::Shell { start } => commands::shell_cmd(&cli, start).await,
+        Command::Shell { start: _, no_start } => commands::shell_cmd(&cli, !no_start).await,
     }
 }

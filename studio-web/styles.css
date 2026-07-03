@@ -318,6 +318,18 @@ a{color:inherit}
 .pager .pgind{font-family:var(--font-mono);font-size:.8rem;font-weight:500;color:var(--text);min-width:84px;text-align:center}
 .pager .pgind b{color:var(--brand)}
 
+/* onboarding empty-state (Live) — one-click demo is the primary path */
+.onboard-cta{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:14px}
+.onboard-cta .btn{min-width:190px;flex:none}
+.onboard-cta-hint{font-size:.8rem;color:var(--text-2);line-height:1.5;max-width:42ch}
+.onboard-note{display:flex;align-items:center;gap:9px;margin-top:14px;padding:11px 14px;border-radius:var(--r-md);font-size:.84rem;font-weight:500;background:var(--surface-2);border:1px solid var(--border);color:var(--text-2)}
+.onboard-note svg{width:16px;height:16px;flex:none}
+.onboard-note.ok{background:var(--safe-soft);border-color:transparent;color:var(--safe)}
+.onboard-note.warn{background:var(--warn-soft);border-color:transparent;color:var(--warn)}
+.spin.sm{width:15px;height:15px;border-width:2px;margin:0;flex:none}
+.onboard-sep{display:flex;align-items:center;gap:12px;margin:20px 0 4px;color:var(--text-3);font-family:var(--font-mono);font-size:.62rem;letter-spacing:.14em;text-transform:uppercase}
+.onboard-sep::before,.onboard-sep::after{content:"";flex:1;height:1px;background:var(--divider)}
+
 /* empty / loading / error states */
 .state{padding:44px 18px;text-align:center;color:var(--text-2)}
 .state .big{font-family:var(--font-display);font-weight:600;font-size:1.1rem;color:var(--text);margin-bottom:6px;letter-spacing:-.01em}
@@ -472,6 +484,9 @@ a{color:inherit}
 .step-n{width:26px;height:26px;border-radius:var(--r-full);background:var(--brand-fill);color:var(--on-brand);display:grid;place-items:center;flex:none;font-family:var(--font-mono);font-weight:600;font-size:.8rem}
 .step-b{flex:1;min-width:0}
 .step-t{font-weight:600;font-size:.9rem;margin-bottom:2px}
+.snip-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px}
+.snip-grid .codeblock{margin-top:0}
+@media(max-width:760px){.snip-grid{grid-template-columns:1fr}}
 .about-foot{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .about-foot-meta{font-family:var(--font-mono);font-size:.72rem;color:var(--text-3)}
 
