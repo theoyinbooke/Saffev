@@ -1128,6 +1128,11 @@
         const row = reqRow(it, { columns: LIVE_COLS, streaming: it.stream, enter: true });
         this.seen[it.id] = row;
         stream.prepend(row);
+        // Keep the privacy lens live: fold this exchange into the recent window
+        // and re-render, so request-side PII shows immediately (not only on the
+        // next full refresh). Matters most right after the one-click demo.
+        this._lastRecent = [it, ...(this._lastRecent || [])].slice(0, 50);
+        this.renderPrivacyLens(this._lastRecent);
         while (stream.children.length > 14) {
           const last = stream.lastElementChild;
           if (last && last.dataset.id) delete this.seen[last.dataset.id];
