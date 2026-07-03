@@ -123,6 +123,47 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_safety_record ON safety_findings(record_id);
     CREATE INDEX IF NOT EXISTS idx_eval_record ON eval_scores(record_id);
     "#,
+    // --- v5: the Preservation archive (durable copy of coding-agent sessions) ---
+    //
+    // Coding tools delete their own history on their own clocks (Claude Code prunes
+    // after `cleanupPeriodDays`, Cursor rotates its store). This is Saffev's durable,
+    // encrypted-at-rest copy so a session survives the source app deleting it.
+    // `content_hash` is the incremental change key; `source_deleted` marks entries
+    // the source has since removed (we NEVER delete our copy for that reason).
+    r#"
+    CREATE TABLE archived_sessions (
+        id              TEXT PRIMARY KEY,   -- namespaced "<tool>:<raw>"
+        tool            TEXT NOT NULL,
+        source_id       TEXT NOT NULL,      -- raw (un-namespaced) id
+        title           TEXT,
+        project         TEXT,
+        git_branch      TEXT,
+        model           TEXT,
+        started_ts      INTEGER NOT NULL,
+        updated_ts      INTEGER NOT NULL,
+        message_count   INTEGER NOT NULL,
+        tool_call_count INTEGER NOT NULL,
+        input_tokens    INTEGER NOT NULL,
+        output_tokens   INTEGER NOT NULL,
+        cache_tokens    INTEGER NOT NULL,
+        source_path     TEXT,
+        content_hash    TEXT NOT NULL,
+        archived_ts     INTEGER NOT NULL,
+        source_deleted  INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE archived_messages (
+        session_id TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        role       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        content    TEXT NOT NULL,
+        ts         INTEGER,
+        tool_name  TEXT,
+        PRIMARY KEY (session_id, seq)
+    );
+    CREATE INDEX idx_archived_updated ON archived_sessions(updated_ts);
+    CREATE INDEX idx_archived_tool ON archived_sessions(tool, source_id);
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod agents;
 pub mod attribution;
 pub mod brain;
 pub mod brand;

@@ -278,7 +278,7 @@ a{color:inherit}
 /* toolbar (history filters) */
 .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
 /* forensic filter bar: search field + segmented scope + page size */
-.filterbar{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.filterbar{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;position:relative;z-index:20}
 .searchfield{display:flex;align-items:center;gap:9px;flex:1;min-width:260px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:0 13px;min-height:42px;transition:border-color .15s,box-shadow .15s}
 .searchfield:focus-within{border-color:var(--brand);box-shadow:var(--ring)}
 .searchfield .sf-ic{display:grid;place-items:center;color:var(--text-3);flex:none}
@@ -382,6 +382,85 @@ a{color:inherit}
 .msg.msg-system .msg-role{color:var(--gold)}
 .linkbtn{background:none;border:none;padding:6px 0 0;margin:0;color:var(--brand);font-family:var(--font-mono);font-size:.7rem;cursor:pointer}
 .linkbtn:hover{color:var(--brand-press);text-decoration:underline}
+.msg.msg-think .msg-body{color:var(--text-2);font-style:italic}
+.msg.msg-tool .msg-role{color:var(--gold)}
+
+/* ---------- Agents (coding-tool history) ---------- */
+/* Source tag — every session/message is attributed to its tool. */
+.toolbadge{font-family:var(--font-mono);font-size:.58rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:var(--r-sm);white-space:nowrap;display:inline-block}
+.tb-claude_code{background:var(--brand-soft);color:var(--brand)}
+.tb-codex{background:var(--gold-soft);color:var(--gold)}
+.tb-opencode{background:var(--safe-soft);color:var(--safe)}
+.tb-cursor{background:var(--danger-soft);color:var(--danger)}
+.tb-vscode{background:color-mix(in srgb,#3b82f6 15%,transparent);color:#2f7ae5}
+/* ---------- Per-tool overview table ---------- */
+.tooltbl .trow.static{cursor:default}
+.tooltbl .trow.static:hover{background:transparent}
+.tt-src{display:flex;align-items:center;gap:9px;min-width:0}
+.tt-ic{width:26px;height:26px;border-radius:var(--r-sm);display:grid;place-items:center;flex:none}
+.tt-ic svg{width:15px;height:15px}
+.tt-nm{font-family:var(--font-display);font-weight:600;font-size:.9rem;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tooltbl .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:.82rem;color:var(--text-1)}
+.tooltbl .retline{margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* AI summary block (optional Codex backend) */
+.aiblk h4{display:flex;align-items:center;gap:6px}
+.aiblk-ic{display:inline-flex;color:var(--brand)}
+.aiblk-ic svg{width:14px;height:14px}
+.ai-btn{display:inline-flex;align-items:center;gap:6px;background:var(--brand);color:#fff;border:none;border-radius:var(--r-sm);padding:8px 14px;font-family:var(--font-display);font-size:.82rem;font-weight:500;cursor:pointer;white-space:nowrap}
+.ai-btn:hover{background:var(--brand-press)}
+.ai-btn:disabled{opacity:.6;cursor:default}
+.ai-btn .aiblk-ic{color:#fff}
+.ai-note{font-family:var(--font-mono);font-size:.62rem;color:var(--text-3);margin-top:6px}
+.ai-hint{font-size:.82rem;color:var(--text-2)}
+.ai-hint a{color:var(--brand);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--brand) 40%,transparent)}
+.ai-out{margin-top:10px}
+.ai-summary{font-size:.86rem;line-height:1.55;color:var(--text-1)}
+.ai-summary h5{font-family:var(--font-display);font-size:.74rem;font-weight:600;letter-spacing:.02em;text-transform:uppercase;color:var(--text-3);margin:12px 0 4px}
+.ai-summary h5:first-child{margin-top:0}
+.ai-summary p{margin:6px 0}
+.ai-summary ul{margin:4px 0 4px 2px;padding-left:16px;list-style:none}
+.ai-summary li{position:relative;margin:3px 0;padding-left:12px}
+.ai-summary li::before{content:'·';position:absolute;left:0;color:var(--brand);font-weight:700}
+.ai-summary code{font-family:var(--font-mono);font-size:.82em;background:var(--surface-2);padding:1px 4px;border-radius:3px}
+.ai-err{font-size:.82rem;color:var(--danger);background:var(--danger-soft);border-radius:var(--r-sm);padding:8px 10px}
+
+/* PII/signals column in the traffic tables (split out of Source) */
+.cell-pii{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.cell-dim{color:var(--text-3)}
+
+/* ---------- Preservation (compact single-row strip) ---------- */
+.preserve{display:flex;align-items:center;gap:14px;padding:10px 16px;margin-bottom:16px}
+.preserve-left{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+.preserve-ic{display:inline-flex;color:var(--brand);flex:none}
+.preserve-ic svg{width:18px;height:18px}
+.preserve-text{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0}
+.preserve-title{font-family:var(--font-display);font-weight:600;font-size:.92rem;letter-spacing:-.01em;flex:none}
+.preserve-sub{font-size:.8rem;color:var(--text-2);line-height:1.4}
+.preserve-actions{flex:none;display:flex;gap:8px;align-items:center}
+.preserve-warn{border-color:color-mix(in srgb,var(--gold) 45%,var(--rule));background:var(--gold-soft)}
+.preserve-warn .preserve-ic{color:var(--gold)}
+/* small buttons (shared) */
+.btn.sm{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:6px 13px;min-height:0;flex:none;font-family:var(--font-display);font-size:.78rem;font-weight:500;border-radius:var(--r-sm);cursor:pointer;white-space:nowrap;border:1px solid transparent}
+.btn.sm.brand{background:var(--brand);color:#fff;border-color:transparent}
+.btn.sm.brand:hover{background:var(--brand-press)}
+.btn.sm:disabled{opacity:.6;cursor:default}
+/* per-tool retention line — now stacked in the card header (name/sessions) */
+.retline{display:flex;align-items:center;gap:6px;margin-top:6px;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.02em;color:var(--text-3)}
+.retline .retdot{width:6px;height:6px;border-radius:50%;background:var(--text-3);flex:none}
+.retline.warn{color:var(--gold)}
+.retline.warn .retdot{background:var(--gold)}
+/* preserved / resurrected badges */
+.presbadge{font-family:var(--font-mono);font-size:.56rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 6px;border-radius:var(--r-sm);background:var(--brand-soft);color:var(--brand);white-space:nowrap}
+.presbadge.deleted{background:var(--gold-soft);color:var(--gold)}
+/* export row in the drawer */
+.exprow{display:flex;align-items:center;gap:8px;margin-top:14px}
+.exp-l{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
+.btn.ghost.sm{background:var(--surface-2);color:var(--text-1);border:1px solid var(--rule);border-radius:var(--r-sm);padding:5px 12px;font-size:.78rem;font-family:var(--font-display);cursor:pointer;white-space:nowrap}
+.btn.ghost.sm:hover{border-color:var(--brand);color:var(--brand)}
+.btn.ghost.sm:disabled{opacity:.5;cursor:default}
+/* Agents source filter: design-system dropdown sits beside the search field */
+.filterbar .dropdown{min-width:160px}
 .findlist{margin-top:8px;display:flex;flex-direction:column;gap:7px}
 .find{display:flex;align-items:center;gap:8px;font-size:.79rem}
 .find .where{font-family:var(--font-mono);color:var(--text-3);margin-left:auto;font-size:.7rem}

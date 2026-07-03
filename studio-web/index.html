@@ -6,6 +6,12 @@
   <meta name="color-scheme" content="light dark" />
   <title>Saffev — local ai studio</title>
 
+  <!-- Favicon: inline SVG data-URI of the brand target glyph (matches the
+       sidebar mark). Inlined so the browser never requests /favicon.ico — no
+       extra asset, no network round-trip, fully offline. The rationed brand
+       teal reads on both light and dark browser tabs. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2034'%3E%3Ccircle%20cx='17'%20cy='17'%20r='15.3'%20fill='none'%20stroke='%2311766E'%20stroke-width='1.6'/%3E%3Ccircle%20cx='17'%20cy='17'%20r='8.6'%20fill='none'%20stroke='%2311766E'%20stroke-width='1.6'/%3E%3Ccircle%20cx='17'%20cy='17'%20r='3'%20fill='%2311766E'/%3E%3C/svg%3E" />
+
   <!-- Self-hosted fonts (woff2 baked into the binary) — no CDN, fully offline. -->
   <link rel="stylesheet" href="/fonts.css" />
 
@@ -36,6 +42,9 @@
         </a>
         <a data-route="history" href="#/history">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> History
+        </a>
+        <a data-route="agents" href="#/agents">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 0-4 4v1H7a3 3 0 0 0-3 3v2a3 3 0 0 0 3 3h1v1a4 4 0 0 0 8 0v-1h1a3 3 0 0 0 3-3v-2a3 3 0 0 0-3-3h-1V6a4 4 0 0 0-4-4Z"/><path d="M9 11h.01M15 11h.01"/></svg> Agents
         </a>
         <a data-route="analytics" href="#/analytics">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5M4 19h16M8 16V9M13 16V6M18 16v-4"/></svg> Analytics

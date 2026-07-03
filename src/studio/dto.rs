@@ -384,6 +384,20 @@ pub struct SettingsView {
     /// (the judge is inert until a model is chosen).
     #[serde(default)]
     pub eval_judge_model: Option<String>,
+    /// AI-analysis backend master switch (Codex + ChatGPT subscription). Off by
+    /// default; the only feature that sends session text off-device.
+    #[serde(default)]
+    pub analysis_enabled: bool,
+    /// Whether the Codex backend is even usable here (binary present + authed).
+    /// When false, the toggle is moot (nothing to enable).
+    #[serde(default)]
+    pub analysis_available: bool,
+    /// Preservation archive master switch (opt-in).
+    #[serde(default)]
+    pub archive_enabled: bool,
+    /// Auto-snapshot on start + periodically.
+    #[serde(default)]
+    pub archive_auto: bool,
     /// Fields whose new value was persisted to TOML but is **not** applied to the
     /// running process because it cannot be safely changed at runtime — `mode` and
     /// the ports rebind the listeners / re-adopt the engine. Empty when the last
@@ -425,6 +439,13 @@ pub struct SettingsUpdate {
     pub eval_sample_rate: Option<f32>,
     /// Set the quality-judge model (empty string clears it).
     pub eval_judge_model: Option<String>,
+    /// Toggle the AI-analysis backend (Codex + subscription). Enabling is an
+    /// explicit user action — it permits sending session text to OpenAI via Codex.
+    pub analysis_enabled: Option<bool>,
+    /// Toggle the Preservation archive (durable local copy of agent history).
+    pub archive_enabled: Option<bool>,
+    /// Toggle automatic snapshots.
+    pub archive_auto: Option<bool>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.
@@ -519,6 +540,187 @@ pub struct DemoResult {
     pub model: Option<String>,
     /// Short human note for the UI (what happened / what to do next).
     pub note: String,
+}
+
+/// One coding tool's presence + rollup (Agents overview).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolStat {
+    /// Stable key (`claude_code`, `codex`, `opencode`, `cursor`).
+    pub tool: String,
+    /// Human label.
+    pub label: String,
+    /// History present on this machine?
+    pub present: bool,
+    /// Session count (as listed; may be capped).
+    pub sessions: u32,
+    /// Total tokens (in + out) across listed sessions.
+    pub tokens: u64,
+    /// Estimated USD cost across listed sessions.
+    pub cost_usd: f64,
+    /// Most recent activity (unix millis).
+    pub last_active: i64,
+}
+
+/// Whether the optional AI-analysis backend (Codex + subscription) is present
+/// and enabled — drives the "Summarize" affordance in the UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisStatus {
+    /// Codex is installed and authenticated on this machine.
+    pub available: bool,
+    /// The user has opted the feature on in Settings.
+    pub enabled: bool,
+    /// Configured model, if pinned (`None` = Codex default).
+    pub model: Option<String>,
+}
+
+/// One tool's retention behavior + what's at risk (Preservation awareness).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtRiskView {
+    pub tool: String,
+    pub label: String,
+    /// `age_days` | `churn` | `keeps_all` | `unknown`.
+    pub kind: String,
+    /// Age cutoff in days when `kind == age_days`.
+    pub days: Option<u32>,
+    /// Plain-language description.
+    pub note: String,
+    pub total: u32,
+    pub expiring_soon: u32,
+    pub overdue: u32,
+    pub soonest_expiry_ts: Option<i64>,
+}
+
+/// Archive footprint + switches (Preservation).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveStatusView {
+    pub enabled: bool,
+    pub auto: bool,
+    /// Sessions preserved.
+    pub count: u64,
+    /// Messages preserved.
+    pub messages: u64,
+    /// Approximate bytes stored.
+    pub bytes: u64,
+}
+
+/// `GET /api/agents` — the Agents overview.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsOverview {
+    /// Per-tool stats (all tools, present or not).
+    pub tools: Vec<AgentToolStat>,
+    pub total_sessions: u32,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    /// AI-analysis backend status.
+    pub analysis: AnalysisStatus,
+    /// Per-tool retention + at-risk breakdown.
+    pub at_risk: Vec<AtRiskView>,
+    /// Archive footprint + switches.
+    pub archive: ArchiveStatusView,
+}
+
+/// `POST /api/archive/export` — bulk export result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    /// Sessions written.
+    pub count: u32,
+    /// Sessions that failed to write.
+    pub errors: u32,
+    /// Absolute destination directory.
+    pub dir: String,
+}
+
+/// `POST /api/agents/sessions/:id/summarize` — an AI summary of one session.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryResult {
+    /// The generated summary text.
+    pub summary: String,
+    /// Model that produced it, if known.
+    pub model: Option<String>,
+    /// Wall-clock time (millis).
+    pub elapsed_ms: u64,
+}
+
+/// A source-tagged coding-agent session summary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionView {
+    pub id: String,
+    /// Source tool key + label (the tag).
+    pub tool: String,
+    pub label: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
+    pub model: Option<String>,
+    pub started_ts: i64,
+    pub updated_ts: i64,
+    pub message_count: u32,
+    pub tool_call_count: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+    pub cost_usd: f64,
+    /// PII findings on this session (present in detail; 0 in list for speed).
+    pub pii_count: u32,
+    /// The file the session was read from (source tag).
+    pub source_path: String,
+    /// A durable copy exists in Saffev's archive.
+    #[serde(default)]
+    pub preserved: bool,
+    /// The source app has deleted its copy; Saffev's archive is the only one left.
+    #[serde(default)]
+    pub source_deleted: bool,
+}
+
+/// One message in a session transcript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageView {
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub ts: Option<i64>,
+    pub tool_name: Option<String>,
+}
+
+/// `GET /api/agents/sessions/:id` — full transcript + PII lens.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionDetailView {
+    pub session: AgentSessionView,
+    pub messages: Vec<AgentMessageView>,
+    /// PII findings across the transcript (what was pasted into the agent).
+    pub pii: Vec<PiiFindingView>,
+}
+
+/// Per-model rollup for the Agents analytics.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelStat {
+    pub model: String,
+    pub sessions: u32,
+    pub tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// `GET /api/agents/analytics` — cross-session rollups.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAnalytics {
+    pub total_sessions: u32,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub total_tool_calls: u64,
+    pub by_tool: Vec<AgentToolStat>,
+    pub by_model: Vec<AgentModelStat>,
 }
 
 /// Uniform error envelope for any failed `/api/*` call.

@@ -115,6 +115,13 @@
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtNum = (n) => (n == null ? '·' : Number(n).toLocaleString());
+  const fmtBytes = (n) => {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  };
   function initials(name) {
     if (!name) return '?';
     const parts = String(name).trim().split(/[\s._-]+/).filter(Boolean);
@@ -345,16 +352,17 @@
   }
 
   const REQ_COLS = {
-    app:      { label: 'Source',   w: 'minmax(104px,1.3fr)', r: false },
+    app:      { label: 'Source',   w: 'minmax(96px,1fr)',    r: false },
     model:    { label: 'Model',    w: 'minmax(74px,1fr)',    r: false },
     endpoint: { label: 'Endpoint', w: 'minmax(82px,1.1fr)',  r: false },
     status:   { label: 'Status',   w: 'minmax(72px,auto)',   r: false },
+    pii:      { label: 'PII',      w: 'minmax(64px,auto)',   r: false },
     lat:      { label: 'Latency',  w: '68px',                r: true },
     tokens:   { label: 'Tokens',   w: 'minmax(86px,auto)',   r: true },
     time:     { label: 'Time',     w: '92px',                r: true },
   };
-  const LIVE_COLS = ['app', 'model', 'endpoint', 'status', 'lat', 'tokens', 'time'];
-  const HIST_COLS = ['app', 'model', 'endpoint', 'status', 'lat', 'tokens', 'time'];
+  const LIVE_COLS = ['app', 'model', 'endpoint', 'status', 'pii', 'lat', 'tokens', 'time'];
+  const HIST_COLS = ['app', 'model', 'endpoint', 'status', 'pii', 'lat', 'tokens', 'time'];
   function gtcFor(cols) { return cols.map((k) => REQ_COLS[k].w).join(' '); }
 
   // Column header strip. Lives ABOVE the scrolling body so it stays fixed.
@@ -367,16 +375,22 @@
   // One cell for `key`, populated from `item`.
   function reqCell(key, item) {
     if (key === 'app') {
+      // Source is just the app now — PII/safety live in their own column.
       const cell = el('div', { class: 'tcell cell-app' });
       cell.appendChild(el('span', { class: 'nm', text: item.sourceApp || 'Unknown' }));
-      // Collapse multiple PII kinds to "first + N" so the source column stays tidy.
+      return cell;
+    }
+    if (key === 'pii') {
+      const cell = el('div', { class: 'tcell cell-pii' });
+      // Collapse multiple PII kinds to "first + N" to keep the column compact.
       const kinds = item.piiKinds || [];
       if (kinds.length) {
         cell.appendChild(el('span', { class: 'piibadge' + (kinds[0] === 'api_key' ? ' key' : ''), 'data-k': kinds[0], text: piiShort(kinds[0]) }));
         if (kinds.length > 1) cell.appendChild(el('span', { class: 'piibadge more', title: kinds.slice(1).map(piiShort).join(', '), text: '+' + (kinds.length - 1) }));
       }
-      // Safety flag badge (eval pipeline).
+      // Safety flag (eval pipeline) shares this signals column.
       if (item.safetyFlagged) cell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
+      if (!kinds.length && !item.safetyFlagged) cell.appendChild(el('span', { class: 'cell-dim', text: '·' }));
       return cell;
     }
     if (key === 'model') return el('div', { class: 'tcell cell-model', title: item.model || '', text: item.model || '·' });
@@ -1278,9 +1292,11 @@
         const row = this.seen[msg.id];
         if (row) {
           row.classList.add('flagged');
-          const appCell = row.querySelector('.cell-app');
-          if (appCell && !appCell.querySelector('.safetybadge')) {
-            appCell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
+          const piiCell = row.querySelector('.cell-pii');
+          if (piiCell && !piiCell.querySelector('.safetybadge')) {
+            const dim = piiCell.querySelector('.cell-dim');
+            if (dim) dim.remove();
+            piiCell.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
           }
         }
       }
@@ -1903,6 +1919,32 @@
       );
       evalCard.appendChild(setRow('Judge sampling', 'Fraction of exchanges sent to the model judge. The safety guard always runs on all exchanges when enabled.', el('div', { class: 'ctl' }, [rateSel])));
       panel.appendChild(evalCard);
+
+      // AI analysis (optional Codex app-server backend). The ONLY feature that
+      // sends content off-device — strictly opt-in, and only on an explicit click.
+      const aiCard = el('div', { class: 'card reveal', style: 'animation-delay:.16s' }, [el('div', { class: 'hrow' }, [el('h3', {}, [el('span', { class: 'aiblk-ic', html: ICON.sparkles }), document.createTextNode(' AI analysis')])])]);
+      const aiEnable = switchBtn(s.analysisEnabled, 'Toggle AI analysis', { disabled: !s.analysisAvailable });
+      aiEnable.addEventListener('click', () => { if (!s.analysisAvailable) return; this.save(view, { analysisEnabled: !aiEnable.classList.contains('on') }); });
+      const aiHint = !s.analysisAvailable
+        ? 'Codex not detected on this machine. Install the Codex CLI and sign in to enable AI summaries.'
+        : (s.analysisEnabled
+          ? 'On · the Summarize button in a session uses your Codex + ChatGPT subscription. Session text is sent to OpenAI (via your own Codex) only when you click Summarize.'
+          : 'Off · nothing leaves the device. Turn on to summarize coding sessions with your Codex subscription.');
+      aiCard.appendChild(setRow('Enable AI analysis', aiHint, el('div', { class: 'ctl' }, [aiEnable])));
+      panel.appendChild(aiCard);
+
+      // Preservation archive — durable local copy that survives source deletion.
+      const arCard = el('div', { class: 'card reveal', style: 'animation-delay:.2s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Preservation' })])]);
+      const arEnable = switchBtn(s.archiveEnabled, 'Toggle preservation archive');
+      arEnable.addEventListener('click', () => this.save(view, { archiveEnabled: !arEnable.classList.contains('on') }));
+      const arHint = s.archiveEnabled
+        ? 'On · Saffev keeps a durable, encrypted copy of your agent history that survives the source apps deleting theirs. Local-only, nothing leaves the device.'
+        : 'Off · your history lives only in each tool, subject to its deletion policy. Turn on to keep your own copy.';
+      arCard.appendChild(setRow('Enable preservation', arHint, el('div', { class: 'ctl' }, [arEnable])));
+      const arAuto = switchBtn(s.archiveAuto, 'Toggle automatic snapshots', { disabled: !s.archiveEnabled });
+      arAuto.addEventListener('click', () => { if (!s.archiveEnabled) return; this.save(view, { archiveAuto: !arAuto.classList.contains('on') }); });
+      arCard.appendChild(setRow('Automatic snapshots', !s.archiveEnabled ? 'Enable preservation first.' : 'Snapshot on start and periodically, so the archive stays current without a manual click.', el('div', { class: 'ctl' }, [arAuto])));
+      panel.appendChild(arCard);
     },
 
     panelSystem(panel, view, s) {
@@ -2623,9 +2665,410 @@
     teardown() {},
   };
 
+  /* =========================================================================
+     PAGE: AGENTS — read AI coding tools' local session history on-device
+     ========================================================================= */
+  const AGENT_ICON = {
+    claude_code: ICON.pulse, codex: ICON.bolt, opencode: ICON.server, cursor: ICON.eye,
+    vscode: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 7l-2 10"/></svg>',
+  };
+  function toolBadge(tool, label) {
+    return el('span', { class: 'toolbadge tb-' + tool, text: label });
+  }
+  const AGENT_COLS = [
+    { label: 'Source', w: '.6fr' },
+    { label: 'Session', w: '2.2fr' },
+    { label: 'Model', w: '1fr' },
+    { label: 'Msgs', w: '.5fr', r: true },
+    { label: 'Tokens', w: '.75fr', r: true },
+    { label: 'Cost', w: '.6fr', r: true },
+    { label: 'Updated', w: '.8fr', r: true },
+  ];
+  function agentGtc() { return AGENT_COLS.map((c) => c.w).join(' '); }
+  function agentHead() {
+    const head = el('div', { class: 'thead' });
+    AGENT_COLS.forEach((c) => head.appendChild(el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label })));
+    return head;
+  }
+
+  const Agents = {
+    title: 'Agents',
+    sub: 'Own your AI history. Read on-device, see what each tool is about to delete, and keep a durable copy that is yours.',
+    q: '', tool: '',
+    _tools: [],
+
+    async render(view) {
+      this.q = ''; this.tool = '';
+      view.innerHTML = '';
+      view.appendChild(loadingState('Reading coding-agent history…'));
+      let ov;
+      try { ov = await api('/agents'); hideBanner(); }
+      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not read agent history', e.message || '')); return; }
+      view.innerHTML = '';
+      this._tools = ov.tools;
+      this._analysis = ov.analysis || { available: false, enabled: false };
+      this._atRisk = ov.atRisk || [];
+      this._archive = ov.archive || { enabled: false, count: 0, bytes: 0 };
+
+      // Overview metric strip.
+      view.appendChild(statStrip(4, [
+        statCell('Sessions', fmtNum(ov.totalSessions), 'across all tools'),
+        statCell('Preserved', fmtNum(this._archive.count), this._archive.enabled ? fmtBytes(this._archive.bytes) : 'archive off'),
+        statCell('Est. cost', '$' + (ov.totalCostUsd || 0).toFixed(2), 'vs cloud pricing'),
+        statCell('Tools', String(ov.tools.filter((t) => t.present).length), 'detected on-device'),
+      ]));
+
+      // Preservation banner — the wedge: surface at-risk history + archive state.
+      view.appendChild(this.preserveBanner());
+
+      // Per-tool source cards.
+      const present = ov.tools.filter((t) => t.present);
+      if (!present.length) {
+        view.appendChild(el('div', { class: 'card reveal' }, [
+          aboutSection(ICON.eye, 'No coding agents detected', 'Nothing to read yet'),
+          el('p', { class: 'about-p', text: 'Saffev reads local session history from Claude Code, Codex, OpenCode, and Cursor — on-device, nothing leaves the machine. None were found in their usual locations.' }),
+        ]));
+        return;
+      }
+      view.appendChild(this.toolTable(present));
+
+      // Filter bar: search + source (tool) facet.
+      const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
+      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search title, project, or model…' });
+      let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reloadSessions(); }, 250); });
+      const scopes = [{ value: '', label: 'All sources' }].concat(present.map((t) => ({ value: t.tool, label: t.label })));
+      const seg = dropdown(scopes, this.tool, (v) => { if (this.tool === v) return; this.tool = v; this.reloadSessions(); }, { ariaLabel: 'Filter by source' });
+      view.appendChild(el('div', { class: 'filterbar reveal' }, [
+        el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]),
+        seg,
+      ]));
+
+      // Session list.
+      view.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+        el('div', { class: 'ttable', style: '--gtc:' + agentGtc() }, [
+          agentHead(),
+          el('div', { class: 'list', id: 'agentList' }),
+        ]),
+      ]));
+      await this.reloadSessions();
+    },
+
+    // Per-tool overview as a compact table (one row per tool) — scales cleanly to
+    // any number of tools and keeps the big token/cost numbers aligned.
+    toolTable(present) {
+      const COLS = [
+        { label: 'Source', w: 'minmax(150px,1.5fr)' },
+        { label: 'Sessions', w: 'minmax(72px,.7fr)', r: true },
+        { label: 'Retention', w: 'minmax(130px,1.2fr)' },
+        { label: 'Tokens', w: 'minmax(96px,1fr)', r: true },
+        { label: 'Est. cost', w: 'minmax(84px,.8fr)', r: true },
+      ];
+      const head = el('div', { class: 'thead' }, COLS.map((c) => el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label })));
+      const list = el('div', { class: 'list' });
+      present.forEach((t) => {
+        const risk = (this._atRisk || []).find((r) => r.tool === t.tool);
+        let retText = '', retWarn = false, retTitle = '';
+        if (risk) {
+          retTitle = risk.note;
+          const atrisk = (risk.overdue || 0) + (risk.expiringSoon || 0);
+          if (risk.kind === 'age_days' && atrisk > 0) { retWarn = true; retText = atrisk + ' at risk · ' + risk.days + 'd'; }
+          else if (risk.kind === 'age_days') retText = 'deletes after ' + risk.days + 'd';
+          else if (risk.kind === 'keeps_all') retText = 'no auto-delete';
+          else if (risk.kind === 'churn') retText = 'rotates old chats';
+        }
+        const row = el('div', { class: 'trow static' }, [
+          el('div', { class: 'tcell' }, [el('span', { class: 'tt-src' }, [
+            el('span', { class: 'tt-ic tb-' + t.tool, html: AGENT_ICON[t.tool] || ICON.server }),
+            el('span', { class: 'tt-nm', text: t.label }),
+          ])]),
+          el('div', { class: 'tcell r num', text: fmtNum(t.sessions) }),
+          el('div', { class: 'tcell' }, [
+            retText
+              ? el('span', { class: 'retline' + (retWarn ? ' warn' : ''), title: retTitle }, [el('span', { class: 'retdot' }), document.createTextNode(retText)])
+              : el('span', { class: 'cell-dim', text: '·' }),
+          ]),
+          el('div', { class: 'tcell r num', text: fmtNum(t.tokens) }),
+          el('div', { class: 'tcell r num', text: '$' + (t.costUsd || 0).toFixed(2) }),
+        ]);
+        list.appendChild(row);
+      });
+      return el('div', { class: 'card reveal tooltbl', style: 'margin-bottom:16px;padding:0;overflow:hidden' }, [
+        el('div', { class: 'ttable', style: '--gtc:' + COLS.map((c) => c.w).join(' ') }, [head, list]),
+      ]);
+    },
+
+    // The wedge: make invisible data loss visible + offer to preserve it.
+    preserveBanner() {
+      const risks = this._atRisk || [];
+      const arch = this._archive || {};
+      const overdue = risks.reduce((a, r) => a + (r.overdue || 0), 0);
+      const soon = risks.reduce((a, r) => a + (r.expiringSoon || 0), 0);
+      const atrisk = overdue + soon;
+      const wrap = el('div', { class: 'card reveal preserve' + (atrisk > 0 && !arch.enabled ? ' preserve-warn' : '') });
+      wrap.appendChild(el('div', { class: 'preserve-left' }, [
+        el('span', { class: 'preserve-ic', html: ICON.shield || ICON.eye }),
+        el('div', { class: 'preserve-text' }, [
+          el('span', { class: 'preserve-title', text: 'Preservation' }),
+          el('span', { class: 'preserve-sub', text: this.preserveMsg(atrisk, overdue, soon, arch) }),
+        ]),
+      ]));
+      const actions = el('div', { class: 'preserve-actions' });
+      if (arch.enabled) {
+        const btn = el('button', { class: 'btn sm brand', type: 'button', id: 'archiveNowBtn', text: 'Archive now' });
+        btn.addEventListener('click', () => this.archiveNow(btn));
+        actions.appendChild(btn);
+      } else {
+        actions.appendChild(el('a', { class: 'btn sm brand', href: '#/settings', text: 'Turn on Preservation' }));
+      }
+      const exp = el('button', { class: 'btn ghost sm', type: 'button', text: 'Export all' });
+      exp.addEventListener('click', () => this.exportAll(exp));
+      actions.appendChild(exp);
+      wrap.appendChild(actions);
+      return wrap;
+    },
+
+    async exportAll(btn) {
+      const orig = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Exporting…';
+      try {
+        const r = await api('/archive/export', { method: 'POST', body: { format: 'md' } });
+        showBanner('Exported ' + fmtNum(r.count) + ' sessions to ' + r.dir + (r.errors ? ' · ' + r.errors + ' failed' : ''));
+      } catch (e) { handleApiError(e); }
+      btn.disabled = false; btn.textContent = orig;
+    },
+
+    preserveMsg(atrisk, overdue, soon, arch) {
+      if (atrisk > 0) {
+        const parts = [];
+        if (overdue) parts.push(overdue + ' already overdue');
+        if (soon) parts.push(soon + ' within 7 days');
+        const risk = atrisk + ' session' + (atrisk === 1 ? '' : 's') + ' scheduled for deletion by your tools (' + parts.join(' · ') + ').';
+        return arch.enabled
+          ? risk + ' ' + fmtNum(arch.count) + ' preserved here · ' + fmtBytes(arch.bytes) + '.'
+          : risk + ' Nothing is backed up yet.';
+      }
+      return arch.enabled
+        ? fmtNum(arch.count) + ' sessions preserved · ' + fmtBytes(arch.bytes) + '. Your history is safe here even if the tools delete theirs.'
+        : 'Your tools delete their own history on their own clocks. Turn on Preservation to keep a durable, on-device copy.';
+    },
+
+    async archiveNow(btn) {
+      const orig = btn.innerHTML;
+      btn.disabled = true; btn.textContent = 'Archiving…';
+      try {
+        const r = await api('/archive/run', { method: 'POST' });
+        showBanner('Archived ' + fmtNum(r.archived) + ' new · ' + fmtNum(r.skipped) + ' unchanged' + (r.deletedDetected ? ' · ' + r.deletedDetected + ' deleted from source, preserved here' : ''));
+        this.render($('#view')); // refresh counts + banner
+      } catch (e) {
+        handleApiError(e); btn.disabled = false; btn.innerHTML = orig;
+      }
+    },
+
+    // Download a session in an open format (auth-gated fetch → blob download).
+    exportBtn(id, fmt, label) {
+      const b = el('button', { class: 'btn ghost sm', type: 'button', text: label });
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const res = await fetch('/api/agents/sessions/' + encodeURIComponent(id) + '/export?format=' + fmt, { headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {} });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const blob = await res.blob();
+          const cd = res.headers.get('content-disposition') || '';
+          const m = cd.match(/filename="([^"]+)"/);
+          const name = m ? m[1] : (id.replace(/:/g, '_') + '.' + fmt);
+          const url = URL.createObjectURL(blob);
+          const a = el('a', { href: url, download: name });
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (e) { showBanner('Export failed: ' + (e.message || ''), 'danger'); }
+        b.disabled = false;
+      });
+      return b;
+    },
+
+    async reloadSessions() {
+      const list = $('#agentList');
+      if (!list) return;
+      list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Loading sessions…' })]));
+      let rows;
+      try { rows = await api('/agents/sessions?limit=500' + (this.tool ? '&tool=' + encodeURIComponent(this.tool) : '') + (this.q ? '&q=' + encodeURIComponent(this.q) : '')); }
+      catch (e) { list.innerHTML = ''; list.appendChild(el('div', { class: 'state sm', text: e.message || 'Could not load.' })); return; }
+      list.innerHTML = '';
+      if (!rows.length) { list.appendChild(el('div', { class: 'state sm', style: 'padding:28px', text: this.q ? 'No sessions match.' : 'No sessions.' })); return; }
+      rows.forEach((s) => list.appendChild(this.row(s)));
+    },
+
+    row(s) {
+      const row = el('div', { class: 'trow', tabindex: '0', 'data-id': s.id });
+      const cell = (c, node) => { const d = el('div', { class: 'tcell' + (c.r ? ' r' : '') }); d.appendChild(node); return d; };
+      row.appendChild(cell(AGENT_COLS[0], toolBadge(s.tool, s.label)));
+      const title = el('div', { class: 'cell-app' }, [el('span', { class: 'nm', title: s.project || '', text: s.title || 'Untitled session' })]);
+      if (s.sourceDeleted) title.appendChild(el('span', { class: 'presbadge deleted', title: 'Deleted from the source app · preserved by Saffev', text: 'preserved' }));
+      else if (s.preserved) title.appendChild(el('span', { class: 'presbadge', title: 'A durable copy is in your archive', text: 'archived' }));
+      if (s.piiCount > 0) title.appendChild(el('span', { class: 'piibadge key', title: s.piiCount + ' PII findings', text: 'PII' }));
+      row.appendChild(cell(AGENT_COLS[1], title));
+      row.appendChild(cell(AGENT_COLS[2], el('span', { class: 'cell-model', text: s.model || '·' })));
+      row.appendChild(cell(AGENT_COLS[3], el('span', { class: 'cell-tokens', text: fmtNum(s.messageCount) })));
+      row.appendChild(cell(AGENT_COLS[4], el('span', { class: 'cell-tokens', text: fmtNum(s.inputTokens + s.outputTokens) })));
+      row.appendChild(cell(AGENT_COLS[5], el('span', { class: 'cell-lat', text: s.costUsd > 0 ? '$' + s.costUsd.toFixed(2) : '·' })));
+      row.appendChild(cell(AGENT_COLS[6], el('span', { class: 'cell-time', text: s.updatedTs ? new Date(s.updatedTs).toLocaleDateString() : '·' })));
+      row.addEventListener('click', () => this.openDetail(s.id));
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.openDetail(s.id); } });
+      return row;
+    },
+
+    async openDetail(id) {
+      let d;
+      try { d = await api('/agents/sessions/' + encodeURIComponent(id)); }
+      catch (e) { handleApiError(e); return; }
+      closeDrawer();
+      const s = d.session;
+      const bg = el('div', { class: 'drawer-bg', onclick: closeDrawer });
+      const dl = el('dl', { class: 'kvgrid' });
+      const kv = (k, v) => { dl.appendChild(el('dt', { text: k })); dl.appendChild(el('dd', { text: v })); };
+      kv('Source', s.label);
+      kv('Model', s.model || '·');
+      kv('Project', s.project || '·');
+      if (s.gitBranch) kv('Branch', s.gitBranch);
+      kv('Messages', fmtNum(s.messageCount));
+      kv('Tool calls', fmtNum(s.toolCallCount));
+      kv('Tokens', fmtNum(s.inputTokens) + ' in · ' + fmtNum(s.outputTokens) + ' out' + (s.cacheTokens ? ' · ' + fmtNum(s.cacheTokens) + ' cache' : ''));
+      if (s.costUsd > 0) kv('Est. cost', '$' + s.costUsd.toFixed(2));
+      kv('Updated', new Date(s.updatedTs).toLocaleString());
+
+      const tags = el('div', { class: 'hrow', style: 'margin-top:6px;gap:6px;flex-wrap:wrap' }, [toolBadge(s.tool, s.label)]);
+      if (s.sourceDeleted) tags.appendChild(el('span', { class: 'presbadge deleted', text: 'preserved · deleted from source' }));
+      else if (s.preserved) tags.appendChild(el('span', { class: 'presbadge', text: 'archived' }));
+      const body = el('div', {}, [
+        el('button', { class: 'iconbtn close', onclick: closeDrawer, 'aria-label': 'Close', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6 18 18M18 6 6 18"/></svg>' }),
+        el('h2', { text: s.title || 'Untitled session' }),
+        tags,
+        dl,
+      ]);
+
+      // Export — the session is yours to keep, in open formats.
+      const exportRow = el('div', { class: 'exprow' }, [
+        el('span', { class: 'exp-l', text: 'Export' }),
+        this.exportBtn(s.id, 'md', 'Markdown'),
+        this.exportBtn(s.id, 'json', 'JSON'),
+      ]);
+      body.appendChild(exportRow);
+
+      // AI summary (optional Codex backend).
+      body.appendChild(this.summarizeSection(s));
+
+      // PII lens: what secrets were pasted into this agent.
+      if (d.pii && d.pii.length) {
+        const byKind = {};
+        d.pii.forEach((f) => { byKind[f.kind] = (byKind[f.kind] || 0) + 1; });
+        const fl = el('div', { class: 'payblk' }, [el('h4', { text: 'Privacy lens · ' + d.pii.length + ' findings' })]);
+        const list = el('div', { class: 'findlist' });
+        Object.keys(byKind).sort((a, b) => byKind[b] - byKind[a]).forEach((k) => {
+          list.appendChild(el('div', { class: 'find' }, [
+            el('span', { class: 'piibadge' + (k === 'api_key' ? ' key' : ''), text: piiShort(k) }),
+            el('span', { text: piiLabel(k) }),
+            el('span', { class: 'where', text: byKind[k] + '×' }),
+          ]));
+        });
+        fl.appendChild(list);
+        body.appendChild(fl);
+      }
+
+      // Transcript.
+      const tb = el('div', { class: 'payblk' }, [el('h4', { text: 'Transcript' })]);
+      const chat = el('div', { class: 'chat' });
+      d.messages.slice(0, 400).forEach((m) => {
+        const roleLabel = m.kind === 'tool_use' ? (m.toolName || 'tool') + ' (call)' : m.kind === 'tool_result' ? 'tool result' : m.kind === 'thinking' ? m.role + ' · thinking' : m.role;
+        chat.appendChild(el('div', { class: 'msg msg-' + esc(m.role) + (m.kind === 'thinking' ? ' msg-think' : '') }, [
+          el('div', { class: 'msg-role', text: roleLabel }),
+          el('div', { class: 'msg-body', text: m.content }),
+        ]));
+      });
+      if (d.messages.length > 400) tb.appendChild(el('div', { class: 'meta', style: 'margin-bottom:8px', text: 'Showing first 400 of ' + fmtNum(d.messages.length) + ' messages.' }));
+      tb.appendChild(chat);
+      body.appendChild(tb);
+      body.appendChild(el('div', { class: 'meta', style: 'margin-top:14px;word-break:break-all', text: 'Source: ' + s.sourcePath }));
+
+      const drawer = el('div', { class: 'drawer', role: 'dialog', 'aria-modal': 'true' }, [body]);
+      document.body.appendChild(bg); document.body.appendChild(drawer);
+      document.addEventListener('keydown', escClose);
+    },
+    // The optional "Summarize this session" block. Shown only when the Codex
+    // backend is present; explains the opt-in when it's off.
+    summarizeSection(s) {
+      const a = this._analysis || { available: false, enabled: false };
+      if (!a.available) return el('span', { style: 'display:none' });
+      const wrap = el('div', { class: 'payblk aiblk' }, [
+        el('h4', {}, [el('span', { class: 'aiblk-ic', html: ICON.sparkles }), document.createTextNode(' AI summary')]),
+      ]);
+      if (!a.enabled) {
+        wrap.appendChild(el('div', { class: 'ai-hint' }, [
+          document.createTextNode('Summarize this session using your Codex subscription. '),
+          el('a', { href: '#/settings', text: 'Enable in Settings' }),
+          document.createTextNode('.'),
+        ]));
+        return wrap;
+      }
+      const out = el('div', { class: 'ai-out' });
+      const btn = el('button', { class: 'btn ai-btn', type: 'button' }, [
+        el('span', { class: 'aiblk-ic', html: ICON.sparkles }),
+        document.createTextNode(' Summarize this session'),
+      ]);
+      btn.addEventListener('click', () => this.runSummary(s.id, out, btn));
+      wrap.appendChild(btn);
+      wrap.appendChild(el('div', { class: 'ai-note', text: 'Sends this session’s text to OpenAI via your Codex · uses your subscription' }));
+      wrap.appendChild(out);
+      return wrap;
+    },
+
+    async runSummary(id, out, btn) {
+      btn.disabled = true;
+      out.innerHTML = '';
+      out.appendChild(el('div', { class: 'state' }, [
+        el('div', { class: 'spin' }),
+        el('div', { class: 'sm', text: 'Analyzing with Codex… (usually 10-30s)' }),
+      ]));
+      try {
+        const r = await api('/agents/sessions/' + encodeURIComponent(id) + '/summarize', { method: 'POST' });
+        out.innerHTML = '';
+        out.appendChild(el('div', { class: 'ai-summary', html: mdLite(r.summary) }));
+        out.appendChild(el('div', { class: 'ai-note', text: 'via ' + (r.model || 'Codex') + ' · ' + ((r.elapsedMs || 0) / 1000).toFixed(1) + 's' }));
+        btn.textContent = '';
+        btn.appendChild(el('span', { class: 'aiblk-ic', html: ICON.sparkles }));
+        btn.appendChild(document.createTextNode(' Regenerate'));
+      } catch (e) {
+        out.innerHTML = '';
+        out.appendChild(el('div', { class: 'ai-err', text: e.message || 'Summary failed.' }));
+      }
+      btn.disabled = false;
+    },
+
+    teardown() {},
+  };
+
+  // Minimal, XSS-safe markdown for AI output: escapes first, then applies bold,
+  // inline code, bullet lists, and bold-only lines as small headings.
+  function mdLite(src) {
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const inline = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    let html = '', inList = false;
+    for (const raw of String(src || '').split('\n')) {
+      const line = raw.replace(/\s+$/, '');
+      const li = line.match(/^\s*[-*]\s+(.*)$/);
+      if (li) { if (!inList) { html += '<ul>'; inList = true; } html += '<li>' + inline(li[1]) + '</li>'; continue; }
+      if (inList) { html += '</ul>'; inList = false; }
+      if (!line.trim()) continue;
+      const h = line.match(/^\s*\*\*(.+?)\*\*:?\s*$/);
+      if (h) { html += '<h5>' + esc(h[1]) + '</h5>'; continue; }
+      html += '<p>' + inline(line) + '</p>';
+    }
+    if (inList) html += '</ul>';
+    return html;
+  }
+
   // Privacy + Quality are folded into Analytics tabs (see navigate() redirects);
   // they stay as objects (Analytics renders their bodies) but aren't top-level routes.
-  const ROUTES = { live: Live, history: History, analytics: Analytics, engines: Engines, settings: Settings, about: About };
+  const ROUTES = { live: Live, history: History, agents: Agents, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {

@@ -318,6 +318,55 @@ pub enum WriteOp {
     EvalScores(Vec<EvalScoreRecord>),
     /// Upsert a setting key/value.
     Setting { key: String, value: String },
+    /// Upsert an archived session + replace its messages (Preservation layer).
+    ArchiveSession(Box<ArchivedSession>),
+    /// Flag/unflag an archived session as deleted-from-source (we keep our copy).
+    MarkSourceDeleted { id: String, deleted: bool },
+}
+
+/// A coding-agent session preserved in the durable archive. Messages are carried
+/// on writes and detail reads; empty on list reads.
+#[derive(Debug, Clone)]
+pub struct ArchivedSession {
+    pub id: String,
+    pub tool: String,
+    pub source_id: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
+    pub model: Option<String>,
+    pub started_ts: i64,
+    pub updated_ts: i64,
+    pub message_count: u32,
+    pub tool_call_count: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+    pub source_path: Option<String>,
+    /// Incremental change key (hash of the normalized content).
+    pub content_hash: String,
+    pub archived_ts: i64,
+    /// The source app has since deleted its copy; ours is the only one left.
+    pub source_deleted: bool,
+    pub messages: Vec<ArchivedMessage>,
+}
+
+/// One message in an archived transcript.
+#[derive(Debug, Clone)]
+pub struct ArchivedMessage {
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub ts: Option<i64>,
+    pub tool_name: Option<String>,
+}
+
+/// Rollup of the archive's footprint (for storage awareness).
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveStats {
+    pub count: u64,
+    pub messages: u64,
+    pub bytes: u64,
 }
 
 /// A cloneable handle the proxy and control plane use to enqueue writes and run
@@ -386,6 +435,18 @@ impl Store {
             // Drop-and-log: logging must never break inference.
             tracing::warn!(target: "saffev::store", "dropped write op: {e}");
         }
+    }
+
+    /// Backpressure-safe enqueue for correctness-critical batch writes (the
+    /// Preservation archive): blocks the calling thread until the writer has room
+    /// instead of dropping. **Must** be called from a blocking context (inside
+    /// `spawn_blocking`), never on the async runtime. `Err` only if the writer is
+    /// gone.
+    pub fn enqueue_blocking(&self, op: WriteOp) -> Result<()> {
+        self.inner
+            .tx
+            .blocking_send(op)
+            .map_err(|_| Error::Store("writer thread gone".into()))
     }
 
     /// Run a read query on a fresh connection on the blocking pool. WAL mode
@@ -571,6 +632,94 @@ impl Store {
             })
             .optional()
             .map_err(Error::from)
+        })
+        .await
+    }
+
+    /// Archive index: `id -> content_hash` for every preserved session. The
+    /// snapshot job uses this to skip unchanged sessions (incremental).
+    pub async fn archived_index(&self) -> Result<std::collections::HashMap<String, String>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare("SELECT id, content_hash FROM archived_sessions")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().collect())
+        })
+        .await
+    }
+
+    /// All archived session summaries (no messages), newest first.
+    pub async fn archived_sessions(&self) -> Result<Vec<ArchivedSession>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
+                 message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
+                 source_path,content_hash,archived_ts,source_deleted \
+                 FROM archived_sessions ORDER BY updated_ts DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_archived)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// One archived session with its full transcript, or `None`.
+    pub async fn archived_detail(&self, id: &str) -> Result<Option<ArchivedSession>> {
+        let id = id.to_string();
+        self.read(move |conn| {
+            let mut session = conn
+                .query_row(
+                    "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
+                     message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
+                     source_path,content_hash,archived_ts,source_deleted \
+                     FROM archived_sessions WHERE id = ?1",
+                    [&id],
+                    row_to_archived,
+                )
+                .optional()?;
+            if let Some(s) = session.as_mut() {
+                let mut stmt = conn.prepare(
+                    "SELECT role,kind,content,ts,tool_name FROM archived_messages \
+                     WHERE session_id = ?1 ORDER BY seq",
+                )?;
+                s.messages = stmt
+                    .query_map([&id], |r| {
+                        Ok(ArchivedMessage {
+                            role: r.get(0)?,
+                            kind: r.get(1)?,
+                            content: r.get(2)?,
+                            ts: r.get(3)?,
+                            tool_name: r.get(4)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+            }
+            Ok(session)
+        })
+        .await
+    }
+
+    /// Archive footprint: session count, message count, approximate bytes.
+    pub async fn archive_stats(&self) -> Result<ArchiveStats> {
+        self.read(|conn| {
+            let (count, messages): (u64, u64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(message_count),0) FROM archived_sessions",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )?;
+            let bytes: u64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)),0) FROM archived_messages",
+                [],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )?;
+            Ok(ArchiveStats {
+                count,
+                messages,
+                bytes,
+            })
         })
         .await
     }
@@ -841,6 +990,66 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                 rusqlite::params![key, value],
             )?;
         }
+        WriteOp::ArchiveSession(s) => {
+            // Idempotent upsert: replace the session row + its messages atomically.
+            let tx = conn.unchecked_transaction()?;
+            {
+                tx.execute(
+                    "DELETE FROM archived_messages WHERE session_id = ?1",
+                    [&s.id],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO archived_sessions \
+                     (id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
+                      message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
+                      source_path,content_hash,archived_ts,source_deleted) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                    rusqlite::params![
+                        s.id,
+                        s.tool,
+                        s.source_id,
+                        s.title,
+                        s.project,
+                        s.git_branch,
+                        s.model,
+                        s.started_ts,
+                        s.updated_ts,
+                        s.message_count as i64,
+                        s.tool_call_count as i64,
+                        s.input_tokens as i64,
+                        s.output_tokens as i64,
+                        s.cache_tokens as i64,
+                        s.source_path,
+                        s.content_hash,
+                        s.archived_ts,
+                        s.source_deleted as i64,
+                    ],
+                )?;
+                let mut stmt = tx.prepare(
+                    "INSERT INTO archived_messages \
+                     (session_id, seq, role, kind, content, ts, tool_name) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                )?;
+                for (i, m) in s.messages.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        s.id,
+                        i as i64,
+                        m.role,
+                        m.kind,
+                        m.content,
+                        m.ts,
+                        m.tool_name,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
+        WriteOp::MarkSourceDeleted { id, deleted } => {
+            conn.execute(
+                "UPDATE archived_sessions SET source_deleted = ?2 WHERE id = ?1",
+                rusqlite::params![id, *deleted as i64],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1006,6 +1215,32 @@ fn row_to_pii_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<PiiFindingRec
         confidence: parse_confidence(&row.get::<_, String>(7)?),
         action: parse_pii_action(&row.get::<_, String>(8)?),
         value_hash: row.get(9)?,
+    })
+}
+
+/// Map an `archived_sessions` row (messages filled separately). Column order must
+/// match the SELECTs in `archived_sessions`/`archived_detail`.
+fn row_to_archived(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchivedSession> {
+    Ok(ArchivedSession {
+        id: row.get(0)?,
+        tool: row.get(1)?,
+        source_id: row.get(2)?,
+        title: row.get(3)?,
+        project: row.get(4)?,
+        git_branch: row.get(5)?,
+        model: row.get(6)?,
+        started_ts: row.get(7)?,
+        updated_ts: row.get(8)?,
+        message_count: row.get::<_, i64>(9)? as u32,
+        tool_call_count: row.get::<_, i64>(10)? as u32,
+        input_tokens: row.get::<_, i64>(11)? as u64,
+        output_tokens: row.get::<_, i64>(12)? as u64,
+        cache_tokens: row.get::<_, i64>(13)? as u64,
+        source_path: row.get(14)?,
+        content_hash: row.get(15)?,
+        archived_ts: row.get(16)?,
+        source_deleted: row.get::<_, i64>(17)? != 0,
+        messages: Vec::new(),
     })
 }
 
@@ -1398,6 +1633,104 @@ mod tests {
         assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
         assert_eq!(resp.output_tokens_src, TokenSource::Estimated);
         assert_eq!(row.pii_count, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn archive_round_trips_and_marks_deleted() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        let sess = ArchivedSession {
+            id: "claude_code:abc".into(),
+            tool: "claude_code".into(),
+            source_id: "abc".into(),
+            title: Some("Fix login".into()),
+            project: Some("/proj".into()),
+            git_branch: Some("main".into()),
+            model: Some("claude-opus-4-8".into()),
+            started_ts: 1000,
+            updated_ts: 2000,
+            message_count: 2,
+            tool_call_count: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_tokens: 2,
+            source_path: Some("/x.jsonl".into()),
+            content_hash: "h1".into(),
+            archived_ts: 3000,
+            source_deleted: false,
+            messages: vec![
+                ArchivedMessage {
+                    role: "user".into(),
+                    kind: "text".into(),
+                    content: "hi".into(),
+                    ts: Some(1000),
+                    tool_name: None,
+                },
+                ArchivedMessage {
+                    role: "assistant".into(),
+                    kind: "text".into(),
+                    content: "hello".into(),
+                    ts: Some(1500),
+                    tool_name: None,
+                },
+            ],
+        };
+        store.enqueue(WriteOp::ArchiveSession(Box::new(sess)));
+        store.flush().await.unwrap();
+
+        // Index (incremental change key), list, detail, stats.
+        let idx = store.archived_index().await.unwrap();
+        assert_eq!(idx.get("claude_code:abc").map(String::as_str), Some("h1"));
+        let list = store.archived_sessions().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title.as_deref(), Some("Fix login"));
+        let detail = store
+            .archived_detail("claude_code:abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].content, "hi");
+        let stats = store.archive_stats().await.unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.messages, 2);
+        assert!(stats.bytes >= 7); // "hi" + "hello"
+
+        // Idempotent re-archive (same id) replaces, doesn't duplicate.
+        let mut again = detail.clone();
+        again.content_hash = "h2".into();
+        again.messages.truncate(1);
+        store.enqueue(WriteOp::ArchiveSession(Box::new(again)));
+        store.flush().await.unwrap();
+        assert_eq!(store.archived_sessions().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .archived_detail("claude_code:abc")
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+
+        // Deletion detection keeps our copy, flags it.
+        store.enqueue(WriteOp::MarkSourceDeleted {
+            id: "claude_code:abc".into(),
+            deleted: true,
+        });
+        store.flush().await.unwrap();
+        assert!(
+            store
+                .archived_detail("claude_code:abc")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_deleted
+        );
 
         let _ = std::fs::remove_file(&path);
     }

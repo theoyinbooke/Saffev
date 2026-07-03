@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 dirs = "5.0"
 once_cell = "1.19"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tiktoken-rs = "0.11.0"
 
 [profile.release]

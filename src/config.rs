@@ -267,6 +267,69 @@ impl Default for EvalConfig {
     }
 }
 
+/// Optional AI-analysis backend using the user's local Codex app-server + their
+/// ChatGPT subscription as an on-demand model.
+///
+/// **Off by default.** This is the one path where session text leaves the device
+/// (sent to OpenAI *through the user's own Codex*), so it is strictly opt-in and
+/// runs only on an explicit user action. Hot-reloadable like [`EvalConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    /// Master switch. `false` (default) = no analysis; nothing is ever sent out.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model the Codex backend asks. `None` = Codex's default for the account.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-request timeout (millis).
+    #[serde(default = "default_analysis_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_analysis_timeout_ms() -> u64 {
+    90_000
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        AnalysisConfig {
+            enabled: false,
+            model: None,
+            timeout_ms: default_analysis_timeout_ms(),
+        }
+    }
+}
+
+/// Preservation / archive config — Saffev's durable, encrypted copy of your
+/// coding-agent history, so a session survives the source app deleting it.
+///
+/// **Off by default** (opt-in). Local-only, encrypted at rest, never mutates
+/// source files. Hot-reloadable. Our own retention defaults to keep-forever: we
+/// must never silently delete the way the source apps do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    /// Master switch. `false` (default) = nothing is archived.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Run a snapshot automatically (on Studio start + periodically) when enabled.
+    #[serde(default)]
+    pub auto: bool,
+    /// Our-side retention in days. `None` (default) = keep forever. Set only if the
+    /// user explicitly wants us to prune — we never do so on our own.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        ArchiveConfig {
+            enabled: false,
+            auto: false,
+            retention_days: None,
+        }
+    }
+}
+
 /// The full Saffev configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -307,6 +370,15 @@ pub struct Config {
     /// Opt-in evaluation pipeline (safety guard + quality judge). Off by default.
     #[serde(default)]
     pub eval: EvalConfig,
+
+    /// Opt-in AI-analysis backend (Codex app-server + ChatGPT subscription). Off
+    /// by default; the only path that sends session text off-device.
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
+
+    /// Opt-in Preservation archive (durable, encrypted copy of agent history).
+    #[serde(default)]
+    pub archive: ArchiveConfig,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -325,6 +397,8 @@ impl Default for Config {
             custom_patterns: Vec::new(),
             masking: MaskingConfig::default(),
             eval: EvalConfig::default(),
+            analysis: AnalysisConfig::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
