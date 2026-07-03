@@ -368,6 +368,20 @@ a{color:inherit}
 .payblk{margin-top:20px}
 .payblk h4{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:var(--text-3);margin-bottom:9px}
 .payblk pre{font-family:var(--font-mono);font-size:.76rem;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);padding:13px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;color:var(--text);line-height:1.6}
+/* drawer action row (copy as cURL / copy prompt / copy response) */
+.drawer-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.drawer-actions .copybtn{font-size:.76rem}
+/* chat payload viewer — messages by role */
+.chat{display:flex;flex-direction:column;gap:10px}
+.msg{border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;background:var(--surface-2)}
+.msg-role{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);padding:7px 12px;border-bottom:1px solid var(--border);background:var(--surface)}
+.msg-body{font-size:.82rem;line-height:1.6;padding:11px 12px;white-space:pre-wrap;word-break:break-word;color:var(--text);max-height:280px;overflow:auto}
+.msg.msg-user .msg-role{color:var(--brand)}
+.msg.msg-assistant{border-color:color-mix(in srgb,var(--brand) 22%,var(--border))}
+.msg.msg-assistant .msg-role{color:var(--brand);background:var(--brand-soft)}
+.msg.msg-system .msg-role{color:var(--gold)}
+.linkbtn{background:none;border:none;padding:6px 0 0;margin:0;color:var(--brand);font-family:var(--font-mono);font-size:.7rem;cursor:pointer}
+.linkbtn:hover{color:var(--brand-press);text-decoration:underline}
 .findlist{margin-top:8px;display:flex;flex-direction:column;gap:7px}
 .find{display:flex;align-items:center;gap:8px;font-size:.79rem}
 .find .where{font-family:var(--font-mono);color:var(--text-3);margin-left:auto;font-size:.7rem}
@@ -591,6 +605,33 @@ a{color:inherit}
 .upfoot .uv{font-family:var(--font-mono);font-size:.7rem;color:var(--text-2);margin:5px 0 0}
 .upfoot .umsg{font-size:.72rem;color:var(--text-2);line-height:1.45;margin-top:4px}
 .upfoot .btn{width:100%;min-height:34px;padding:7px 10px;font-size:.76rem;margin-top:8px}
+
+/* ============================================================
+   Leak alerts — topbar bell + toasts
+   ============================================================ */
+.alert-bell{position:relative;color:var(--danger)}
+.alert-bell:hover{background:var(--danger-soft)}
+.alert-bell .count{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:var(--r-full);background:var(--danger);color:#fff;font-family:var(--font-mono);font-size:.6rem;font-weight:600;display:grid;place-items:center;line-height:1}
+.alert-menu{position:absolute;z-index:50;top:calc(100% + 8px);right:0;width:min(320px,86vw);background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--shadow);padding:6px;animation:ddpop .14s cubic-bezier(.2,.8,.2,1);text-align:left}
+.alert-menu-h{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);padding:8px 10px 6px}
+.alert-menu-empty{padding:10px;font-size:.82rem;color:var(--text-2)}
+.alert-item{display:flex;align-items:center;gap:9px;width:100%;padding:9px 10px;border:none;background:transparent;border-radius:var(--r-sm);cursor:pointer;text-align:left}
+.alert-item:hover{background:var(--surface-2)}
+.alert-item-t{font-family:var(--font-mono);font-size:.72rem;color:var(--text-2)}
+.alert-item-time{margin-left:auto;font-family:var(--font-mono);font-size:.68rem;color:var(--text-3)}
+.toast-host{position:fixed;top:18px;right:18px;z-index:70;display:flex;flex-direction:column;gap:10px;max-width:min(380px,92vw)}
+.toast{display:flex;align-items:flex-start;gap:11px;padding:13px 14px;border-radius:var(--r-md);background:var(--surface);border:1px solid color-mix(in srgb,var(--danger) 30%,var(--border));box-shadow:var(--shadow);cursor:pointer;animation:toastin .28s cubic-bezier(.2,.8,.2,1)}
+.toast.out{animation:toastout .3s forwards}
+@keyframes toastin{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+@keyframes toastout{to{opacity:0;transform:translateX(16px)}}
+.toast-ic{display:grid;place-items:center;width:30px;height:30px;border-radius:var(--r-sm);background:var(--danger-soft);color:var(--danger);flex:none}
+.toast-ic svg{width:17px;height:17px}
+.toast-b{flex:1;min-width:0}
+.toast-t{font-weight:600;font-size:.86rem;color:var(--text)}
+.toast-d{font-size:.76rem;color:var(--text-2);margin-top:2px;line-height:1.45}
+.toast-x{background:none;border:none;color:var(--text-3);cursor:pointer;font-size:.8rem;padding:2px 4px;flex:none}
+.toast-x:hover{color:var(--text)}
+@media (prefers-reduced-motion: reduce){.toast{animation:none}.toast.out{opacity:0}}
 
 /* thin scrollbars */
 .dd-menu::-webkit-scrollbar,.codeblock pre::-webkit-scrollbar{width:9px;height:9px}

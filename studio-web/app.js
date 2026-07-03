@@ -514,18 +514,68 @@
       body.appendChild(ef);
     }
 
-    // payloads
+    // payloads — the debugging core: see exactly what the app sent + received
     if (detail.payloadsDisabled) {
+      const enableBtn = el('button', { class: 'btn primary auto', html: ICON.eye + '<span>Turn on payload capture</span>' });
+      const enableNote = el('div', { class: 'meta', style: 'margin-top:10px', hidden: true });
+      enableBtn.addEventListener('click', async () => {
+        setBusy(enableBtn, true);
+        try {
+          await api('/settings', { method: 'PUT', body: { payloadStorage: true } });
+          enableNote.hidden = false; enableNote.className = 'onboard-note ok';
+          enableNote.innerHTML = ICON.check + ' On. New exchanges will include the prompt and response — open one after your next request.';
+        } catch (e) {
+          enableNote.hidden = false; enableNote.className = 'onboard-note warn';
+          enableNote.innerHTML = ICON.alert + ' ' + esc(e.message || 'Could not enable payload capture.');
+        }
+        setBusy(enableBtn, false);
+      });
       body.appendChild(el('div', { class: 'payblk' }, [
         el('h4', { text: 'Payloads' }),
-        el('div', { class: 'expnote', html: ICON.shield + ' Metadata-only · raw prompt &amp; response are not stored (payload storage off).' }),
+        el('p', { class: 'about-p', style: 'margin-top:0', text: 'Raw prompt and response are not stored (metadata-only, the privacy default). Turn it on to inspect exactly what your apps send and receive — stored encrypted, on this device.' }),
+        enableBtn, enableNote,
       ]));
-    } else {
+    } else if (detail.prompt != null || detail.response != null) {
+      const base = await proxyBaseUrl();
+      const msgs = parseMessages(detail.prompt);
+      const resp = extractResponse(detail.response);
+
+      // Action row: reproduce or copy this exchange.
+      body.appendChild(el('div', { class: 'drawer-actions' }, [
+        detail.prompt != null ? drawerCopyBtn('Copy as cURL', () => curlFor(base, it.endpoint, detail.prompt)) : null,
+        detail.prompt != null ? drawerCopyBtn('Copy prompt', () => (msgs ? msgs.map((m) => m.role + ': ' + m.content).join('\n\n') : detail.prompt)) : null,
+        detail.response != null ? drawerCopyBtn('Copy response', () => (resp.text || detail.response)) : null,
+      ]));
+
       if (detail.prompt != null) {
-        body.appendChild(el('div', { class: 'payblk' }, [el('h4', { text: 'Prompt' }), el('pre', { text: detail.prompt })]));
+        const pb = el('div', { class: 'payblk' }, [el('h4', { text: 'Prompt' })]);
+        if (msgs) {
+          const chat = el('div', { class: 'chat' });
+          msgs.forEach((m) => chat.appendChild(el('div', { class: 'msg msg-' + esc((m.role || '').toLowerCase()) }, [
+            el('div', { class: 'msg-role', text: m.role }),
+            el('div', { class: 'msg-body', text: m.content }),
+          ])));
+          pb.appendChild(chat);
+        } else {
+          pb.appendChild(el('pre', { text: detail.prompt }));
+        }
+        body.appendChild(pb);
       }
       if (detail.response != null) {
-        body.appendChild(el('div', { class: 'payblk' }, [el('h4', { text: 'Response' }), el('pre', { text: detail.response })]));
+        const rb = el('div', { class: 'payblk' }, [el('h4', { text: 'Response' })]);
+        if (resp.text) {
+          rb.appendChild(el('div', { class: 'msg msg-assistant' }, [
+            el('div', { class: 'msg-role', text: 'assistant' + (resp.streamed ? ' · streamed' : '') }),
+            el('div', { class: 'msg-body', text: resp.text }),
+          ]));
+          const rawPre = el('pre', { text: detail.response, hidden: true, style: 'margin-top:10px' });
+          const tog = el('button', { class: 'linkbtn', type: 'button', text: 'show raw' });
+          tog.addEventListener('click', () => { rawPre.hidden = !rawPre.hidden; tog.textContent = rawPre.hidden ? 'show raw' : 'hide raw'; });
+          rb.appendChild(tog); rb.appendChild(rawPre);
+        } else {
+          rb.appendChild(el('pre', { text: detail.response }));
+        }
+        body.appendChild(rb);
       }
     }
 
@@ -679,6 +729,74 @@
       btn,
     ]);
     return el('div', { class: 'codeblock' }, [head, el('pre', {}, [el('code', { text: text })])]);
+  }
+
+  // ---- payload inspection helpers (drawer) --------------------------------
+  // Cached proxy base for "Copy as cURL"; fetched once from /api/settings.
+  let _proxyBaseCache = null;
+  async function proxyBaseUrl() {
+    if (_proxyBaseCache) return _proxyBaseCache;
+    try { const s = await api('/settings'); _proxyBaseCache = 'http://localhost:' + (s.proxyPort || 8088); }
+    catch (e) { _proxyBaseCache = 'http://localhost:8088'; }
+    return _proxyBaseCache;
+  }
+  // Parse a raw request body into chat messages, best-effort. Handles the
+  // { messages:[{role,content}] } shape (Ollama /api/chat + OpenAI) and the
+  // { prompt } shape (Ollama /api/generate). null if it isn't one of those.
+  function parseMessages(raw) {
+    if (!raw) return null;
+    let j; try { j = JSON.parse(raw); } catch (e) { return null; }
+    if (Array.isArray(j.messages)) {
+      return j.messages.map((m) => ({ role: m.role || 'user', content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2) }));
+    }
+    if (typeof j.prompt === 'string') return [{ role: 'user', content: j.prompt }];
+    return null;
+  }
+  // Pull assistant text from one parsed response object (Ollama + OpenAI shapes).
+  function respText(j, delta) {
+    if (j == null || typeof j !== 'object') return null;
+    if (typeof j.response === 'string') return j.response;                              // Ollama /api/generate
+    if (j.message && typeof j.message.content === 'string') return j.message.content;   // Ollama /api/chat
+    if (Array.isArray(j.choices) && j.choices[0]) {
+      const c = j.choices[0];
+      if (delta && c.delta && typeof c.delta.content === 'string') return c.delta.content; // OpenAI stream
+      if (c.message && typeof c.message.content === 'string') return c.message.content;     // OpenAI non-stream
+      if (typeof c.text === 'string') return c.text;                                        // OpenAI completions
+    }
+    return null;
+  }
+  // Extract the assistant's text from a raw response body (single JSON, or an
+  // NDJSON / SSE stream). Returns { text, streamed }.
+  function extractResponse(raw) {
+    if (!raw) return { text: '', streamed: false };
+    const trimmed = raw.trim();
+    try { const t = respText(JSON.parse(trimmed)); if (t != null) return { text: t, streamed: false }; } catch (e) { /* stream */ }
+    let out = '';
+    trimmed.split('\n').forEach((line) => {
+      let s = line.trim();
+      if (!s) return;
+      if (s.startsWith('data:')) s = s.slice(5).trim();
+      if (s === '[DONE]') return;
+      try { const t = respText(JSON.parse(s), true); if (t) out += t; } catch (e) {}
+    });
+    return { text: out, streamed: true };
+  }
+  // A cURL that reproduces this request against the Saffev proxy (so re-running
+  // it is itself traced). Body is the exact raw request payload.
+  function curlFor(base, endpoint, rawBody) {
+    const bodyArg = rawBody ? " \\\n  -d '" + String(rawBody).replace(/'/g, "'\\''") + "'" : '';
+    return 'curl ' + base + (endpoint || '') + " \\\n  -H 'Content-Type: application/json'" + bodyArg;
+  }
+  // A copy button for the drawer action row; `getText` may be sync or async.
+  function drawerCopyBtn(label, getText) {
+    const btn = el('button', { class: 'copybtn', type: 'button', html: ICON.copy + '<span>' + label + '</span>' });
+    btn.addEventListener('click', async () => {
+      const ok = await copyText(await getText());
+      btn.classList.toggle('done', ok);
+      btn.innerHTML = (ok ? ICON.check : ICON.copy) + '<span>' + (ok ? 'Copied' : label) + '</span>';
+      setTimeout(() => { btn.classList.remove('done'); btn.innerHTML = ICON.copy + '<span>' + label + '</span>'; }, 1600);
+    });
+    return btn;
   }
 
   /* -------------------------------------------------------------------------
@@ -2538,6 +2656,103 @@
   /* =========================================================================
      BOOT
      ========================================================================= */
+  /* =========================================================================
+     LEAK ALERTS — a live, on-device signal when a high-confidence secret (API
+     key, credit card) flows through the proxy. Its own lightweight SSE so alerts
+     fire on ANY page, not just Live. Nothing leaves the device.
+     ========================================================================= */
+  const LEAK_KINDS = { api_key: 'API key', credit_card: 'Credit card' };
+  function ensureToastHost() {
+    let h = $('#toastHost');
+    if (!h) { h = el('div', { class: 'toast-host', id: 'toastHost' }); document.body.appendChild(h); }
+    return h;
+  }
+  const LeakAlerts = {
+    log: [], unseen: 0, _stop: false, _retry: 0, _ctrl: null,
+    init() { this._stop = false; this.wireBell(); this._run(); },
+    async _run() {
+      if (this._stop || !TOKEN) return;
+      const ctrl = new AbortController(); this._ctrl = ctrl;
+      const headers = { Accept: 'text/event-stream', Authorization: 'Bearer ' + TOKEN };
+      try {
+        const res = await fetch('/api/stream?token=' + encodeURIComponent(TOKEN), { headers, signal: ctrl.signal, cache: 'no-store' });
+        if (!res.ok || !res.body) throw new Error('alert stream ' + res.status);
+        this._retry = 0;
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        for (;;) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) { const frame = buf.slice(0, idx); buf = buf.slice(idx + 2); this._frame(frame); }
+        }
+      } catch (e) { /* reconnect below */ }
+      if (this._stop) return;
+      const delay = Math.min(1500 * Math.pow(2, this._retry++), 20000);
+      setTimeout(() => this._run(), delay);
+    },
+    _frame(frame) {
+      const lines = [];
+      frame.split('\n').forEach((l) => { if (l.startsWith('data:')) lines.push(l.slice(5).replace(/^ /, '')); });
+      if (!lines.length) return;
+      let msg; try { msg = JSON.parse(lines.join('\n')); } catch (e) { return; }
+      if (msg.type === 'pii' && msg.finding) this.consider(msg.finding, msg.id);
+    },
+    consider(f, id) {
+      if (!LEAK_KINDS[f.kind]) return;                    // only alert on secrets
+      if (f.confidence && f.confidence !== 'high') return; // and only high-confidence
+      const rec = { kind: f.kind, id, ts: Date.now(), side: f.side };
+      this.log.unshift(rec); this.log = this.log.slice(0, 30);
+      this.unseen++; this.updateBell(); this.toast(rec);
+    },
+    toast(rec) {
+      const host = ensureToastHost();
+      const label = LEAK_KINDS[rec.kind] || 'Secret';
+      const t = el('div', { class: 'toast' });
+      t.appendChild(el('span', { class: 'toast-ic', html: ICON.shieldAlert }));
+      t.appendChild(el('div', { class: 'toast-b' }, [
+        el('div', { class: 'toast-t', text: label + ' in a ' + (rec.side === 'response' ? 'response' : 'prompt') }),
+        el('div', { class: 'toast-d', text: 'High-confidence secret observed on-device. Click to inspect.' }),
+      ]));
+      const x = el('button', { class: 'toast-x', type: 'button', 'aria-label': 'Dismiss', text: '✕' });
+      x.addEventListener('click', (e) => { e.stopPropagation(); t.remove(); });
+      t.appendChild(x);
+      t.addEventListener('click', () => { t.remove(); openDetail(rec.id); });
+      host.appendChild(t);
+      setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 9000);
+    },
+    updateBell() {
+      const bell = $('#alertBell'); if (!bell) return;
+      bell.hidden = false;
+      const c = $('#alertCount');
+      if (c) { c.hidden = this.unseen === 0; c.textContent = this.unseen > 9 ? '9+' : String(this.unseen); }
+    },
+    wireBell() {
+      const bell = $('#alertBell'); if (!bell || bell._wired) return; bell._wired = true;
+      bell.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
+    },
+    toggleMenu() {
+      const existing = $('#alertMenu');
+      if (existing) { existing.remove(); return; }
+      this.unseen = 0; this.updateBell();
+      const m = el('div', { class: 'alert-menu', id: 'alertMenu' }, [el('div', { class: 'alert-menu-h', text: 'Recent leaks' })]);
+      if (!this.log.length) m.appendChild(el('div', { class: 'alert-menu-empty', text: 'No secrets detected this session.' }));
+      else this.log.forEach((r) => {
+        const row = el('button', { class: 'alert-item', type: 'button' }, [
+          el('span', { class: 'piibadge key', text: LEAK_KINDS[r.kind] }),
+          el('span', { class: 'alert-item-t', text: r.side === 'response' ? 'response' : 'prompt' }),
+          el('span', { class: 'alert-item-time', text: new Date(r.ts).toLocaleTimeString() }),
+        ]);
+        row.addEventListener('click', () => { const mm = $('#alertMenu'); if (mm) mm.remove(); openDetail(r.id); });
+        m.appendChild(row);
+      });
+      const bell = $('#alertBell'); bell.appendChild(m);
+      setTimeout(() => document.addEventListener('click', function off(ev) {
+        const mm = $('#alertMenu');
+        if (mm && !bell.contains(ev.target)) { mm.remove(); document.removeEventListener('click', off); }
+      }), 0);
+    },
+  };
+
   function applyBrand() {
     document.title = BRAND.wordmark + ' · Studio';
     setText('#wmName', BRAND.wordmark);
@@ -2557,6 +2772,8 @@
       // Auto-check for a newer release (GitHub release metadata only · nothing
       // about the user leaves the device). Fail-soft: never blocks the UI.
       checkForUpdate();
+      // Live leak alerts (its own SSE, on-device only) fire on any page.
+      LeakAlerts.init();
     }
   }
 
