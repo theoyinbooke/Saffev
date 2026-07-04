@@ -1148,6 +1148,21 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         eval_rx,
     );
 
+    // Preservation: if auto-archive is enabled, snapshot the durable copy in the
+    // background on start so it stays current without a manual click. Off the hot
+    // path, fail-open.
+    {
+        let cfg = proxy_state.config.load();
+        if cfg.archive.enabled && cfg.archive.auto {
+            let store = proxy_state.store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::agents::archive::run_snapshot(&store).await {
+                    tracing::warn!(target: "saffev::archive", "auto snapshot failed: {e}");
+                }
+            });
+        }
+    }
+
     // Run both servers concurrently under a shared graceful-shutdown signal.
     //
     // A `watch` channel fans the single shutdown trigger (Ctrl-C *or* SIGTERM)

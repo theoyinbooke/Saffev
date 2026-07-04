@@ -114,6 +114,20 @@ impl StudioServer {
             // One-click "send a test prompt" — fires a captured request through
             // the proxy so the first-run Studio populates without a terminal.
             .route("/demo", post(api::demo))
+            // Agents — read coding tools' local session history on-device.
+            .route("/agents", get(api::agents))
+            .route("/agents/sessions", get(api::agents_sessions))
+            .route("/agents/sessions/:id", get(api::agents_detail))
+            .route(
+                "/agents/sessions/:id/summarize",
+                post(api::agents_summarize),
+            )
+            .route("/agents/sessions/:id/export", get(api::agents_export))
+            .route("/agents/analytics", get(api::agents_analytics))
+            // Preservation: trigger a snapshot into the durable archive.
+            .route("/archive/run", post(api::archive_run))
+            // Preservation: bulk-export all sessions to a folder on disk.
+            .route("/archive/export", post(api::archive_export))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
             // Host checked first (cheapest reject), then token, then CORS

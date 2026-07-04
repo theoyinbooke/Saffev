@@ -1586,6 +1586,722 @@ fn is_embedding_model(name: &str) -> bool {
     n.contains("embed") || n.contains("minilm") || n.contains("nomic")
 }
 
+// ===== Agents (coding-tool session history, on-device) ==========================
+
+/// Default detector for scanning coding-agent transcripts for PII ("what did I
+/// paste into my agent"). Built once; default patterns only.
+static AGENT_DETECTOR: once_cell::sync::Lazy<Option<crate::brain::pii::Detector>> =
+    once_cell::sync::Lazy::new(|| crate::brain::pii::Detector::new(&[]).ok());
+
+/// Query for `GET /api/agents/sessions`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionsParams {
+    /// Free-text filter over title/project/model.
+    pub q: Option<String>,
+    /// Restrict to one tool key.
+    pub tool: Option<String>,
+    /// Cap the number returned.
+    pub limit: Option<usize>,
+    /// When true, only sessions preserved in the archive.
+    pub preserved: Option<bool>,
+}
+
+fn agent_session_view(s: &crate::agents::AgentSession, pii_count: u32) -> dto::AgentSessionView {
+    dto::AgentSessionView {
+        id: s.id.clone(),
+        tool: s.tool.key().to_string(),
+        label: s.tool.label().to_string(),
+        title: s.title.clone(),
+        project: s.project.clone(),
+        git_branch: s.git_branch.clone(),
+        model: s.model.clone(),
+        started_ts: s.started_ts,
+        updated_ts: s.updated_ts,
+        message_count: s.message_count,
+        tool_call_count: s.tool_call_count,
+        input_tokens: s.input_tokens,
+        output_tokens: s.output_tokens,
+        cache_tokens: s.cache_tokens,
+        cost_usd: crate::agents::cost_usd(
+            s.model.as_deref(),
+            s.input_tokens,
+            s.output_tokens,
+            s.cache_tokens,
+        ),
+        pii_count,
+        source_path: s.source_path.clone(),
+        preserved: false,
+        source_deleted: false,
+    }
+}
+
+/// Build a session view from an archived (preserved) session — used for sessions
+/// the source app has deleted (resurrected from the archive).
+fn archived_session_view(a: &crate::store::ArchivedSession) -> dto::AgentSessionView {
+    let tool = crate::agents::split_id(&a.id)
+        .map(|(t, _)| t)
+        .unwrap_or(crate::agents::AgentTool::ClaudeCode);
+    dto::AgentSessionView {
+        id: a.id.clone(),
+        tool: a.tool.clone(),
+        label: tool.label().to_string(),
+        title: a.title.clone(),
+        project: a.project.clone(),
+        git_branch: a.git_branch.clone(),
+        model: a.model.clone(),
+        started_ts: a.started_ts,
+        updated_ts: a.updated_ts,
+        message_count: a.message_count,
+        tool_call_count: a.tool_call_count,
+        input_tokens: a.input_tokens,
+        output_tokens: a.output_tokens,
+        cache_tokens: a.cache_tokens,
+        cost_usd: crate::agents::cost_usd(
+            a.model.as_deref(),
+            a.input_tokens,
+            a.output_tokens,
+            a.cache_tokens,
+        ),
+        pii_count: 0,
+        source_path: a.source_path.clone().unwrap_or_default(),
+        preserved: true,
+        source_deleted: a.source_deleted,
+    }
+}
+
+fn tool_stat_view(t: &crate::agents::ToolStat) -> dto::AgentToolStat {
+    dto::AgentToolStat {
+        tool: t.tool.key().to_string(),
+        label: t.tool.label().to_string(),
+        present: t.present,
+        sessions: t.sessions,
+        tokens: t.tokens,
+        cost_usd: t.cost_usd,
+        last_active: t.last_active,
+    }
+}
+
+fn agent_msg_view(m: &crate::agents::AgentMessage) -> dto::AgentMessageView {
+    use crate::agents::{MessageKind, Role};
+    dto::AgentMessageView {
+        role: match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+            Role::System => "system",
+        }
+        .into(),
+        kind: match m.kind {
+            MessageKind::Text => "text",
+            MessageKind::Thinking => "thinking",
+            MessageKind::ToolUse => "tool_use",
+            MessageKind::ToolResult => "tool_result",
+        }
+        .into(),
+        content: m.content.clone(),
+        ts: m.ts,
+        tool_name: m.tool_name.clone(),
+    }
+}
+
+fn agent_finding_view(f: &crate::brain::Finding) -> dto::PiiFindingView {
+    dto::PiiFindingView {
+        kind: f.kind,
+        label: f.label.clone(),
+        side: f.side,
+        start: f.start,
+        end: f.end,
+        confidence: f.confidence,
+        action: crate::store::PiiAction::Observed,
+    }
+}
+
+fn at_risk_view(r: &crate::agents::retention::AtRisk) -> dto::AtRiskView {
+    use crate::agents::retention::RetentionKind;
+    dto::AtRiskView {
+        tool: r.tool.key().to_string(),
+        label: r.tool.label().to_string(),
+        kind: match r.policy.kind {
+            RetentionKind::AgeDays => "age_days",
+            RetentionKind::Churn => "churn",
+            RetentionKind::KeepsAll => "keeps_all",
+            RetentionKind::Unknown => "unknown",
+        }
+        .to_string(),
+        days: r.policy.days,
+        note: r.policy.note.clone(),
+        total: r.total,
+        expiring_soon: r.expiring_soon,
+        overdue: r.overdue,
+        soonest_expiry_ts: r.soonest_expiry_ts,
+    }
+}
+
+/// `GET /api/agents` — which coding tools are present + rollups + at-risk + archive.
+pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOverview> {
+    // List once; derive tool stats + at-risk from the same pass.
+    let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
+        .await
+        .unwrap_or_default();
+    let tools = crate::agents::tool_stats(&sessions);
+    let at_risk = crate::agents::at_risk_report(&sessions);
+    let total_sessions = tools.iter().map(|t| t.sessions).sum();
+    let total_tokens = tools.iter().map(|t| t.tokens).sum();
+    let total_cost_usd = tools.iter().map(|t| t.cost_usd).sum();
+    let archived = state.store.archive_stats().await.unwrap_or_default();
+    let cfg = state.config.load();
+    Json(dto::AgentsOverview {
+        tools: tools.iter().map(tool_stat_view).collect(),
+        total_sessions,
+        total_tokens,
+        total_cost_usd,
+        analysis: dto::AnalysisStatus {
+            available: crate::agents::codex_server::is_available(),
+            enabled: cfg.analysis.enabled,
+            model: cfg.analysis.model.clone(),
+        },
+        at_risk: at_risk.iter().map(at_risk_view).collect(),
+        archive: dto::ArchiveStatusView {
+            enabled: cfg.archive.enabled,
+            auto: cfg.archive.auto,
+            count: archived.count,
+            messages: archived.messages,
+            bytes: archived.bytes,
+        },
+    })
+}
+
+/// Build a compact, cost-bounded transcript for the summarizer: `role: text`
+/// lines, capped to `max_chars` by keeping the head and tail (the middle is where
+/// long sessions are most repetitive).
+fn compact_transcript(d: &crate::agents::AgentSessionDetail, max_chars: usize) -> String {
+    use crate::agents::Role;
+    let mut lines: Vec<String> = Vec::new();
+    for m in &d.messages {
+        let who = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+            Role::System => "system",
+        };
+        let body = m.content.trim();
+        if body.is_empty() {
+            continue;
+        }
+        // Tool/thinking blocks: keep only a short marker so they don't dominate.
+        let snippet = match m.kind {
+            crate::agents::MessageKind::ToolUse | crate::agents::MessageKind::ToolResult => {
+                format!(
+                    "[{} {}]",
+                    m.tool_name.as_deref().unwrap_or("tool"),
+                    crate::agents::claude_code::truncate(body, 160)
+                )
+            }
+            _ => crate::agents::claude_code::truncate(body, 1200),
+        };
+        lines.push(format!("{who}: {snippet}"));
+    }
+    let full = lines.join("\n");
+    if full.len() <= max_chars {
+        return full;
+    }
+    // Keep head + tail around a marker.
+    let half = max_chars / 2;
+    let head: String = full.chars().take(half).collect();
+    let tail: String = full
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n\n[... transcript truncated ...]\n\n{tail}")
+}
+
+/// `POST /api/agents/sessions/:id/summarize` — AI summary via the user's Codex.
+///
+/// Gated on `analysis.enabled` (opt-in). Fail-open: any backend error returns a
+/// clean 4xx/5xx envelope, never a panic.
+pub async fn agents_summarize(
+    State(state): State<StudioState>,
+    Path(id): Path<String>,
+) -> Result<Json<dto::SummaryResult>, Response> {
+    let cfg = state.config.load();
+    if !cfg.analysis.enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "analysis_disabled",
+            "AI analysis is off. Enable it in Settings (uses your Codex subscription).",
+        ));
+    }
+    if !crate::agents::codex_server::is_available() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "codex_unavailable",
+            "Codex is not installed or not signed in on this machine.",
+        ));
+    }
+    let detail = crate::agents::detail(&id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id"))?;
+
+    let transcript = compact_transcript(&detail, 24_000);
+    if transcript.is_empty() {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "empty_session",
+            "This session has no readable content to summarize.",
+        ));
+    }
+    let prompt = format!(
+        "You are analyzing a transcript from an AI coding-agent session, for the developer who ran it. \
+Write a concise, skimmable summary. Cover, with short headings or bullets:\n\
+- Goal: what they were trying to do\n\
+- Outcome: what was actually accomplished\n\
+- Key changes/decisions: notable edits, files, or technical choices\n\
+- Loose ends: anything unresolved or worth following up\n\
+Be specific and grounded in the transcript. Do not use any tools; reply with the summary only.\n\n\
+TRANSCRIPT (source: {}):\n{}",
+        detail.session.tool.label(),
+        transcript
+    );
+
+    let model = cfg.analysis.model.clone();
+    let timeout = std::time::Duration::from_millis(cfg.analysis.timeout_ms);
+    let out = tokio::task::spawn_blocking(move || {
+        crate::agents::codex_server::run_prompt(&prompt, model.as_deref(), timeout)
+    })
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "join_error",
+            "analysis task failed",
+        )
+    })?;
+
+    match out {
+        Ok(c) => Ok(Json(dto::SummaryResult {
+            summary: c.text,
+            model: c.model,
+            elapsed_ms: c.elapsed_ms,
+        })),
+        Err(e) => Err(api_error(StatusCode::BAD_GATEWAY, "codex_error", &e)),
+    }
+}
+
+/// `GET /api/agents/sessions` — source-tagged session list (newest first).
+///
+/// Unified view: live sessions (flagged `preserved` when a copy is in the archive)
+/// **plus** sessions the source app deleted that Saffev has kept ("resurrected"
+/// from the archive, flagged `sourceDeleted`).
+pub async fn agents_sessions(
+    State(state): State<StudioState>,
+    Query(p): Query<AgentSessionsParams>,
+) -> Json<Vec<dto::AgentSessionView>> {
+    let q = p.q.unwrap_or_default().to_lowercase();
+    let live = tokio::task::spawn_blocking(crate::agents::all_sessions)
+        .await
+        .unwrap_or_default();
+    let archived = state.store.archived_sessions().await.unwrap_or_default();
+
+    let live_ids: std::collections::HashSet<&str> = live.iter().map(|s| s.id.as_str()).collect();
+    let archived_ids: std::collections::HashSet<&str> =
+        archived.iter().map(|a| a.id.as_str()).collect();
+
+    let mut out: Vec<dto::AgentSessionView> = Vec::with_capacity(live.len() + archived.len());
+    for s in &live {
+        let mut v = agent_session_view(s, 0);
+        v.preserved = archived_ids.contains(s.id.as_str());
+        out.push(v);
+    }
+    // Resurrected: archived sessions the source deleted and are no longer live.
+    for a in &archived {
+        if a.source_deleted && !live_ids.contains(a.id.as_str()) {
+            out.push(archived_session_view(a));
+        }
+    }
+    out.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
+
+    if let Some(tool) = p.tool.as_deref() {
+        out.retain(|v| v.tool == tool);
+    }
+    if !q.is_empty() {
+        out.retain(|v| {
+            format!(
+                "{} {} {} {}",
+                v.title.as_deref().unwrap_or(""),
+                v.project.as_deref().unwrap_or(""),
+                v.model.as_deref().unwrap_or(""),
+                v.label
+            )
+            .to_lowercase()
+            .contains(&q)
+        });
+    }
+    if p.preserved == Some(true) {
+        out.retain(|v| v.preserved);
+    }
+    if let Some(lim) = p.limit {
+        out.truncate(lim);
+    }
+    Json(out)
+}
+
+/// Rebuild an [`crate::agents::AgentSessionDetail`] from an archived session so
+/// the detail handler is uniform across live and resurrected sessions.
+fn archived_to_detail(a: crate::store::ArchivedSession) -> crate::agents::AgentSessionDetail {
+    use crate::agents::{AgentMessage, AgentSession, AgentSessionDetail, MessageKind, Role};
+    let tool = crate::agents::split_id(&a.id)
+        .map(|(t, _)| t)
+        .unwrap_or(crate::agents::AgentTool::ClaudeCode);
+    let parse_role = |s: &str| match s {
+        "assistant" => Role::Assistant,
+        "tool" => Role::Tool,
+        "system" => Role::System,
+        _ => Role::User,
+    };
+    let parse_kind = |s: &str| match s {
+        "thinking" => MessageKind::Thinking,
+        "tool_use" => MessageKind::ToolUse,
+        "tool_result" => MessageKind::ToolResult,
+        _ => MessageKind::Text,
+    };
+    let session = AgentSession {
+        id: a.id,
+        tool,
+        title: a.title,
+        project: a.project,
+        git_branch: a.git_branch,
+        model: a.model,
+        started_ts: a.started_ts,
+        updated_ts: a.updated_ts,
+        message_count: a.message_count,
+        tool_call_count: a.tool_call_count,
+        input_tokens: a.input_tokens,
+        output_tokens: a.output_tokens,
+        cache_tokens: a.cache_tokens,
+        source_path: a.source_path.unwrap_or_default(),
+    };
+    let messages = a
+        .messages
+        .into_iter()
+        .map(|m| AgentMessage {
+            role: parse_role(&m.role),
+            kind: parse_kind(&m.kind),
+            content: m.content,
+            ts: m.ts,
+            tool_name: m.tool_name,
+        })
+        .collect();
+    AgentSessionDetail { session, messages }
+}
+
+/// `GET /api/agents/sessions/:id` — full transcript + on-device PII lens.
+///
+/// Reads the live source first; if the source app has deleted it, falls back to
+/// the archive (resurrected). Flags `preserved` / `sourceDeleted` accordingly.
+pub async fn agents_detail(
+    State(state): State<StudioState>,
+    Path(id): Path<String>,
+) -> Result<Json<dto::AgentSessionDetailView>, Response> {
+    let id2 = id.clone();
+    let live = tokio::task::spawn_blocking(move || crate::agents::detail(&id2))
+        .await
+        .ok()
+        .flatten();
+    let (d, preserved, source_deleted) = match live {
+        Some(d) => {
+            let idx = state.store.archived_index().await.unwrap_or_default();
+            (d, idx.contains_key(&id), false)
+        }
+        None => {
+            let a = state
+                .store
+                .archived_detail(&id)
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id")
+                })?;
+            let sd = a.source_deleted;
+            (archived_to_detail(a), true, sd)
+        }
+    };
+    // Scan the transcript for PII (what was pasted into the agent). Dedupe by
+    // (kind, value-hash) so a repeated secret counts once, and cap the total.
+    let mut pii = Vec::new();
+    if let Some(det) = AGENT_DETECTOR.as_ref() {
+        let mut seen: std::collections::HashSet<(crate::brain::PiiKind, String)> =
+            std::collections::HashSet::new();
+        'outer: for m in &d.messages {
+            let side = match m.role {
+                crate::agents::Role::Assistant => crate::brain::Side::Response,
+                _ => crate::brain::Side::Request,
+            };
+            for f in det.scan(side, &m.content) {
+                if seen.insert((f.kind, f.value_hash.clone())) {
+                    pii.push(agent_finding_view(&f));
+                    if pii.len() >= 200 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let mut session = agent_session_view(&d.session, pii.len() as u32);
+    session.preserved = preserved;
+    session.source_deleted = source_deleted;
+    let messages = d.messages.iter().map(agent_msg_view).collect();
+    Ok(Json(dto::AgentSessionDetailView {
+        session,
+        messages,
+        pii,
+    }))
+}
+
+/// `POST /api/archive/run` — trigger a snapshot into the archive (gated on enabled).
+pub async fn archive_run(
+    State(state): State<StudioState>,
+) -> Result<Json<crate::agents::archive::SnapshotSummary>, Response> {
+    if !state.config.load().archive.enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "archive_disabled",
+            "Preservation is off. Enable it in Settings to archive your history.",
+        ));
+    }
+    let summary = crate::agents::archive::run_snapshot(&state.store)
+        .await
+        .map_err(internal)?;
+    Ok(Json(summary))
+}
+
+/// Query for the export endpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct ExportParams {
+    /// `md` | `json` (default `md`).
+    pub format: Option<String>,
+}
+
+/// `GET /api/agents/sessions/:id/export?format=md|json` — download one session.
+pub async fn agents_export(
+    State(state): State<StudioState>,
+    Path(id): Path<String>,
+    Query(p): Query<ExportParams>,
+) -> Result<Response, Response> {
+    let format = crate::agents::export::Format::parse(p.format.as_deref().unwrap_or("md"))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_format",
+                "format must be md or json",
+            )
+        })?;
+
+    // Live first, else archive.
+    let id2 = id.clone();
+    let live = tokio::task::spawn_blocking(move || crate::agents::detail(&id2))
+        .await
+        .ok()
+        .flatten();
+    let detail = match live {
+        Some(d) => d,
+        None => {
+            let a = state
+                .store
+                .archived_detail(&id)
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id")
+                })?;
+            archived_to_detail(a)
+        }
+    };
+    let body = crate::agents::export::render(&detail, format);
+    let filename = format!(
+        "{}.{}",
+        crate::agents::export::safe_filename(&detail),
+        format.ext()
+    );
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                format.content_type().to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// Body for `POST /api/archive/export`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportAllBody {
+    /// `md` | `json` (default `md`).
+    pub format: Option<String>,
+    /// Restrict to one tool key.
+    pub tool: Option<String>,
+    /// Destination directory (default `~/Saffev-Export`).
+    pub dest: Option<String>,
+}
+
+fn write_session_export(
+    dir: &std::path::Path,
+    d: &crate::agents::AgentSessionDetail,
+    format: crate::agents::export::Format,
+) -> std::io::Result<()> {
+    let sub = dir.join(d.session.tool.key());
+    std::fs::create_dir_all(&sub)?;
+    let path = sub.join(format!(
+        "{}.{}",
+        crate::agents::export::safe_filename(d),
+        format.ext()
+    ));
+    std::fs::write(path, crate::agents::export::render(d, format))
+}
+
+/// `POST /api/archive/export` — export every session to a folder on disk (one
+/// file per session, foldered by tool). Exports from the archive when populated
+/// (fast, and includes sessions the source has deleted); otherwise reads live
+/// sources. It's the user's data, in open formats, theirs to keep.
+pub async fn archive_export(
+    State(state): State<StudioState>,
+    Json(body): Json<ExportAllBody>,
+) -> Result<Json<dto::ExportSummary>, Response> {
+    let format = crate::agents::export::Format::parse(body.format.as_deref().unwrap_or("md"))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_format",
+                "format must be md or json",
+            )
+        })?;
+    let dir = body
+        .dest
+        .filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::agents::home().join("Saffev-Export"));
+    std::fs::create_dir_all(&dir).map_err(internal)?;
+    let tool = body.tool.filter(|t| !t.is_empty());
+
+    let has_archive = state
+        .store
+        .archive_stats()
+        .await
+        .map(|s| s.count > 0)
+        .unwrap_or(false);
+    let (count, errors) = if has_archive {
+        let mut count = 0u32;
+        let mut errors = 0u32;
+        for a in state.store.archived_sessions().await.map_err(internal)? {
+            if tool.as_deref().map(|t| a.tool != t).unwrap_or(false) {
+                continue;
+            }
+            match state.store.archived_detail(&a.id).await {
+                Ok(Some(full)) => {
+                    let detail = archived_to_detail(full);
+                    if write_session_export(&dir, &detail, format).is_ok() {
+                        count += 1;
+                    } else {
+                        errors += 1;
+                    }
+                }
+                _ => errors += 1,
+            }
+        }
+        (count, errors)
+    } else {
+        let dir2 = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut count = 0u32;
+            let mut errors = 0u32;
+            for s in crate::agents::all_sessions() {
+                if tool.as_deref().map(|t| s.tool.key() != t).unwrap_or(false) {
+                    continue;
+                }
+                match crate::agents::detail(&s.id) {
+                    Some(d) => {
+                        if write_session_export(&dir2, &d, format).is_ok() {
+                            count += 1;
+                        } else {
+                            errors += 1;
+                        }
+                    }
+                    None => errors += 1,
+                }
+            }
+            (count, errors)
+        })
+        .await
+        .map_err(|_| internal(crate::Error::Store("export task failed".into())))?
+    };
+
+    Ok(Json(dto::ExportSummary {
+        count,
+        errors,
+        dir: dir.display().to_string(),
+    }))
+}
+
+/// `GET /api/agents/analytics` — cross-session rollups (by tool, by model).
+pub async fn agents_analytics(State(_state): State<StudioState>) -> Json<dto::AgentAnalytics> {
+    let sessions = crate::agents::all_sessions();
+    let by_tool = crate::agents::detected();
+    let total_sessions = sessions.len() as u32;
+    let total_tokens: u64 = sessions
+        .iter()
+        .map(|s| s.input_tokens + s.output_tokens)
+        .sum();
+    let total_tool_calls: u64 = sessions.iter().map(|s| s.tool_call_count as u64).sum();
+    let total_cost_usd: f64 = by_tool.iter().map(|t| t.cost_usd).sum();
+
+    let mut models: BTreeMap<String, (u32, u64, f64)> = BTreeMap::new();
+    for s in &sessions {
+        let name = s.model.clone().unwrap_or_else(|| "unknown".into());
+        let e = models.entry(name).or_insert((0, 0, 0.0));
+        e.0 += 1;
+        e.1 += s.input_tokens + s.output_tokens;
+        e.2 += crate::agents::cost_usd(
+            s.model.as_deref(),
+            s.input_tokens,
+            s.output_tokens,
+            s.cache_tokens,
+        );
+    }
+    let mut by_model: Vec<dto::AgentModelStat> = models
+        .into_iter()
+        .map(
+            |(model, (sessions, tokens, cost_usd))| dto::AgentModelStat {
+                model,
+                sessions,
+                tokens,
+                cost_usd,
+            },
+        )
+        .collect();
+    by_model.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+
+    Json(dto::AgentAnalytics {
+        total_sessions,
+        total_tokens,
+        total_cost_usd,
+        total_tool_calls,
+        by_tool: by_tool.iter().map(tool_stat_view).collect(),
+        by_model,
+    })
+}
+
 /// `GET /api/settings`
 ///
 /// Reads the **live** config snapshot (`state.config.load()`), so it reflects any
@@ -1725,6 +2441,31 @@ pub async fn settings_put(
         live.eval.judge_model = val;
     }
 
+    // AI-analysis backend — hot-reloadable. Enabling permits sending session text
+    // to OpenAI via the user's Codex, so log it as an explicit action.
+    if let Some(v) = body.analysis_enabled {
+        persisted.analysis.enabled = v;
+        live.analysis.enabled = v;
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "analysis_enabled".to_string(),
+            value: v.to_string(),
+        });
+    }
+
+    // Preservation archive — hot-reloadable, opt-in, local-only.
+    if let Some(v) = body.archive_enabled {
+        persisted.archive.enabled = v;
+        live.archive.enabled = v;
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "archive_enabled".to_string(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = body.archive_auto {
+        persisted.archive.auto = v;
+        live.archive.auto = v;
+    }
+
     // Persist the full config (write-through to TOML). The token is never touched.
     persisted.save().map_err(internal)?;
 
@@ -1808,6 +2549,10 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         eval_quality: cfg.eval.quality,
         eval_sample_rate: cfg.eval.sample_rate,
         eval_judge_model: cfg.eval.judge_model.clone(),
+        analysis_enabled: cfg.analysis.enabled,
+        analysis_available: crate::agents::codex_server::is_available(),
+        archive_enabled: cfg.archive.enabled,
+        archive_auto: cfg.archive.auto,
         restart_required: Vec::new(),
         restart_note: None,
     }

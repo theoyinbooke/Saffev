@@ -237,6 +237,50 @@ streaming):
 >   `saffev start`. `PUT /api/settings` reports them in the response's
 >   `restartRequired` field with a `restartNote` rather than swapping them live.
 
+## Agents & Preservation
+
+Beyond observing live traffic, Saffev reads your **AI coding tools' local session
+history on-device** and helps you own it. This is pure file reading — **it does
+not need the proxy running**; open the **Agents** page and it reads directly from
+each tool's on-disk history.
+
+**Sources (auto-detected):** Claude Code (`~/.claude/projects/**.jsonl`), OpenAI
+Codex (`~/.codex/sessions/**/rollout-*.jsonl`), OpenCode (`opencode.db`), Cursor
+(`state.vscdb`), and VS Code / GitHub Copilot Chat (`workspaceStorage/**/
+chatSessions/*.jsonl`). Each session and message is **tagged with its source**;
+SQLite stores are read via a read-only snapshot that never touches the live DB.
+DB/file reads are cached by a stat-only fingerprint, so repeat page loads are
+instant and only re-parse when a source file actually changes.
+
+- **See everything, per tool.** Sessions, models, message/tool-call counts, token
+  usage, and an estimated cloud-cost-avoided figure, in a per-tool table plus a
+  searchable, source-tagged session list with a full-transcript drawer.
+- **Privacy lens.** The on-device PII detector scans each transcript for what you
+  pasted into the agent (emails, cards, API keys, IPs, phones) — offsets + a
+  stable hash only, never the raw secret.
+- **Preservation (opt-in, off by default).** These tools delete their own history
+  on their own clocks (Claude Code prunes after `cleanupPeriodDays`, default 30;
+  Cursor rotates its DB). Saffev surfaces **what is scheduled for deletion** per
+  tool, and — when you enable it — keeps a **durable, encrypted copy in its own
+  SQLCipher store that survives the source app deleting theirs.** The snapshot is
+  incremental (unchanged sessions are skipped), never mutates source files, and
+  flags but never deletes sessions the source has removed ("resurrected" from the
+  archive). Our own retention defaults to keep-forever.
+- **Export.** Any session (or all of them, bulk) to open **Markdown / JSON**, to a
+  folder you own — your data, portable, yours to keep.
+- **AI summaries (opt-in).** If you have the Codex CLI installed and signed in,
+  Saffev can summarize a session using **your own Codex + ChatGPT subscription**
+  via a hardened, sandboxed `codex app-server` (read-only, no tools, minimal
+  config). This is the **one** path where content leaves the device (sent to
+  OpenAI through your own Codex); it is strictly opt-in and runs only on an
+  explicit click.
+
+> **Verification note:** these adapters are validated against real on-disk data on
+> **macOS**. The Linux/Windows storage paths are implemented but not yet verified
+> on those platforms. First load of a very large history can take a few seconds
+> while sources are parsed (then cached); the archive's first snapshot is
+> proportional to history size, and subsequent runs are near-instant.
+
 ## Build / run / test
 
 `cargo` lives at `~/.cargo/bin`. If it is not on your `PATH`:
