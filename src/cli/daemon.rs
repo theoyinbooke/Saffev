@@ -124,6 +124,19 @@ pub fn remove_pid_file(path: &Path) -> Result<()> {
     }
 }
 
+/// Remove a PID file **only if it still records `pid`**. During a restart race
+/// (update helper: `stop` old → `start` new) the successor daemon may already
+/// have written its own pid to the same path; an exiting predecessor that
+/// removed the file unconditionally would orphan the new daemon (a later `stop`
+/// couldn't find it — the exact failure mode behind a stuck in-app update).
+/// Absent/unparseable/foreign-pid files are left untouched. Best-effort.
+pub fn remove_pid_file_if_owned(path: &Path, pid: u32) -> Result<()> {
+    match read_pid_file(path) {
+        Ok(Some(pf)) if pf.pid == pid => remove_pid_file(path),
+        _ => Ok(()),
+    }
+}
+
 /// Is the process with `pid` currently alive?
 ///
 /// Our own pid (`saffev start` re-checking itself) is short-circuited to `true`
@@ -442,6 +455,30 @@ mod tests {
         // Removing an already-absent file is a no-op (not an error).
         remove_pid_file(&path).expect("idempotent remove");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owned_removal_spares_a_successors_pid_file() {
+        let dir = unique_temp_dir("owned");
+        let path = dir.join(PID_FILE_NAME);
+        let pf = PidFile {
+            pid: 4242,
+            url: "http://localhost:7100".to_string(),
+        };
+        write_pid_file(&path, &pf).expect("write pid file");
+
+        // A different pid (an exiting predecessor after a restart race) must NOT
+        // delete the successor's file.
+        remove_pid_file_if_owned(&path, 9999).expect("foreign-pid removal is a no-op");
+        assert!(path.exists(), "foreign pid removed the successor's pid file");
+
+        // The recorded owner may remove it.
+        remove_pid_file_if_owned(&path, 4242).expect("owner removal");
+        assert!(!path.exists());
+
+        // Absent file: no-op, no error.
+        remove_pid_file_if_owned(&path, 4242).expect("idempotent");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
