@@ -741,11 +741,14 @@ pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
         })
         .await
         .flatten();
-        let detail = match holder {
+        let ours = holder
+            .as_ref()
+            .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
+        let detail = match &holder {
             Some(h) => format!(
                 "port {} held by {} (pid {})",
                 proxy_port,
-                h.name.unwrap_or_else(|| "unknown".to_string()),
+                h.name.as_deref().unwrap_or("unknown"),
                 h.pid
             ),
             None => format!("port {proxy_port} already in use"),
@@ -756,11 +759,22 @@ pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
             p.label("start"),
             p.error(&detail)
         );
-        println!(
-            "{} run {} to diagnose, or adopt the engine first",
-            p.muted("·"),
-            p.value("saffev doctor"),
-        );
+        if ours {
+            // Another saffev already serves this port (possibly an orphaned
+            // daemon whose pid file was lost) — point at the command that now
+            // recovers both cases, instead of the generic doctor advice.
+            println!(
+                "{} another saffev is already running — run {} first",
+                p.muted("·"),
+                p.value("saffev stop"),
+            );
+        } else {
+            println!(
+                "{} run {} to diagnose, or adopt the engine first",
+                p.muted("·"),
+                p.value("saffev doctor"),
+            );
+        }
         return Ok(());
     }
 
@@ -801,9 +815,11 @@ pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
     let _ = (proxy_addr, studio_addr);
     let launched = run_servers(&cfg).await;
 
-    // Clean up our PID file on the way out (graceful shutdown or bind failure),
-    // so a later `stop`/`status` doesn't see a stale entry. Idempotent.
-    if let Err(e) = daemon::remove_pid_file(&pid_path) {
+    // Clean up our PID file on the way out (graceful shutdown or bind failure) —
+    // but only if it still records OUR pid. During an in-app update-restart the
+    // successor daemon may already have written its own pid here; deleting that
+    // would orphan it (`stop` couldn't find it and the next update would stick).
+    if let Err(e) = daemon::remove_pid_file_if_owned(&pid_path, std::process::id()) {
         tracing::debug!("could not remove pid file {}: {e}", pid_path.display());
     }
 
@@ -864,17 +880,45 @@ async fn start_background(
     // case — not a conflict.
     let proxy_port = cfg.ports.proxy;
     if !first_run && port_listening(cfg.ports.bind, proxy_port).await {
+        // Identify the holder so the advice is actionable: another saffev
+        // (e.g. an orphaned daemon whose pid file was lost) is recovered with
+        // `saffev stop`; anything else keeps the doctor/adopt advice.
+        let holder = guard("port diagnosis", async move {
+            crate::engine::adopt::diagnose_port_conflict(proxy_port).await
+        })
+        .await
+        .flatten();
+        let ours = holder
+            .as_ref()
+            .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
+        let detail = match &holder {
+            Some(h) => format!(
+                "port {} held by {} (pid {})",
+                proxy_port,
+                h.name.as_deref().unwrap_or("unknown"),
+                h.pid
+            ),
+            None => format!("port {proxy_port} already in use"),
+        };
         println!(
             "{} {} {}",
             p.dot(Level::Err),
             p.label("start"),
-            p.error(&format!("port {proxy_port} already in use")),
+            p.error(&detail),
         );
-        println!(
-            "{} run {} to diagnose, or adopt the engine first",
-            p.muted("·"),
-            p.value("saffev doctor"),
-        );
+        if ours {
+            println!(
+                "{} another saffev is already running — run {} first",
+                p.muted("·"),
+                p.value("saffev stop"),
+            );
+        } else {
+            println!(
+                "{} run {} to diagnose, or adopt the engine first",
+                p.muted("·"),
+                p.value("saffev doctor"),
+            );
+        }
         return Ok(());
     }
 
@@ -1253,6 +1297,19 @@ async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
 /// no longer alive) is cleaned up gracefully. When there is no PID file but a
 /// Saffev-looking proxy is up, we report that the running instance is unmanaged
 /// (foreground in another terminal: Ctrl-C there).
+/// Is a port-holder's process name our own binary? Matches on the executable's
+/// file name (the diagnosis may report a full path, e.g.
+/// `/Users/you/.cargo/bin/saffev`), tolerating a Windows `.exe` suffix. Used to
+/// decide whether an unmanaged port holder is a recoverable orphaned daemon.
+fn holder_is_saffev(name: Option<&str>) -> bool {
+    let Some(name) = name else { return false };
+    let file = std::path::Path::new(name.trim())
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    file == crate::brand::APP_CMD || file == format!("{}.exe", crate::brand::APP_CMD)
+}
+
 pub async fn stop(cli: &Cli) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
@@ -1268,25 +1325,85 @@ pub async fn stop(cli: &Cli) -> Result<()> {
         }
     };
 
-    // No PID file: nothing we manage. Fall back to a liveness probe so the
-    // message is honest about an unmanaged (foreground) instance.
+    // No PID file: probe the configured ports. If one is held by a *saffev*
+    // process, that's an ORPHANED daemon (pid file lost to a crash, manual
+    // delete, or a cleanup race) — recover it like a managed stop, so the
+    // in-app "Update & restart" can never get stuck behind a missing pid file.
+    // A foreign holder (or an unidentifiable one) keeps the honest warning:
+    // we never terminate a process we can't attribute to ourselves.
     let Some(record) = record else {
-        let proxy_up = port_listening(cfg.ports.bind, cfg.ports.proxy).await;
         let studio_up = port_listening(cfg.ports.bind, cfg.ports.studio).await;
-        if proxy_up || studio_up {
-            println!(
-                "{} {} {}",
-                p.dot(Level::Warn),
-                p.label("stop"),
-                p.warn("running but unmanaged (no pid file) — press Ctrl-C in its terminal"),
-            );
-        } else {
+        let proxy_up = port_listening(cfg.ports.bind, cfg.ports.proxy).await;
+        if !(studio_up || proxy_up) {
             println!(
                 "{} {} {}",
                 p.dot(Level::Ok),
                 p.label("stop"),
                 p.value("not running"),
             );
+            return Ok(());
+        }
+
+        // Prefer the Studio port for attribution — only saffev ever serves it
+        // (the proxy port could legitimately be a relocated engine in Gateway).
+        let probe_port = if studio_up {
+            cfg.ports.studio
+        } else {
+            cfg.ports.proxy
+        };
+        let holder = guard("port diagnosis", async move {
+            crate::engine::adopt::diagnose_port_conflict(probe_port).await
+        })
+        .await
+        .flatten();
+
+        match holder {
+            Some(h) if holder_is_saffev(h.name.as_deref()) => {
+                println!(
+                    "{} {} {}",
+                    p.dot(Level::Warn),
+                    p.label("stop"),
+                    p.warn(&format!(
+                        "orphaned daemon on port {} (pid {}, no pid file) — recovering",
+                        probe_port, h.pid
+                    )),
+                );
+                if let Err(e) = daemon::send_terminate(h.pid) {
+                    tracing::debug!("terminating orphaned {} failed: {e}", h.pid);
+                }
+                let exited = daemon::wait_for_exit(
+                    h.pid,
+                    Duration::from_secs(5),
+                    Duration::from_millis(100),
+                )
+                .await;
+                if exited {
+                    println!(
+                        "{} {} {}",
+                        p.dot(Level::Ok),
+                        p.label("stopped"),
+                        p.success(&format!("orphaned pid {} shut down gracefully", h.pid)),
+                    );
+                } else {
+                    println!(
+                        "{} {} {}",
+                        p.dot(Level::Warn),
+                        p.label("stop"),
+                        p.warn(&format!(
+                            "pid {} did not exit within 5s — re-run `saffev stop` to retry",
+                            h.pid
+                        )),
+                    );
+                }
+            }
+            _ => {
+                println!(
+                    "{} {} {}",
+                    p.dot(Level::Warn),
+                    p.label("stop"),
+                    p.warn("running but unmanaged (no pid file) — press Ctrl-C in its terminal"),
+                );
+            }
         }
         return Ok(());
     };
@@ -1336,8 +1453,9 @@ pub async fn stop(cli: &Cli) -> Result<()> {
 
     if exited {
         // The daemon removes its own PID file on clean exit; remove it here too
-        // in case it couldn't (idempotent).
-        if let Err(e) = daemon::remove_pid_file(&pid_path) {
+        // in case it couldn't — but only while it still records the pid we
+        // stopped, so we can't race a successor that already wrote its own.
+        if let Err(e) = daemon::remove_pid_file_if_owned(&pid_path, record.pid) {
             tracing::debug!("removing pid file after stop failed: {e}");
         }
         println!(
@@ -2158,6 +2276,21 @@ fn default_setup_snippet(proxy_url: &str) -> String {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn holder_is_saffev_matches_only_our_binary() {
+        // Bare name, full path, and Windows .exe all attribute to us.
+        assert!(holder_is_saffev(Some("saffev")));
+        assert!(holder_is_saffev(Some("/Users/you/.cargo/bin/saffev")));
+        assert!(holder_is_saffev(Some("saffev.exe"))); // Windows tasklist name
+        assert!(holder_is_saffev(Some("  saffev  "))); // ps padding
+        // Foreign processes (and the unknown case) never match — we must not
+        // terminate something we can't attribute to ourselves.
+        assert!(!holder_is_saffev(Some("ollama")));
+        assert!(!holder_is_saffev(Some("/usr/local/bin/node")));
+        assert!(!holder_is_saffev(Some("saffev-helper")));
+        assert!(!holder_is_saffev(None));
+    }
 
     #[test]
     fn group_thousands_formats() {
