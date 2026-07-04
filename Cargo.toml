@@ -29,8 +29,16 @@ default = ["sqlcipher"]
 # system OpenSSL). Enabled in `default`; opt out with `--no-default-features`
 # for a plain bundled-SQLite build (no encryption, no crypto compile).
 sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+# Menu-bar / system-tray launcher (Saffev.app). OFF by default so the headless
+# server builds (and Linux/Windows release artifacts) are unaffected. Enabled only
+# for the macOS .app build. Pulls in a native event loop + tray widget; all objc
+# unsafe stays inside those crates, so `#![forbid(unsafe_code)]` still holds.
+tray = ["dep:tray-icon", "dep:tao"]
 
 [dependencies]
+# --- menu-bar launcher (feature `tray`, optional) ---
+tray-icon = { version = "0.19", optional = true }
+tao = { version = "0.30", optional = true }
 # --- async runtime / proxy spine ---
 tokio = { version = "1.40", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }

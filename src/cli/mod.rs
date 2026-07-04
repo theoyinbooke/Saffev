@@ -8,6 +8,9 @@
 pub mod capture;
 pub mod commands;
 pub mod daemon;
+/// macOS menu-bar launcher (Saffev.app). Only built with `--features tray`.
+#[cfg(feature = "tray")]
+pub mod tray;
 
 use clap::{Parser, Subcommand};
 
