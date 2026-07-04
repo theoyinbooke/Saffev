@@ -15,6 +15,8 @@
 #     --apple-id YOU@example.com --team-id TEAMID --password APP_SPECIFIC_PW
 #
 # Output: target/Saffev.app  (drag it to /Applications, then double-click).
+#         With --notarize, also target/Saffev-macos-<arch>.dmg — a notarized,
+#         stapled drag-install disk image (the primary download; no unzip).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -114,19 +116,41 @@ if [[ -n "$SIGN_ID" ]]; then
   codesign --verify --deep --strict "$APP" && echo "   signature OK"
 fi
 
-# Notarize + staple (needs --sign and a stored notarytool keychain profile).
+# Notarize the app, staple it, then wrap it in a notarized drag-install DMG
+# (needs --sign and a stored notarytool keychain profile). notarytool needs a
+# container (zip/dmg), so the app is submitted zipped; the DMG is submitted and
+# stapled separately so Gatekeeper accepts the downloaded .dmg with no unzip.
+ARCH="$(uname -m)"  # arm64 on Apple Silicon; the release asset is named by arch.
+DMG="target/Saffev-macos-$ARCH.dmg"
 if [[ -n "$NOTARY_PROFILE" ]]; then
-  echo "==> Notarizing (profile: $NOTARY_PROFILE)…"
+  echo "==> Notarizing app (profile: $NOTARY_PROFILE)…"
   ZIP="target/Saffev-$VERSION.zip"
   rm -f "$ZIP"
   ditto -c -k --keepParent "$APP" "$ZIP"
   xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple "$APP"
-  spctl -a -t exec -vv "$APP" && echo "   notarization OK (Gatekeeper accepts)"
   rm -f "$ZIP"
+
+  echo "==> Building drag-install DMG: $DMG…"
+  STAGE="$(mktemp -d)"
+  cp -R "$APP" "$STAGE/"
+  ln -s /Applications "$STAGE/Applications"   # drag Saffev.app -> Applications
+  rm -f "$DMG"
+  hdiutil create -volname "Saffev" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+  rm -rf "$STAGE"
+
+  # Sign the DMG itself (not just the app inside) so Gatekeeper has a usable
+  # primary signature on the downloaded image, then notarize + staple it.
+  echo "==> Signing + notarizing DMG…"
+  codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+  spctl -a -t open --context context:primary-signature -vv "$DMG" \
+    && echo "   DMG notarization OK (Gatekeeper accepts the download)"
 fi
 
 echo ""
 echo "Built $APP"
+[[ -f "$DMG" ]] && echo "Built $DMG  (drag-install: open it, drag Saffev.app to Applications)"
 echo "  Install:  cp -R \"$APP\" /Applications/  &&  open /Applications/Saffev.app"
 echo "  It appears in the menu bar (no Dock icon). Click it -> Open Saffev Studio."

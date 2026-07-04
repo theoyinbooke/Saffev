@@ -25,12 +25,13 @@ the same command to update. (Prebuilt targets: macOS arm64 + x86_64, Linux
 x86_64. Build from source for others — see **Build / run / test**.)
 
 **macOS — prefer a menu-bar app?** The latest release also ships a signed &
-notarized **`Saffev.app`** (Apple Silicon). Download `Saffev-macos-arm64.zip`
-from the [latest release](https://github.com/theoyinbooke/Saffev/releases/latest),
-unzip, drag `Saffev.app` to `/Applications`, and double-click. It lives in the
-menu bar (no Dock icon, no terminal) and keeps the proxy + Studio running:
-**Open Studio · Start · Stop · Restart · Open at Login · Quit**. Under the hood it
-is the same `saffev` binary running `saffev tray`.
+notarized **`Saffev.app`** (Apple Silicon) as a drag-install disk image.
+Download
+**[`Saffev-macos-arm64.dmg`](https://github.com/theoyinbooke/Saffev/releases/latest/download/Saffev-macos-arm64.dmg)**,
+open it, and drag `Saffev.app` onto the `Applications` shortcut inside — no
+unzip. It lives in the menu bar (no Dock icon, no terminal) and keeps the proxy +
+Studio running: **Open Studio · Start · Stop · Restart · Open at Login · Quit**.
+Under the hood it is the same `saffev` binary running `saffev tray`.
 
 **Updating in place.** Installer installs can update themselves: run `saffev
 update` (or `saffev update --check` to just look), or click **Update** in the
