@@ -131,7 +131,7 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
   xcrun stapler staple "$APP"
   rm -f "$ZIP"
 
-  echo "==> Building drag-install DMG: $DMG…"
+  echo "==> Building drag-install DMG: ${DMG}…"
   STAGE="$(mktemp -d)"
   cp -R "$APP" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"   # drag Saffev.app -> Applications
