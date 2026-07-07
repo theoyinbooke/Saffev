@@ -1869,7 +1869,7 @@
         if (!next) {
           const ok = await confirmModal({
             title: 'Turn off dry-run?',
-            body: 'With dry-run off, high-confidence PII (email, card, API key, IP, phone) is redacted from request bodies BEFORE they reach the model. Responses and streaming are unaffected.\n\nFail-open: any error forwards the original request unchanged.',
+            body: 'With dry-run off, high-confidence PII (email, card, API key, IP, phone) is redacted from requests BEFORE they reach the model, and from responses on the way back \u00b7 including streams, via a bounded holdback that catches spans straddling chunks.\n\nFail-open: any error forwards the original traffic unchanged.',
             confirmLabel: 'Start redacting', danger: true,
           });
           if (!ok) return;

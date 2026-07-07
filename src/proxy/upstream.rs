@@ -111,9 +111,9 @@ pub async fn forward_streaming(
     //
     // SCOPE: we mask the REQUEST body here (the full body is in hand).
     // NON-STREAMING responses are masked on the response path (buffered + redacted
-    // — see `buffer_and_mask_response`). STREAMING responses stay deferred: a PII
-    // span can straddle two chunks and we must never buffer a stream (the
-    // transparent-streaming invariant).
+    // — see `buffer_and_mask_response`). STREAMING responses are masked frame by
+    // frame through the bounded-holdback masker (`stream_and_mask_response`) —
+    // never buffered whole.
     let (forward_bytes, mask_action) = mask_request_body(state, &req_bytes);
 
     // Tee the request start with the ORIGINAL (unredacted) body so the logger
@@ -176,13 +176,15 @@ pub async fn forward_streaming(
     let status = upstream_resp.status();
     let resp_headers = forward_response_headers(upstream_resp.headers());
 
-    // Non-streaming response masking (04 §7.6). When masking is LIVE and the
-    // upstream returned a single JSON body (not an SSE/NDJSON stream), buffer the
-    // whole body and redact response-side PII before forwarding — the response
-    // analogue of request masking. A non-streamed JSON response is not a stream,
-    // so this does NOT violate the transparent-streaming invariant. STREAMING
-    // responses are never buffered here (a span can straddle chunks) — response
-    // masking stays deferred for them; they observe-only.
+    // Response masking (04 §7.6). When masking is LIVE:
+    // - a single JSON body is buffered + redacted (`buffer_and_mask_response`);
+    // - a STREAM (Ollama NDJSON / OpenAI SSE) flows through the bounded-holdback
+    //   stream masker (`stream_and_mask_response`): frames are forwarded as they
+    //   arrive, with each frame's text delta passed through
+    //   `brain::stream_mask::StreamMasker`, which retains only a small bounded
+    //   tail so a PII span straddling chunks is still caught. The stream is
+    //   never aggregated; live masking is the user's explicit opt-in, so the
+    //   altered stream is by design (observe/dry-run remain byte-transparent).
     let masking_live = {
         let m = &state.config.load().masking;
         m.enabled && !m.dry_run
@@ -190,6 +192,19 @@ pub async fn forward_streaming(
     if masking_live && response_is_json(upstream_resp.headers()) {
         return buffer_and_mask_response(state, id, start, status, resp_headers, upstream_resp)
             .await;
+    }
+    if masking_live {
+        if let Some(kind) = response_stream_kind(upstream_resp.headers()) {
+            return stream_and_mask_response(
+                state,
+                id,
+                start,
+                status,
+                resp_headers,
+                kind,
+                upstream_resp,
+            );
+        }
     }
 
     // Wrap the upstream byte stream so each chunk is teed as it is forwarded —
@@ -357,6 +372,447 @@ async fn buffer_and_mask_response(
 /// large prompts and base64 image payloads, bounded so a hostile client can't
 /// OOM us. 64 MiB.
 const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Streaming-response masking (bounded holdback)
+// ---------------------------------------------------------------------------
+
+/// Which streaming frame protocol the upstream response uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// Ollama-native streaming: one JSON object per `\n`-terminated line.
+    Ndjson,
+    /// OpenAI-compatible streaming: `data: {json}` SSE events separated by a
+    /// blank line (LM Studio, Ollama `/v1`).
+    Sse,
+}
+
+/// Classify a streamed response by content type. `None` = not a recognized
+/// stream (passthrough; observe-only).
+fn response_stream_kind(headers: &reqwest::header::HeaderMap) -> Option<StreamKind> {
+    let ct = headers
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase();
+    if ct.contains("ndjson") {
+        Some(StreamKind::Ndjson)
+    } else if ct.contains("text/event-stream") {
+        Some(StreamKind::Sse)
+    } else {
+        None
+    }
+}
+
+/// Where the text delta lives inside one stream frame's JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextPath {
+    /// Ollama `/api/generate`: top-level `"response"`.
+    OllamaResponse,
+    /// Ollama `/api/chat`: `"message": {"content": …}`.
+    OllamaMessage,
+    /// OpenAI chat stream: `"choices"[0]."delta"."content"`.
+    OpenAiDelta,
+    /// OpenAI completions stream: `"choices"[0]."text"`.
+    OpenAiText,
+}
+
+fn find_text_path(v: &serde_json::Value) -> Option<TextPath> {
+    if v.get("response").is_some_and(|t| t.is_string()) {
+        return Some(TextPath::OllamaResponse);
+    }
+    if v.get("message")
+        .and_then(|m| m.get("content"))
+        .is_some_and(|t| t.is_string())
+    {
+        return Some(TextPath::OllamaMessage);
+    }
+    if let Some(c0) = v.get("choices").and_then(|c| c.get(0)) {
+        if c0
+            .get("delta")
+            .and_then(|d| d.get("content"))
+            .is_some_and(|t| t.is_string())
+        {
+            return Some(TextPath::OpenAiDelta);
+        }
+        if c0.get("text").is_some_and(|t| t.is_string()) {
+            return Some(TextPath::OpenAiText);
+        }
+    }
+    None
+}
+
+fn get_text(v: &serde_json::Value, path: TextPath) -> Option<&str> {
+    match path {
+        TextPath::OllamaResponse => v.get("response")?.as_str(),
+        TextPath::OllamaMessage => v.get("message")?.get("content")?.as_str(),
+        TextPath::OpenAiDelta => v
+            .get("choices")?
+            .get(0)?
+            .get("delta")?
+            .get("content")?
+            .as_str(),
+        TextPath::OpenAiText => v.get("choices")?.get(0)?.get("text")?.as_str(),
+    }
+}
+
+/// Replace the frame's text delta in place. Returns false when the path is
+/// unexpectedly absent (caller then passes the frame through verbatim).
+fn set_text(v: &mut serde_json::Value, path: TextPath, s: String) -> bool {
+    let slot = match path {
+        TextPath::OllamaResponse => v.get_mut("response"),
+        TextPath::OllamaMessage => v.get_mut("message").and_then(|m| m.get_mut("content")),
+        TextPath::OpenAiDelta => v
+            .get_mut("choices")
+            .and_then(|c| c.get_mut(0))
+            .and_then(|c0| c0.get_mut("delta"))
+            .and_then(|d| d.get_mut("content")),
+        TextPath::OpenAiText => v
+            .get_mut("choices")
+            .and_then(|c| c.get_mut(0))
+            .and_then(|c0| c0.get_mut("text")),
+    };
+    match slot {
+        Some(slot) => {
+            *slot = serde_json::Value::String(s);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A frame buffer that never completes (no terminator seen) must not grow
+/// without bound: past this we permanently fall back to verbatim passthrough
+/// for the rest of the stream (fail-open).
+const MAX_FRAME_BUF: usize = 1024 * 1024;
+
+/// Incremental frame processor: splits the byte stream into NDJSON lines / SSE
+/// events, routes each frame's text delta through the [`StreamMasker`], and
+/// re-serializes. Everything unrecognized passes through verbatim (fail-open).
+///
+/// [`StreamMasker`]: crate::brain::stream_mask::StreamMasker
+struct FrameMasker {
+    kind: StreamKind,
+    masker: crate::brain::stream_mask::StreamMasker,
+    buf: Vec<u8>,
+    /// Template (a clone of the last content-bearing frame) used to synthesize
+    /// one final frame carrying the flushed holdback text at stream end.
+    template: Option<(serde_json::Value, TextPath)>,
+    /// Set when framing has failed; the remainder of the stream passes through
+    /// verbatim (fail-open: transparency beats masking).
+    broken: bool,
+}
+
+impl FrameMasker {
+    fn new(kind: StreamKind, masker: crate::brain::stream_mask::StreamMasker) -> Self {
+        FrameMasker {
+            kind,
+            masker,
+            buf: Vec::new(),
+            template: None,
+            broken: false,
+        }
+    }
+
+    fn masked_total(&self) -> usize {
+        self.masker.masked_total()
+    }
+
+    /// Feed one network chunk; returns the bytes to forward to the client now.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.broken {
+            return chunk.to_vec();
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::with_capacity(chunk.len());
+        loop {
+            let frame_end = match self.kind {
+                StreamKind::Ndjson => self.buf.iter().position(|&b| b == b'\n').map(|p| p + 1),
+                StreamKind::Sse => find_sse_event_end(&self.buf),
+            };
+            match frame_end {
+                Some(end) => {
+                    let frame: Vec<u8> = self.buf.drain(..end).collect();
+                    match self.kind {
+                        StreamKind::Ndjson => out.extend(self.process_ndjson_line(&frame)),
+                        StreamKind::Sse => out.extend(self.process_sse_event(&frame)),
+                    }
+                }
+                None => break,
+            }
+        }
+        if self.buf.len() > MAX_FRAME_BUF {
+            // No terminator in over a megabyte: this is not the stream shape we
+            // understand. Fall back to passthrough for the rest of the stream.
+            tracing::warn!(
+                "proxy: stream frame exceeded {} bytes; falling back to passthrough (fail-open)",
+                MAX_FRAME_BUF
+            );
+            self.broken = true;
+            out.append(&mut self.buf);
+        }
+        out
+    }
+
+    /// Stream end: flush the masker's holdback (synthesized into a final frame
+    /// when there is text left) and drain any incomplete buffered frame verbatim.
+    fn finish(&mut self) -> Vec<u8> {
+        let mut out = self.synthesize_flush();
+        out.append(&mut self.buf);
+        out
+    }
+
+    /// One complete NDJSON line (including its `\n`).
+    fn process_ndjson_line(&mut self, line: &[u8]) -> Vec<u8> {
+        let trimmed = trim_ascii(line);
+        if trimmed.is_empty() {
+            return line.to_vec();
+        }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(trimmed) else {
+            return line.to_vec(); // not JSON — verbatim (fail-open)
+        };
+        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+        let Some(path) = find_text_path(&v) else {
+            if done {
+                // Final frame without a text slot: flush ahead of it.
+                let mut out = self.synthesize_flush();
+                out.extend_from_slice(line);
+                return out;
+            }
+            return line.to_vec();
+        };
+        let text = get_text(&v, path).unwrap_or_default().to_string();
+        if !done {
+            self.template = Some((v.clone(), path));
+        }
+        let mut masked = self.masker.push(&text);
+        if done {
+            // Ollama's final frame carries the text slot (normally empty): the
+            // flushed holdback rides in it, so nothing is ever left behind.
+            masked.push_str(&self.masker.flush());
+        }
+        if !set_text(&mut v, path, masked) {
+            return line.to_vec();
+        }
+        match serde_json::to_vec(&v) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                bytes
+            }
+            Err(_) => line.to_vec(),
+        }
+    }
+
+    /// One complete SSE event (including its blank-line terminator).
+    fn process_sse_event(&mut self, event: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(event) else {
+            return event.to_vec();
+        };
+        // Exactly one `data:` line is the shape LLM engines emit; anything else
+        // (multi-line data, comments-only) passes through verbatim.
+        let data_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("data:")).collect();
+        if data_lines.len() != 1 {
+            return event.to_vec();
+        }
+        let payload = data_lines[0]["data:".len()..].trim_start();
+        if payload == "[DONE]" {
+            let mut out = self.synthesize_flush();
+            out.extend_from_slice(event);
+            return out;
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return event.to_vec();
+        };
+        let finished = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c0| c0.get("finish_reason"))
+            .is_some_and(|f| !f.is_null());
+        let Some(path) = find_text_path(&v) else {
+            if finished {
+                // finish_reason frame with no content slot: flush BEFORE it so
+                // clients that stop reading at finish_reason still get the tail.
+                let mut out = self.synthesize_flush();
+                out.extend_from_slice(event);
+                return out;
+            }
+            return event.to_vec();
+        };
+        let delta = get_text(&v, path).unwrap_or_default().to_string();
+        if !finished {
+            self.template = Some((v.clone(), path));
+        }
+        let mut masked = self.masker.push(&delta);
+        if finished {
+            masked.push_str(&self.masker.flush());
+        }
+        if !set_text(&mut v, path, masked) {
+            return event.to_vec();
+        }
+        let Ok(json) = serde_json::to_string(&v) else {
+            return event.to_vec();
+        };
+        // Rebuild the event: swap the data line, keep every other line (event:,
+        // id:, retry:, comments) verbatim.
+        let mut rebuilt = String::with_capacity(event.len() + json.len());
+        for line in text.lines() {
+            if line.starts_with("data:") {
+                rebuilt.push_str("data: ");
+                rebuilt.push_str(&json);
+            } else {
+                rebuilt.push_str(line);
+            }
+            rebuilt.push('\n');
+        }
+        rebuilt.push('\n');
+        rebuilt.into_bytes()
+    }
+
+    /// Drain the masker's holdback into one synthesized frame shaped like the
+    /// last content-bearing frame. Empty when there is nothing left (or no
+    /// template was ever seen — which implies no text was ever pushed).
+    fn synthesize_flush(&mut self) -> Vec<u8> {
+        let rest = self.masker.flush();
+        if rest.is_empty() {
+            return Vec::new();
+        }
+        let Some((template, path)) = self.template.clone() else {
+            tracing::warn!(
+                "proxy: stream masker had holdback text but no frame template; text dropped"
+            );
+            return Vec::new();
+        };
+        let mut v = template;
+        if !set_text(&mut v, path, rest) {
+            return Vec::new();
+        }
+        match self.kind {
+            StreamKind::Ndjson => match serde_json::to_vec(&v) {
+                Ok(mut bytes) => {
+                    bytes.push(b'\n');
+                    bytes
+                }
+                Err(_) => Vec::new(),
+            },
+            StreamKind::Sse => match serde_json::to_string(&v) {
+                Ok(json) => format!("data: {json}\n\n").into_bytes(),
+                Err(_) => Vec::new(),
+            },
+        }
+    }
+}
+
+/// Find the end (exclusive, including terminator) of the first complete SSE
+/// event: a `\n\n` or `\r\n\r\n` separator.
+fn find_sse_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn trim_ascii(b: &[u8]) -> &[u8] {
+    let start = b.iter().position(|c| !c.is_ascii_whitespace());
+    match start {
+        Some(s) => {
+            let end = b
+                .iter()
+                .rposition(|c| !c.is_ascii_whitespace())
+                .unwrap_or(s);
+            &b[s..=end]
+        }
+        None => &[],
+    }
+}
+
+/// Forward a STREAMED response through the bounded-holdback masker. Frames flow
+/// to the client as they arrive (never aggregated); only each frame's text delta
+/// is rewritten, with a small bounded tail held back so a PII span straddling
+/// chunks is still caught (see [`crate::brain::stream_mask`]). The ORIGINAL
+/// bytes are teed for logging (true findings + offsets), mirroring
+/// [`buffer_and_mask_response`]. Fail-open throughout: unrecognized frames pass
+/// verbatim, and a framing failure degrades to passthrough mid-stream.
+fn stream_and_mask_response(
+    state: &ProxyState,
+    id: String,
+    start: Instant,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+    kind: StreamKind,
+    upstream_resp: reqwest::Response,
+) -> Response {
+    let masker = crate::brain::stream_mask::StreamMasker::new(
+        state.detector.clone(),
+        crate::brain::Side::Response,
+        state.config.load().masking.kinds.clone(),
+    );
+    let mut frames = FrameMasker::new(kind, masker);
+    let tee = state.tee.clone();
+    let status_code = status.as_u16();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let mut byte_stream = upstream_resp.bytes_stream();
+
+    tokio::spawn(async move {
+        let mut error_kind: Option<String> = None;
+        while let Some(item) = byte_stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    // Tee the ORIGINAL chunk (logger derives TTFT + true findings).
+                    send_chunk(&tee, &id, chunk.clone());
+                    let out = frames.feed(&chunk);
+                    if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
+                        // Client dropped; stop pulling from the engine.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "proxy: upstream stream error mid-flight (masked stream)");
+                    error_kind = Some("stream_error".to_string());
+                    let _ = tx.send(Err(std::io::Error::other(e))).await;
+                    break;
+                }
+            }
+        }
+        let rest = frames.finish();
+        if !rest.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(rest))).await;
+        }
+        let resp_mask_action = if frames.masked_total() > 0 {
+            MaskAction::Masked
+        } else {
+            MaskAction::Observed
+        };
+        if let Err(e) = tee.try_send(TeeEvent::ResponseFinished {
+            id,
+            ttft_ms: None,
+            total_ms: Some(elapsed_ms(start)),
+            status: Some(status_code),
+            error_kind,
+            resp_mask_action,
+        }) {
+            tracing::debug!(error = ?e, "proxy: tee full/closed on masked-stream finish (fail-open)");
+        }
+    });
+
+    let body_stream =
+        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) });
+    let body = Body::from_stream(body_stream);
+
+    let mut response = Response::builder().status(status);
+    if let Some(h) = response.headers_mut() {
+        *h = resp_headers;
+    }
+    match response.body(body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "proxy: failed to build masked streaming response; failing open");
+            (StatusCode::BAD_GATEWAY, "saffev: response build error").into_response()
+        }
+    }
+}
 
 /// Best-effort enqueue of a [`TeeEvent`] with **drop-oldest** semantics: if the
 /// channel is full, drop the oldest queued event rather than block the client
@@ -851,5 +1307,184 @@ mod tests {
         assert!(!json("application/x-ndjson"));
         // Absent content type: not bufferable (observe).
         assert!(!response_is_json(&reqwest::header::HeaderMap::new()));
+    }
+
+    // -- streaming-response masking ------------------------------------------
+
+    fn frame_masker(kind: StreamKind) -> FrameMasker {
+        let det = std::sync::Arc::new(detector());
+        let masker =
+            crate::brain::stream_mask::StreamMasker::new(det, crate::brain::Side::Response, None);
+        FrameMasker::new(kind, masker)
+    }
+
+    /// Reassemble the visible text a client would see from masked NDJSON output.
+    fn ndjson_text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| find_text_path(&v).and_then(|p| get_text(&v, p).map(|s| s.to_string())))
+            .collect()
+    }
+
+    fn sse_text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|l| l.starts_with("data:"))
+            .map(|l| l["data:".len()..].trim_start())
+            .filter(|p| *p != "[DONE]")
+            .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .filter_map(|v| {
+                find_text_path(&v).and_then(|pth| get_text(&v, pth).map(|s| s.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_kind_detection() {
+        let kind = |ct: &'static str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static(ct),
+            );
+            response_stream_kind(&h)
+        };
+        assert_eq!(kind("application/x-ndjson"), Some(StreamKind::Ndjson));
+        assert_eq!(kind("text/event-stream"), Some(StreamKind::Sse));
+        assert_eq!(kind("application/json"), None);
+        assert_eq!(
+            response_stream_kind(&reqwest::header::HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn ndjson_email_straddling_frames_is_masked() {
+        // Ollama /api/generate shape: email split across two frames, done frame
+        // carries the flushed holdback.
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let mut out = Vec::new();
+        out.extend(
+            fm.feed(b"{\"model\":\"m\",\"response\":\"mail me at user@exa\",\"done\":false}\n"),
+        );
+        out.extend(fm.feed(b"{\"model\":\"m\",\"response\":\"mple.com thanks\",\"done\":false}\n"));
+        out.extend(
+            fm.feed(b"{\"model\":\"m\",\"response\":\"\",\"done\":true,\"eval_count\":42}\n"),
+        );
+        out.extend(fm.finish());
+        let text = ndjson_text(&out);
+        assert_eq!(text, "mail me at [EMAIL] thanks");
+        assert_eq!(fm.masked_total(), 1);
+        // Non-text metadata survives (token accounting fields intact).
+        assert!(String::from_utf8_lossy(&out).contains("\"eval_count\":42"));
+    }
+
+    #[test]
+    fn ndjson_line_split_across_network_chunks_reassembles() {
+        // A single JSON line arriving in three arbitrary byte chunks.
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let mut out = Vec::new();
+        out.extend(fm.feed(b"{\"response\":\"clean "));
+        out.extend(fm.feed(b"text he"));
+        out.extend(fm.feed(b"re\",\"done\":false}\n"));
+        out.extend(fm.feed(b"{\"response\":\"\",\"done\":true}\n"));
+        out.extend(fm.finish());
+        assert_eq!(ndjson_text(&out), "clean text here");
+    }
+
+    #[test]
+    fn ndjson_chat_shape_is_masked() {
+        // Ollama /api/chat shape: message.content.
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let mut out = Vec::new();
+        out.extend(fm.feed(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"card 4111 1111 1111 1111 ok\"},\"done\":false}\n",
+        ));
+        out.extend(
+            fm.feed(b"{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n"),
+        );
+        out.extend(fm.finish());
+        let text = ndjson_text(&out);
+        assert!(text.contains("[CARD]"), "got: {text}");
+        assert!(!text.contains("4111"));
+    }
+
+    #[test]
+    fn ndjson_garbage_passes_through_verbatim() {
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let out = fm.feed(b"this is not json at all\n");
+        assert_eq!(out, b"this is not json at all\n");
+        assert_eq!(fm.masked_total(), 0);
+    }
+
+    #[test]
+    fn sse_email_straddling_events_is_masked_and_done_preserved() {
+        // OpenAI-compatible stream (LM Studio): delta.content across events,
+        // then a finish_reason frame, then [DONE].
+        let mut fm = frame_masker(StreamKind::Sse);
+        let mut out = Vec::new();
+        out.extend(fm.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"reach me: user@exa\"},\"finish_reason\":null}]}\n\n",
+        ));
+        out.extend(fm.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"mple.com bye\"},\"finish_reason\":null}]}\n\n",
+        ));
+        out.extend(fm.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"));
+        out.extend(fm.feed(b"data: [DONE]\n\n"));
+        out.extend(fm.finish());
+        let text = sse_text(&out);
+        assert_eq!(text, "reach me: [EMAIL] bye");
+        let raw = String::from_utf8_lossy(&out);
+        assert!(raw.contains("[DONE]"), "terminator must survive");
+        assert!(raw.contains("finish_reason"), "finish frame must survive");
+        // The flushed tail must arrive BEFORE the finish_reason frame.
+        let tail_pos = raw.find("bye").expect("tail text present");
+        let fin_pos = raw.find("\"stop\"").expect("finish frame present");
+        assert!(
+            tail_pos < fin_pos,
+            "holdback must flush before finish_reason"
+        );
+    }
+
+    #[test]
+    fn sse_event_split_across_chunks_reassembles() {
+        let mut fm = frame_masker(StreamKind::Sse);
+        let mut out = Vec::new();
+        out.extend(fm.feed(b"data: {\"choices\":[{\"delta\":{\"content\":"));
+        out.extend(fm.feed(b"\"hello world\"},\"finish_reason\":null}]}\n"));
+        out.extend(fm.feed(b"\n"));
+        out.extend(fm.feed(b"data: [DONE]\n\n"));
+        out.extend(fm.finish());
+        assert_eq!(sse_text(&out), "hello world");
+    }
+
+    #[test]
+    fn oversized_frame_falls_back_to_passthrough() {
+        // A "stream" with no terminator must not buffer forever: past the cap it
+        // degrades to verbatim passthrough (fail-open).
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let chunk = vec![b'x'; 300 * 1024];
+        let mut emitted = 0usize;
+        for _ in 0..5 {
+            emitted += fm.feed(&chunk).len();
+        }
+        assert!(emitted >= 5 * chunk.len() - MAX_FRAME_BUF - chunk.len());
+        assert!(fm.broken, "must be in passthrough mode");
+        // Subsequent chunks flow straight through.
+        assert_eq!(fm.feed(b"more").len(), 4);
+    }
+
+    #[test]
+    fn stream_end_without_done_frame_still_flushes_holdback() {
+        // Engine died mid-stream: finish() must synthesize a frame carrying the
+        // held-back (masked) text so the client is never short-changed.
+        let mut fm = frame_masker(StreamKind::Ndjson);
+        let mut out = Vec::new();
+        out.extend(fm.feed(b"{\"response\":\"short text user@example.com\",\"done\":false}\n"));
+        out.extend(fm.finish());
+        let text = ndjson_text(&out);
+        assert_eq!(text, "short text [EMAIL]");
     }
 }

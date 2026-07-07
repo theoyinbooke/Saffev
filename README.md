@@ -210,9 +210,13 @@ streaming):
   Flip dry-run off to redact high-confidence request-side PII (email, card, API
   key, IP, phone) to typed placeholders (`[EMAIL]`, `[CARD]`, …) **before** the
   request reaches the engine — the model never sees the raw value. Recorded as
-  `masked`. Low-confidence findings are never masked. Streaming responses are
-  left untouched (a span can cross chunks; the transparent-streaming invariant
-  forbids buffering).
+  `masked`. Low-confidence findings are never masked. Responses are masked too:
+  a single JSON body is buffered and redacted, and **streaming responses**
+  (Ollama NDJSON, OpenAI SSE) flow through a bounded-holdback masker — frames
+  are forwarded as they arrive while a small tail (~160 chars) of decoded text
+  is held back so a PII span that straddles chunks is still caught. The stream
+  is never buffered whole; on any framing error it degrades to verbatim
+  passthrough (fail-open).
 - **Socket-PID source-app attribution.** The client peer address is resolved to
   a process name via `lsof` (macOS) / `/proc` (Linux) off the request path, with
   a header fallback then `Unknown`. Findings carry the real confidence
