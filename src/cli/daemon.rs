@@ -471,7 +471,10 @@ mod tests {
         // A different pid (an exiting predecessor after a restart race) must NOT
         // delete the successor's file.
         remove_pid_file_if_owned(&path, 9999).expect("foreign-pid removal is a no-op");
-        assert!(path.exists(), "foreign pid removed the successor's pid file");
+        assert!(
+            path.exists(),
+            "foreign pid removed the successor's pid file"
+        );
 
         // The recorded owner may remove it.
         remove_pid_file_if_owned(&path, 4242).expect("owner removal");

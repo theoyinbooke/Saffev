@@ -2284,8 +2284,8 @@ mod tests {
         assert!(holder_is_saffev(Some("/Users/you/.cargo/bin/saffev")));
         assert!(holder_is_saffev(Some("saffev.exe"))); // Windows tasklist name
         assert!(holder_is_saffev(Some("  saffev  "))); // ps padding
-        // Foreign processes (and the unknown case) never match — we must not
-        // terminate something we can't attribute to ourselves.
+                                                       // Foreign processes (and the unknown case) never match — we must not
+                                                       // terminate something we can't attribute to ourselves.
         assert!(!holder_is_saffev(Some("ollama")));
         assert!(!holder_is_saffev(Some("/usr/local/bin/node")));
         assert!(!holder_is_saffev(Some("saffev-helper")));

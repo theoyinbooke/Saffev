@@ -14,6 +14,7 @@
 pub mod guard;
 pub mod judge;
 pub mod pii;
+pub mod stream_mask;
 
 use serde::{Deserialize, Serialize};
 

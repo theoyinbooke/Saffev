@@ -37,7 +37,10 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
-            eprintln!("{}: failed to start async runtime: {err}", saffev::brand::APP_CMD);
+            eprintln!(
+                "{}: failed to start async runtime: {err}",
+                saffev::brand::APP_CMD
+            );
             return ExitCode::FAILURE;
         }
     };
