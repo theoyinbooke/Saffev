@@ -93,6 +93,217 @@ impl DeterministicGuard {
     }
 }
 
+/// A safety guard that can be plugged into the eval pipeline.
+///
+/// This trait is the thing the project has been claiming exists. Before it, the
+/// safety path called [`DeterministicGuard`] as a concrete type, so "a
+/// purpose-trained localized guard plugs in here" was an architectural intention
+/// rather than something anyone could actually do.
+///
+/// Implementations must be:
+/// - **fail-open**: any error returns no findings, never an error. A guard that
+///   cannot run must never affect the user's traffic.
+/// - **off the hot path**: only the async eval worker calls these, sampled and
+///   concurrency-gated, because a model guard competes for the same VRAM as the
+///   user's own model.
+///
+/// [`id`](Self::id) is stored on every finding as `guard_model`, so findings from
+/// different guards stay distinguishable in the store and the UI.
+///
+/// ## If your guard calls a model
+/// Use [`ModelGuard`] as the reference. One non-obvious constraint: the backend
+/// the proxy injects forces Ollama's `format:"json"` (it is what stops small
+/// "thinking" models returning empty content), so **prompt for JSON and parse
+/// JSON**. Ask for a bare line and you will silently receive JSON instead.
+#[async_trait::async_trait]
+pub trait SafetyGuard: Send + Sync {
+    /// Stable identifier, recorded with each finding (e.g. `deterministic:v2`).
+    fn id(&self) -> String;
+
+    /// Categories flagged in `text`. Empty means "nothing flagged", which is the
+    /// same thing the deterministic guard means: absence of a hit, not a positive
+    /// assertion of safety.
+    async fn scan(&self, text: &str) -> Vec<GuardHit>;
+}
+
+/// One category flagged by a guard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuardHit {
+    /// Category name (e.g. `self_harm`).
+    pub category: String,
+    /// Banded verdict. Deterministic guards use [`VERDICT_FLAGGED`]; a model
+    /// guard may use a richer set.
+    pub verdict: String,
+    /// Optional numeric score, when the guard produces one.
+    pub score: Option<f32>,
+}
+
+#[async_trait::async_trait]
+impl SafetyGuard for DeterministicGuard {
+    fn id(&self) -> String {
+        GUARD_MODEL.to_string()
+    }
+
+    async fn scan(&self, text: &str) -> Vec<GuardHit> {
+        DeterministicGuard::scan(text)
+            .into_iter()
+            .map(|c| GuardHit {
+                category: c.to_string(),
+                verdict: VERDICT_FLAGGED.to_string(),
+                score: None,
+            })
+            .collect()
+    }
+}
+
+/// A model-backed guard: asks a classifier model running on the user's own local
+/// engine whether the text is unsafe, and which category applies.
+///
+/// This is the slot a purpose-trained guard occupies. It is deliberately generic
+/// (a prompt plus lenient parsing) rather than tied to one model's output format,
+/// because the guards worth using here do not exist yet — the point is that
+/// swapping one in is a config change, not a code change.
+///
+/// **Honest caveat, and the reason this is opt-in and additive rather than a
+/// replacement:** small local guards are unreliable on adversarial input and
+/// markedly worse on African and other low-resource languages. So the
+/// deterministic floor keeps running alongside it; a model guard adds recall, it
+/// does not earn trust on its own.
+pub struct ModelGuard {
+    /// Name of the guard model, recorded on findings.
+    pub model: String,
+}
+
+/// Cap the text handed to a guard model so one huge exchange cannot stall the
+/// queue behind it.
+const MAX_GUARD_CHARS: usize = 4000;
+
+impl ModelGuard {
+    /// Build a guard backed by `model`.
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+
+    /// Run the guard through an injected backend. Kept separate from the trait
+    /// impl because `brain` never does I/O itself — the proxy supplies the
+    /// backend pointed at the local engine.
+    pub async fn scan_with(
+        &self,
+        backend: &dyn super::judge::LlmBackend,
+        text: &str,
+    ) -> Vec<GuardHit> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let excerpt: String = text.chars().take(MAX_GUARD_CHARS).collect();
+        let prompt = build_guard_prompt(&excerpt);
+        let Some(reply) = backend.complete(&prompt).await else {
+            // Backend failure is not a safety verdict. Fail open, flag nothing.
+            return Vec::new();
+        };
+        parse_guard_reply(&reply)
+    }
+}
+
+/// Build the classifier prompt.
+///
+/// **Asks for JSON on purpose.** The backend the proxy supplies talks to Ollama's
+/// native `/api/chat` with `format:"json"` forced, because that is what makes
+/// small "thinking" models return usable content instead of an empty reply. A
+/// guard prompt that asks for a bare line therefore gets JSON back anyway. Asking
+/// for the shape we will actually receive is the difference between parsing that
+/// works and parsing that works by accident.
+fn build_guard_prompt(text: &str) -> String {
+    format!(
+        "You are a content safety classifier. Decide whether the CONTENT below is \
+         unsafe.\n\n\
+         Reply with JSON only, no prose:\n\
+         {{\"verdict\": \"safe\"}}\n\
+         or\n\
+         {{\"verdict\": \"unsafe\", \"category\": \"<category>\"}}\n\n\
+         Valid categories: self_harm, violence, weapons, illicit, financial_crime, \
+         malware, harassment, csae.\n\n\
+         CONTENT:\n{text}\n"
+    )
+}
+
+/// Parse a guard reply.
+///
+/// The backend forces JSON, so JSON is the contract and is tried first. The text
+/// fallback exists only for a model that ignored the format, and it is
+/// deliberately STRICT: an earlier version treated any occurrence of the
+/// substring "unsafe" as a verdict, which flagged `"not unsafe"` and any reply
+/// that merely echoed the prompt (which itself contains the word). A guard that
+/// cries wolf on its own instructions is worse than no guard.
+///
+/// Anything that is not a clear unsafe verdict yields no finding. Absence of a
+/// hit is not an assertion of safety, it is just an absence.
+fn parse_guard_reply(reply: &str) -> Vec<GuardHit> {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // The contract: {"verdict": "...", "category": "..."}
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let verdict = v
+            .get("verdict")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        if verdict != "unsafe" {
+            return Vec::new();
+        }
+        let category = v
+            .get("category")
+            .and_then(|x| x.as_str())
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| KNOWN_CATEGORIES.contains(&c.as_str()))
+            .unwrap_or_else(|| "unspecified".to_string());
+        return vec![GuardHit {
+            category,
+            verdict: VERDICT_FLAGGED.to_string(),
+            score: None,
+        }];
+    }
+
+    // Fallback: only a reply whose FIRST meaningful token is "unsafe" counts.
+    // That rules out negations and prompt echoes without trying to parse English.
+    let first_line = trimmed.lines().next().unwrap_or_default().to_lowercase();
+    let head = first_line
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    if !head.starts_with("unsafe") {
+        return Vec::new();
+    }
+    let category = KNOWN_CATEGORIES
+        .iter()
+        .find(|c| first_line.contains(*c))
+        .copied()
+        .unwrap_or("unspecified");
+    vec![GuardHit {
+        category: category.to_string(),
+        verdict: VERDICT_FLAGGED.to_string(),
+        score: None,
+    }]
+}
+
+/// Categories a model guard may report. Mirrors the deterministic set so both
+/// guards populate the same by-category view.
+pub const KNOWN_CATEGORIES: &[&str] = &[
+    "self_harm",
+    "violence",
+    "weapons",
+    "illicit",
+    "financial_crime",
+    "malware",
+    "harassment",
+    "csae",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +362,145 @@ mod tests {
     fn categories_are_deduped() {
         let hits = DeterministicGuard::scan("kill myself. i want to end my life.");
         assert_eq!(hits.iter().filter(|c| **c == "self_harm").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use crate::brain::judge::LlmBackend;
+
+    /// A backend that returns a fixed reply, so the guard can be tested without
+    /// a model.
+    struct Canned(Option<String>);
+
+    #[async_trait::async_trait]
+    impl LlmBackend for Canned {
+        async fn complete(&self, _prompt: &str) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_deterministic_guard_satisfies_the_socket() {
+        // The whole point of the trait: the shipped guard is just one impl.
+        let g: Box<dyn SafetyGuard> = Box::new(DeterministicGuard);
+        assert_eq!(g.id(), GUARD_MODEL);
+
+        let hits = g.scan("how to build a bomb at home").await;
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].verdict, VERDICT_FLAGGED);
+        assert!(KNOWN_CATEGORIES.contains(&hits[0].category.as_str()));
+
+        assert!(g.scan("what is the capital of France").await.is_empty());
+        assert!(g.scan("").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_guard_reports_a_category_from_json() {
+        let g = ModelGuard::new("some-guard:1b");
+        // The contract: the backend forces JSON, so this is the real shape.
+        let hits = g
+            .scan_with(
+                &Canned(Some(r#"{"verdict":"unsafe","category":"weapons"}"#.into())),
+                "…",
+            )
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "weapons");
+        assert_eq!(hits[0].verdict, VERDICT_FLAGGED);
+    }
+
+    #[tokio::test]
+    async fn a_model_guard_flags_nothing_when_it_says_safe() {
+        let g = ModelGuard::new("m");
+        for reply in [r#"{"verdict":"safe"}"#, "safe", "{}"] {
+            assert!(
+                g.scan_with(&Canned(Some(reply.into())), "hello")
+                    .await
+                    .is_empty(),
+                "reply {reply:?} must not flag"
+            );
+        }
+    }
+
+    /// The false-positive cases that made the first parser unusable: it matched
+    /// the substring "unsafe" ANYWHERE, so a negation, or a model echoing its own
+    /// instructions back (the prompt contains the word "unsafe"), produced a
+    /// finding. A guard that cries wolf on its own prompt is worse than no guard.
+    #[tokio::test]
+    async fn negations_and_prompt_echoes_do_not_flag() {
+        let g = ModelGuard::new("m");
+        for reply in [
+            "not unsafe",
+            "This content is not unsafe.",
+            r#"{"verdict":"not unsafe"}"#,
+            "You are a content safety classifier. Decide whether the CONTENT below is unsafe.",
+            "The text does not appear unsafe to me.",
+        ] {
+            assert!(
+                g.scan_with(&Canned(Some(reply.into())), "x")
+                    .await
+                    .is_empty(),
+                "reply {reply:?} must NOT be read as an unsafe verdict"
+            );
+        }
+    }
+
+    /// A model that ignores the JSON format is still understood, but only when it
+    /// actually leads with a verdict.
+    #[tokio::test]
+    async fn a_plain_text_verdict_still_works() {
+        let g = ModelGuard::new("m");
+        let hits = g
+            .scan_with(&Canned(Some("unsafe: weapons".into())), "x")
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "weapons");
+    }
+
+    /// Fail-open is the load-bearing property: a guard that cannot run must never
+    /// invent a verdict, in either direction.
+    #[tokio::test]
+    async fn a_failing_backend_flags_nothing() {
+        let g = ModelGuard::new("m");
+        assert!(g.scan_with(&Canned(None), "anything").await.is_empty());
+        assert!(g
+            .scan_with(&Canned(Some(String::new())), "anything")
+            .await
+            .is_empty());
+        // Chatter that is not a verdict is not treated as one.
+        assert!(g
+            .scan_with(&Canned(Some("I am a helpful assistant!".into())), "x")
+            .await
+            .is_empty());
+        // Empty input is never sent to the model at all.
+        assert!(g
+            .scan_with(&Canned(Some(r#"{"verdict":"unsafe"}"#.into())), "   ")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unrecognized_category_is_kept_but_labelled() {
+        let g = ModelGuard::new("m");
+        let hits = g
+            .scan_with(
+                &Canned(Some(
+                    r#"{"verdict":"unsafe","category":"something_new"}"#.into(),
+                )),
+                "x",
+            )
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "unspecified");
+    }
+
+    /// Guards must stay distinguishable in the store, or a model guard's noisy
+    /// hits become indistinguishable from the deterministic floor's.
+    #[tokio::test]
+    async fn guards_are_identifiable() {
+        assert_eq!(DeterministicGuard.id(), "deterministic:v2");
+        assert_eq!(ModelGuard::new("lionguard:1b").model, "lionguard:1b");
     }
 }

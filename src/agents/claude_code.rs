@@ -236,9 +236,15 @@ impl AgentReader for ClaudeCodeReader {
         files
             .into_iter()
             .take(400)
-            .filter_map(|(_, p)| self.parse(&p, false))
-            .map(|d| d.session)
-            .filter(|s| s.message_count > 0)
+            // Unchanged transcripts are answered from the per-file cache rather
+            // than re-read (see `agents::cached_file_parse`).
+            .filter_map(|(_, p)| {
+                super::cached_file_parse(&p, |p| {
+                    self.parse(p, false)
+                        .map(|d| d.session)
+                        .filter(|s| s.message_count > 0)
+                })
+            })
             .collect()
     }
     fn retention(&self) -> super::retention::RetentionPolicy {

@@ -174,10 +174,20 @@ impl CodexReader {
                             if let Some(info) = p.get("info").filter(|i| !i.is_null()) {
                                 if let Some(t) = info.get("total_token_usage") {
                                     // Running totals — last non-null wins (overwrite).
-                                    inp = t
+                                    //
+                                    // Codex follows the OpenAI convention where
+                                    // `input_tokens` is the TOTAL prompt and
+                                    // `cached_input_tokens` is a subset of it.
+                                    // `AgentSession::input_tokens` means
+                                    // non-cached input, so subtract. Without this
+                                    // the cached portion is counted twice — once
+                                    // at full price and again as cache — which
+                                    // overstated a real history's estimated cost
+                                    // by more than 10x.
+                                    let total_in = t
                                         .get("input_tokens")
                                         .and_then(Value::as_u64)
-                                        .unwrap_or(inp);
+                                        .unwrap_or(inp + cache);
                                     outp = t
                                         .get("output_tokens")
                                         .and_then(Value::as_u64)
@@ -186,6 +196,7 @@ impl CodexReader {
                                         .get("cached_input_tokens")
                                         .and_then(Value::as_u64)
                                         .unwrap_or(cache);
+                                    inp = total_in.saturating_sub(cache);
                                 }
                             }
                         }
@@ -335,9 +346,16 @@ impl AgentReader for CodexReader {
         self.rollouts()
             .into_iter()
             .take(MAX_LIST)
-            .filter_map(|p| self.parse(&p, &titles, false))
-            .map(|d| d.session)
-            .filter(|s| s.message_count > 0)
+            // A finished rollout never changes, so unchanged files are answered
+            // from the per-file cache instead of being re-read. Without this,
+            // listing re-parsed every rollout on every page load.
+            .filter_map(|p| {
+                super::cached_file_parse(&p, |p| {
+                    self.parse(p, &titles, false)
+                        .map(|d| d.session)
+                        .filter(|s| s.message_count > 0)
+                })
+            })
             .collect()
     }
     fn retention(&self) -> super::retention::RetentionPolicy {

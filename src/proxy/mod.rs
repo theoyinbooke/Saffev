@@ -107,6 +107,12 @@ pub enum MaskAction {
     WouldMask,
     /// Masking live: the request body was redacted before forwarding.
     Masked,
+    /// Policy dry-run: a blocking kind was present; the request was forwarded
+    /// anyway because masking is still in dry-run.
+    WouldBlock,
+    /// Policy live: a blocking kind was present, so the request was **stopped**
+    /// and never reached the engine.
+    Blocked,
 }
 
 impl MaskAction {
@@ -118,6 +124,8 @@ impl MaskAction {
             MaskAction::Observed => PiiAction::Observed,
             MaskAction::WouldMask => PiiAction::WouldMask,
             MaskAction::Masked => PiiAction::Masked,
+            MaskAction::WouldBlock => PiiAction::WouldBlock,
+            MaskAction::Blocked => PiiAction::Blocked,
         }
     }
 }
@@ -363,6 +371,39 @@ async fn run_eval_worker(
         if cfg.eval.safety {
             run_safety_guard(&store, &events, &rec);
         }
+        // Model-backed safety guard: the plug-in slot for a purpose-trained
+        // (e.g. localized) guard. Additive to the deterministic floor above, and
+        // gated exactly like the judge — same non-blocking slot reservation, so
+        // under load an extra guard call is DROPPED rather than queued and the
+        // user's engine is never thrashed.
+        if cfg.eval.safety {
+            if let Some(model) = cfg
+                .eval
+                .guard_model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+            {
+                if let Some(permit) = reserve_judge_slot(&judge_sem, &metrics) {
+                    let backend = EngineBackend {
+                        base: upstream.clone(),
+                        model: model.clone(),
+                        timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
+                    };
+                    let store = store.clone();
+                    let events = events.clone();
+                    let rec = rec.clone();
+                    let metrics = metrics.clone();
+                    metrics.inflight.fetch_add(1, Relaxed);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        run_model_guard(&store, &events, &backend, &model, &rec).await;
+                        metrics.inflight.fetch_sub(1, Relaxed);
+                        metrics.completed.fetch_add(1, Relaxed);
+                    });
+                }
+            }
+        }
+
         // Quality judge: model-backed, opt-in, sampled, concurrency-gated. We
         // reserve a slot in the LOOP (non-blocking): if all slots are busy the
         // judge is dropped for this record — shedding load rather than queueing
@@ -535,6 +576,53 @@ impl EngineBackend {
 
 /// Run the deterministic safety guard over a record's text; persist + publish any
 /// flags. Fail-open: nothing here can disturb the request path.
+/// Run a model-backed safety guard and persist whatever it flags.
+///
+/// Findings are tagged with the guard's own model name, so a model guard's hits
+/// stay distinguishable from the deterministic floor's everywhere they surface.
+/// Fail-open throughout: a backend error simply produces no findings.
+async fn run_model_guard(
+    store: &Store,
+    events: &tokio::sync::broadcast::Sender<dto::StreamEvent>,
+    backend: &dyn crate::brain::judge::LlmBackend,
+    model: &str,
+    rec: &crate::brain::JudgeRecord,
+) {
+    let mut text = String::new();
+    if let Some(p) = &rec.prompt {
+        text.push_str(p);
+        text.push('\n');
+    }
+    if let Some(r) = &rec.response {
+        text.push_str(r);
+    }
+    let guard = crate::brain::guard::ModelGuard::new(model);
+    let hits = guard.scan_with(backend, &text).await;
+    if hits.is_empty() {
+        return;
+    }
+    let ts = now_millis();
+    let records: Vec<crate::store::SafetyFindingRecord> = hits
+        .iter()
+        .map(|h| crate::store::SafetyFindingRecord {
+            record_id: rec.record_id.clone(),
+            guard_model: model.to_string(),
+            category: h.category.clone(),
+            verdict: h.verdict.clone(),
+            score: h.score,
+            ts,
+        })
+        .collect();
+    for r in &records {
+        let _ = events.send(dto::StreamEvent::Safety {
+            id: r.record_id.clone(),
+            category: r.category.clone(),
+            verdict: r.verdict.clone(),
+        });
+    }
+    store.enqueue(WriteOp::SafetyFindings(records));
+}
+
 fn run_safety_guard(
     store: &Store,
     events: &tokio::sync::broadcast::Sender<dto::StreamEvent>,

@@ -1583,6 +1583,18 @@
     teardown() {},
   };
 
+  /* Sub-label for the Tokens KPI. Per-row views mark an estimated count with a
+     tilde, but this total blends engine-reported counts with ones we estimated,
+     and this is the number people quote. Say so when any of it is estimated. */
+  function tokenProvenance(d) {
+    const total = (d.totalInputTokens || 0) + (d.totalOutputTokens || 0);
+    const est = (d.estimatedInputTokens || 0) + (d.estimatedOutputTokens || 0);
+    const base = fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out';
+    if (!est || !total) return base;
+    if (est >= total) return base + ' · all estimated';
+    return base + ' · ' + Math.round((est / total) * 100) + '% estimated';
+  }
+
   function breakdownCard(title, list) {
     const card = el('div', { class: 'card reveal' }, [
       el('div', { class: 'hrow' }, [el('h3', { text: title })]),
@@ -1854,17 +1866,35 @@
       privCard.appendChild(setRow('Retention', 'How long exchanges are kept before pruning. Currently: ' + retVal + '.', el('div', { class: 'ctl' }, [retSel])));
       panel.appendChild(privCard);
 
+      /* A shared team policy outranks this page. Say so at the top, name the
+         file, and disable the controls it governs — a switch that looks live but
+         silently does nothing is worse than one that says no. */
+      const pol = s.policy || null;
+      const governed = (f) => !!(pol && pol.active && (pol.governs || []).includes(f));
+      if (pol) {
+        const card = el('div', { class: 'card reveal policycard' + (pol.active ? '' : ' bad') });
+        card.appendChild(el('div', { class: 'hrow' }, [el('h3', { text: pol.active ? 'Team policy in force' : 'Team policy NOT applied' })]));
+        if (pol.active) {
+          card.appendChild(el('p', { class: 'about-p', text: (pol.description ? pol.description + ' · ' : '') + 'Settings named by this policy are managed there, not here.' }));
+          card.appendChild(el('p', { class: 'about-p', text: 'Governs: ' + ((pol.governs || []).join(', ') || 'nothing') }));
+        } else {
+          card.appendChild(el('p', { class: 'about-p', text: 'You are NOT protected by this policy. ' + (pol.error || '') }));
+        }
+        card.appendChild(el('code', { class: 'digest', text: pol.path }));
+        panel.appendChild(card);
+      }
+
       // PII masking (opt-in redaction, dry-run by default)
       const maskCard = el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'PII masking' })])]);
-      const mEnable = switchBtn(s.maskingEnabled, 'Toggle PII masking');
-      mEnable.addEventListener('click', () => { const next = !mEnable.classList.contains('on'); this.save(view, { maskingEnabled: next }); });
-      const enHint = s.maskingEnabled
+      const mEnable = switchBtn(s.maskingEnabled, 'Toggle PII masking', { disabled: governed('masking.enabled') });
+      mEnable.addEventListener('click', () => { if (governed('masking.enabled')) return; const next = !mEnable.classList.contains('on'); this.save(view, { maskingEnabled: next }); });
+      const enHint = governed('masking.enabled') ? 'Set by your team policy.' : s.maskingEnabled
         ? 'On · high-confidence PII detectors feed the masking pipeline.'
         : 'Off · observe-only (default). Traffic is never altered.';
       maskCard.appendChild(setRow('Enable masking', enHint, el('div', { class: 'ctl' }, [mEnable])));
-      const mDry = switchBtn(s.maskingDryRun, 'Toggle masking dry-run', { disabled: !s.maskingEnabled });
+      const mDry = switchBtn(s.maskingDryRun, 'Toggle masking dry-run', { disabled: !s.maskingEnabled || governed('masking.dry_run') });
       mDry.addEventListener('click', async () => {
-        if (!s.maskingEnabled) return;
+        if (!s.maskingEnabled || governed('masking.dry_run')) return;
         const next = !mDry.classList.contains('on');
         if (!next) {
           const ok = await confirmModal({
@@ -1876,7 +1906,9 @@
         }
         this.save(view, { maskingDryRun: next });
       });
-      const dryHint = !s.maskingEnabled
+      const dryHint = governed('masking.dry_run')
+        ? 'Set by your team policy.'
+        : !s.maskingEnabled
         ? 'Enable masking first to choose dry-run vs live.'
         : (s.maskingDryRun
           ? 'On (default) · records what WOULD be masked; traffic is unchanged.'
@@ -1884,6 +1916,55 @@
       const dryRow = setRow('Dry-run', dryHint, el('div', { class: 'ctl' }, [mDry]));
       if (s.maskingEnabled && !s.maskingDryRun) dryRow.querySelector('.hint').classList.add('danger-note');
       maskCard.appendChild(dryRow);
+
+      /* Blocking: for the things that must not reach a model at all, where
+         "we replaced it for you" is the wrong answer. Nothing is blocked unless
+         the user picks a kind here AND dry-run is off. */
+      const BLOCKABLE = [
+        { k: 'api_key', l: 'API keys' },
+        { k: 'credit_card', l: 'Cards' },
+        { k: 'email', l: 'Emails' },
+        { k: 'phone', l: 'Phones' },
+        { k: 'ip_address', l: 'IP addresses' },
+      ];
+      const current = new Set(s.maskingBlockKinds || []);
+      const chips = el('div', { class: 'chiprow' });
+      BLOCKABLE.forEach((b) => {
+        const on = current.has(b.k);
+        const chip = el('button', {
+          class: 'chip' + (on ? ' on' : ''), type: 'button',
+          'aria-pressed': on ? 'true' : 'false', text: b.l,
+          disabled: !s.maskingEnabled || governed('masking.block_kinds'),
+        });
+        chip.addEventListener('click', async () => {
+          if (!s.maskingEnabled || governed('masking.block_kinds')) return;
+          const next = new Set(current);
+          if (on) next.delete(b.k);
+          else {
+            const ok = await confirmModal({
+              title: 'Block ' + b.l.toLowerCase() + '?',
+              body: 'Requests containing ' + b.l.toLowerCase() + ' will be STOPPED and never sent to the model. The calling app gets a clear error explaining why.\n\nThis only takes effect while dry-run is off. Nothing else changes: internal errors still forward normally, so Saffev can never break your traffic by accident.',
+              confirmLabel: 'Block them', danger: true,
+            });
+            if (!ok) return;
+            next.add(b.k);
+          }
+          this.save(view, { maskingBlockKinds: Array.from(next) });
+        });
+        chips.appendChild(chip);
+      });
+      const blockHint = governed('masking.block_kinds')
+        ? 'Set by your team policy.'
+        : !s.maskingEnabled
+        ? 'Enable masking first.'
+        : (current.size === 0
+          ? 'Nothing is blocked (default). Masking quietly redacts instead. Pick a kind here only if it must never reach a model at all.'
+          : (s.maskingDryRun
+            ? 'Selected, but dry-run is on, so these are only recorded as "would block". Turn off dry-run to actually stop them.'
+            : 'LIVE · requests containing these are stopped and never reach the model.'));
+      const blockRow = setRow('Block outright', blockHint, chips);
+      if (s.maskingEnabled && !s.maskingDryRun && current.size) blockRow.querySelector('.hint').classList.add('danger-note');
+      maskCard.appendChild(blockRow);
       panel.appendChild(maskCard);
 
       // Evaluation (eval pipeline: safety guard + judge). Async, off hot path.
@@ -1928,8 +2009,8 @@
       const aiHint = !s.analysisAvailable
         ? 'Codex not detected on this machine. Install the Codex CLI and sign in to enable AI summaries.'
         : (s.analysisEnabled
-          ? 'On · the Summarize button in a session uses your Codex + ChatGPT subscription. Session text is sent to OpenAI (via your own Codex) only when you click Summarize.'
-          : 'Off · nothing leaves the device. Turn on to summarize coding sessions with your Codex subscription.');
+          ? 'On · this is the ONLY feature in Saffev that sends your content off this device. When you click Summarize on a session, its full text is uploaded to OpenAI through your own Codex sign-in. Never automatic, never in the background, and never without that click.'
+          : 'Off · nothing leaves the device. Turning this on permits session text to be sent to OpenAI through your own Codex, but only on an explicit click.');
       aiCard.appendChild(setRow('Enable AI analysis', aiHint, el('div', { class: 'ctl' }, [aiEnable])));
       panel.appendChild(aiCard);
 
@@ -1944,6 +2025,15 @@
       const arAuto = switchBtn(s.archiveAuto, 'Toggle automatic snapshots', { disabled: !s.archiveEnabled });
       arAuto.addEventListener('click', () => { if (!s.archiveEnabled) return; this.save(view, { archiveAuto: !arAuto.classList.contains('on') }); });
       arCard.appendChild(setRow('Automatic snapshots', !s.archiveEnabled ? 'Enable preservation first.' : 'Snapshot on start and periodically, so the archive stays current without a manual click.', el('div', { class: 'ctl' }, [arAuto])));
+      // Redaction is lossy, so the copy says so plainly rather than selling it.
+      const arRedact = switchBtn(s.archiveRedact, 'Toggle archive redaction', { disabled: !s.archiveEnabled });
+      arRedact.addEventListener('click', () => { if (!s.archiveEnabled) return; this.save(view, { archiveRedact: !arRedact.classList.contains('on') }); });
+      arCard.appendChild(setRow('Redact secrets in the archive',
+        !s.archiveEnabled ? 'Enable preservation first.'
+          : s.archiveRedact
+            ? 'On · detected secrets are replaced with a placeholder before being stored. Safer, but lossy: the original text is not kept anywhere, and your archive may be the last copy. Existing sessions are re-archived redacted on the next snapshot.'
+            : 'Off · transcripts are preserved exactly as they were, secrets included. Turn on to keep a safe copy rather than a complete one.',
+        el('div', { class: 'ctl' }, [arRedact])));
       panel.appendChild(arCard);
     },
 
@@ -2365,7 +2455,7 @@
       // no orphan card. mono label · big tabular number · delta · sparkline.
       const kpis = statStrip(5, [
         statCell('Requests', fmtNum(d.totalRequests), deltaNode(d.totalRequests, d.prevTotalRequests, true), C.sparkline(d.series.map((b) => b.requests))),
-        statCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), fmtNum(d.totalInputTokens) + ' in · ' + fmtNum(d.totalOutputTokens) + ' out', C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
+        statCell('Tokens', fmtNum(d.totalInputTokens + d.totalOutputTokens), tokenProvenance(d), C.sparkline(d.series.map((b) => b.inputTokens + b.outputTokens), { color: 'var(--gold)' })),
         statCell('Latency p50', d.p50LatencyMs != null ? d.p50LatencyMs + '<small>ms</small>' : '·', deltaNode(d.p50LatencyMs, d.prevP50LatencyMs, false), C.sparkline(d.series.map((b) => b.p50LatencyMs || 0))),
         statCell('PII findings', fmtNum(d.piiFindings), deltaNode(d.piiFindings, d.prevPiiFindings, false), C.sparkline(d.series.map((b) => b.pii), { color: 'var(--danger)' })),
         statCell('Failed', fmtNum(d.failedRequests || 0), deltaNode(d.failedRequests, d.prevFailedRequests, false), C.sparkline(d.series.map((b) => b.failed || 0), { color: 'var(--danger)' })),
@@ -2684,6 +2774,27 @@
     { label: 'Cost', w: '.6fr', r: true },
     { label: 'Updated', w: '.8fr', r: true },
   ];
+  /* Render one search excerpt. The store wraps matched terms in ‹ › rather than
+     markup, so the transcript stays plain text all the way here and we build the
+     highlight as DOM nodes. Never use innerHTML on this: it is verbatim content
+     from the user's own transcripts. */
+  function snippetLine(snip) {
+    const line = el('span', { class: 'snip' });
+    let rest = String(snip);
+    let guard = 0;
+    while (rest.length && guard++ < 64) {
+      const open = rest.indexOf('‹');
+      if (open < 0) break;
+      const close = rest.indexOf('›', open + 1);
+      if (close < 0) break;
+      if (open > 0) line.appendChild(document.createTextNode(rest.slice(0, open)));
+      line.appendChild(el('mark', { text: rest.slice(open + 1, close) }));
+      rest = rest.slice(close + 1);
+    }
+    if (rest.length) line.appendChild(document.createTextNode(rest));
+    return line;
+  }
+
   function agentGtc() { return AGENT_COLS.map((c) => c.w).join(' '); }
   function agentHead() {
     const head = el('div', { class: 'thead' });
@@ -2695,6 +2806,15 @@
     title: 'Agents',
     sub: 'Own your AI history. Read on-device, see what each tool is about to delete, and keep a durable copy that is yours.',
     q: '', tool: '',
+    tab: 'sessions',
+    rangeMs: 0,
+    TABS: [{ k: 'sessions', l: 'Sessions' }, { k: 'privacy', l: 'Privacy' }, { k: 'usage', l: 'Usage' }],
+    RANGES: [
+      { value: 0, label: 'All time' },
+      { value: 7 * 86400000, label: 'Last 7 days' },
+      { value: 30 * 86400000, label: 'Last 30 days' },
+      { value: 90 * 86400000, label: 'Last 90 days' },
+    ],
     _tools: [],
 
     async render(view) {
@@ -2732,25 +2852,181 @@
       }
       view.appendChild(this.toolTable(present));
 
+      // Sessions / Privacy / Usage share this page: they are three questions
+      // about the same history, not three different places.
+      this._present = present;
+      const tabs = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Agents sections' });
+      this.TABS.forEach((t) => {
+        const b = el('button', { class: 'tab' + (this.tab === t.k ? ' active' : ''), type: 'button', role: 'tab', 'data-k': t.k, text: t.l });
+        b.addEventListener('click', () => { if (this.tab !== t.k) { this.tab = t.k; this.renderTab(); } });
+        tabs.appendChild(b);
+      });
+      view.appendChild(el('div', { class: 'an-head reveal' }, [tabs]));
+      view.appendChild(el('div', { class: 'an-panel', id: 'agentPanel' }));
+      await this.renderTab();
+    },
+
+    async renderTab() {
+      $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
+      const panel = $('#agentPanel');
+      if (!panel) return;
+      panel.innerHTML = '';
+      if (this.tab === 'privacy') return this.privacyTab(panel);
+      if (this.tab === 'usage') return this.usageTab(panel);
+      return this.sessionsTab(panel);
+    },
+
+    async sessionsTab(panel) {
       // Filter bar: search + source (tool) facet.
       const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
-      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search title, project, or model…' });
+      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search inside conversations, titles, projects…', value: this.q });
       let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reloadSessions(); }, 250); });
-      const scopes = [{ value: '', label: 'All sources' }].concat(present.map((t) => ({ value: t.tool, label: t.label })));
+      const scopes = [{ value: '', label: 'All sources' }].concat((this._present || []).map((t) => ({ value: t.tool, label: t.label })));
       const seg = dropdown(scopes, this.tool, (v) => { if (this.tool === v) return; this.tool = v; this.reloadSessions(); }, { ariaLabel: 'Filter by source' });
-      view.appendChild(el('div', { class: 'filterbar reveal' }, [
+      panel.appendChild(el('div', { class: 'filterbar reveal' }, [
         el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]),
         seg,
       ]));
+      // Say plainly how far search reaches. Searching what was SAID needs a
+      // preserved copy; titles and projects are always searchable.
+      panel.appendChild(el('div', { class: 'searchnote reveal', text: this._archive.enabled && this._archive.count
+        ? 'Searching inside ' + fmtNum(this._archive.count) + ' preserved conversations · titles and projects across all sources.'
+        : 'Searching titles and projects only. Turn on Preservation to search what was actually said.' }));
 
       // Session list.
-      view.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
+      panel.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
         el('div', { class: 'ttable', style: '--gtc:' + agentGtc() }, [
           agentHead(),
           el('div', { class: 'list', id: 'agentList' }),
         ]),
       ]));
       await this.reloadSessions();
+    },
+
+    /* The screenshot screen: what have I been pasting into AI tools?
+       Deliberately leads with the kinds worth trusting (API keys, cards, emails)
+       and shows the pattern-only kinds separately, clearly marked. Inflating the
+       headline with thousands of maybe-IP-addresses would train people to ignore
+       the whole report. */
+    async privacyTab(panel) {
+      panel.appendChild(loadingState('Scanning preserved conversations…'));
+      let d;
+      try { d = await api('/agents/privacy?rangeMs=' + this.rangeMs); hideBanner(); }
+      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not build the privacy report', e.message || '')); return; }
+      panel.innerHTML = '';
+
+      if (!d.coverage.archiveEnabled) {
+        panel.appendChild(emptyState(
+          'Preservation is off',
+          'The privacy report reads your preserved copy, so there is nothing to scan yet. Turn on Preservation to see what you have been sharing with AI tools.'
+        ));
+        return;
+      }
+
+      const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.renderTab(); }, { ariaLabel: 'Time range', align: 'right' });
+      panel.appendChild(el('div', { class: 'an-head reveal' }, [
+        el('div', { class: 'spacer' }), el('span', { class: 'an-range-lbl', text: 'Window' }), range,
+      ]));
+
+      panel.appendChild(statStrip(4, [
+        statCell('You shared', fmtNum(d.highSignalUserSide), 'secrets you pasted in'),
+        statCell('Found total', fmtNum(d.highSignalFindings), 'incl. model replies'),
+        statCell('Sessions affected', fmtNum(d.sessionsWithFindings), 'of ' + fmtNum(d.coverage.preserved) + ' preserved'),
+        statCell('Low confidence', fmtNum(d.totalFindings - d.highSignalFindings), 'pattern-only matches'),
+      ]));
+
+      // Honest framing sits directly under the numbers, not in a footnote.
+      panel.appendChild(el('div', { class: 'searchnote reveal', text:
+        'Scanned ' + fmtNum(d.coverage.preserved) + ' of ' + fmtNum(d.coverage.total) + ' sessions on this machine. '
+        + 'Counts and kinds only, never the secret itself.' }));
+
+      if (!d.totalFindings) {
+        panel.appendChild(emptyState('Nothing found', 'No personal data or credentials were detected in your preserved conversations for this window.'));
+        return;
+      }
+
+      // Reuses the shared breakdown card, with one addition: a kind that
+      // over-matches on code is marked inline so the bar length never reads as
+      // "you leaked this many secrets".
+      const kindCard = breakdownCard('What was found', d.byKind);
+      d.byKind.slice(0, 8).forEach((k, i) => {
+        if (!k.noisy) return;
+        const nm = kindCard.querySelectorAll('.bk .nm')[i];
+        if (nm) nm.appendChild(el('span', { class: 'hitbadge', style: 'margin-left:8px', title: 'Pattern-only match. Version numbers, ports and ids in source code often look like these.', text: 'low conf' }));
+      });
+      panel.appendChild(el('section', { class: 'body', style: 'margin-top:0' }, [
+        kindCard,
+        breakdownCard('Which tool', d.byTool),
+      ]));
+      panel.appendChild(el('div', { style: 'margin-top:16px' }, [breakdownCard('Which project', d.byProject)]));
+
+      // Drill-down: the sessions to actually go and look at.
+      const COLS = [
+        { label: 'Source', w: 'minmax(120px,1fr)' },
+        { label: 'Session', w: 'minmax(220px,2.4fr)' },
+        { label: 'Kinds', w: 'minmax(180px,1.6fr)' },
+        { label: 'You shared', w: 'minmax(90px,.8fr)', r: true },
+        { label: 'Total', w: 'minmax(70px,.6fr)', r: true },
+      ];
+      const head = el('div', { class: 'thead' }, COLS.map((c) => el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label })));
+      const list = el('div', { class: 'list' });
+      d.topSessions.forEach((s) => {
+        const row = el('div', { class: 'trow', tabindex: '0' }, [
+          el('div', { class: 'tcell' }, [toolBadge(s.tool, s.label)]),
+          el('div', { class: 'tcell' }, [el('span', { class: 'nm', title: s.project || '', text: s.title || 'Untitled session' })]),
+          el('div', { class: 'tcell' }, [el('span', { class: 'cell-model', text: s.kinds.join(' · ') || '·' })]),
+          el('div', { class: 'tcell r num', text: fmtNum(s.userSide) }),
+          el('div', { class: 'tcell r num', text: fmtNum(s.findings) }),
+        ]);
+        row.addEventListener('click', () => this.openDetail(s.sessionId));
+        row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.openDetail(s.sessionId); } });
+        list.appendChild(row);
+      });
+      panel.appendChild(el('div', { class: 'card reveal', style: 'padding:0;overflow:hidden' }, [
+        el('div', { class: 'ttable', style: '--gtc:' + COLS.map((c) => c.w).join(' ') }, [head, list]),
+      ]));
+    },
+
+    /* Usage across coding agents. The data behind this was already computed and
+       served by the API; it simply had no screen until now. */
+    async usageTab(panel) {
+      panel.appendChild(loadingState('Adding up usage…'));
+      let d;
+      try { d = await api('/agents/analytics'); hideBanner(); }
+      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load usage', e.message || '')); return; }
+      panel.innerHTML = '';
+
+      panel.appendChild(statStrip(4, [
+        statCell('Sessions', fmtNum(d.totalSessions), 'across all tools'),
+        statCell('Tokens', fmtNum(d.totalTokens), 'in + out'),
+        statCell('Tool calls', fmtNum(d.totalToolCalls), 'actions taken'),
+        statCell('Est. cost', '$' + (d.totalCostUsd || 0).toFixed(2), 'at list prices'),
+      ]));
+      panel.appendChild(el('div', { class: 'searchnote reveal', text:
+        'Cost is an estimate from public list prices for the model each session reported. Locally-run models cost nothing and are counted as $0.' }));
+
+      const table = (title, rows, nameOf) => {
+        const COLS = [
+          { label: title, w: 'minmax(180px,2fr)' },
+          { label: 'Sessions', w: 'minmax(80px,.7fr)', r: true },
+          { label: 'Tokens', w: 'minmax(100px,1fr)', r: true },
+          { label: 'Est. cost', w: 'minmax(90px,.8fr)', r: true },
+        ];
+        const head = el('div', { class: 'thead' }, COLS.map((c) => el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label })));
+        const list = el('div', { class: 'list' });
+        rows.forEach((r) => list.appendChild(el('div', { class: 'trow static' }, [
+          el('div', { class: 'tcell' }, [nameOf(r)]),
+          el('div', { class: 'tcell r num', text: fmtNum(r.sessions) }),
+          el('div', { class: 'tcell r num', text: fmtNum(r.tokens) }),
+          el('div', { class: 'tcell r num', text: r.costUsd > 0 ? '$' + r.costUsd.toFixed(2) : '·' }),
+        ])));
+        return el('div', { class: 'card reveal', style: 'padding:0;overflow:hidden;margin-bottom:16px' }, [
+          el('div', { class: 'ttable', style: '--gtc:' + COLS.map((c) => c.w).join(' ') }, [head, list]),
+        ]);
+      };
+
+      panel.appendChild(table('By tool', d.byTool.filter((t) => t.present), (r) => toolBadge(r.tool, r.label)));
+      panel.appendChild(table('By model', d.byModel.slice(0, 20), (r) => el('span', { class: 'cell-model', text: r.model })));
     },
 
     // Per-tool overview as a compact table (one row per tool) — scales cleanly to
@@ -2823,8 +3099,49 @@
       const exp = el('button', { class: 'btn ghost sm', type: 'button', text: 'Export all' });
       exp.addEventListener('click', () => this.exportAll(exp));
       actions.appendChild(exp);
+      if (arch.enabled) {
+        const aud = el('button', { class: 'btn ghost sm', type: 'button', title: 'Write a folder containing the transcripts, the integrity chain, and how to check it', text: 'Audit bundle' });
+        aud.addEventListener('click', () => this.auditBundle(aud));
+        actions.appendChild(aud);
+      }
       wrap.appendChild(actions);
+      // Integrity line: proof the copy has not been altered since it was kept.
+      if (arch.enabled) {
+        const line = el('div', { class: 'integrity', id: 'integrityLine', text: 'Checking integrity…' });
+        wrap.appendChild(line);
+        this.loadIntegrity();
+      }
       return wrap;
+    },
+
+    async loadIntegrity() {
+      let v;
+      try { v = await api('/archive/verify'); } catch { return; }
+      const line = $('#integrityLine');
+      if (!line) return;
+      line.innerHTML = '';
+      if (!v.entries) {
+        line.appendChild(el('span', { class: 'sm', text: 'Nothing preserved yet, so there is nothing to verify.' }));
+        return;
+      }
+      if (v.intact) {
+        line.className = 'integrity ok';
+        line.appendChild(el('span', { text: '✓ Verified · ' + fmtNum(v.entries) + ' preservation events across ' + fmtNum(v.sessions) + ' sessions, unaltered since they were kept.' }));
+        if (v.headDigest) line.appendChild(el('code', { class: 'digest', title: 'Record this somewhere else to anchor your archive at this point in time', text: v.headDigest.slice(0, 16) }));
+      } else {
+        line.className = 'integrity bad';
+        line.appendChild(el('span', { text: '⚠ Integrity check failed · ' + (v.brokenAt || 'the archive does not match what was recorded.') }));
+      }
+    },
+
+    async auditBundle(btn) {
+      const orig = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Building…';
+      try {
+        const r = await api('/archive/audit', { method: 'POST' });
+        showBanner('Audit bundle written to ' + r.dir + ' · ' + fmtNum(r.sessions) + ' transcripts · integrity ' + (r.intact ? 'verified' : 'FAILED'), r.intact ? '' : 'danger');
+      } catch (e) { handleApiError(e); }
+      btn.disabled = false; btn.textContent = orig;
     },
 
     async exportAll(btn) {
@@ -2906,7 +3223,15 @@
       if (s.sourceDeleted) title.appendChild(el('span', { class: 'presbadge deleted', title: 'Deleted from the source app · preserved by Saffev', text: 'preserved' }));
       else if (s.preserved) title.appendChild(el('span', { class: 'presbadge', title: 'A durable copy is in your archive', text: 'archived' }));
       if (s.piiCount > 0) title.appendChild(el('span', { class: 'piibadge key', title: s.piiCount + ' PII findings', text: 'PII' }));
-      row.appendChild(cell(AGENT_COLS[1], title));
+      if (s.matchCount > 0) title.appendChild(el('span', { class: 'hitbadge', title: s.matchCount + ' matching message' + (s.matchCount === 1 ? '' : 's'), text: s.matchCount + ' hit' + (s.matchCount === 1 ? '' : 's') }));
+      // A content match shows WHY it matched, right in the row.
+      let titleNode = title;
+      if (s.snippets && s.snippets.length) {
+        const stack = el('div', { class: 'cellstack' }, [title]);
+        s.snippets.slice(0, 2).forEach((sn) => stack.appendChild(snippetLine(sn)));
+        titleNode = stack;
+      }
+      row.appendChild(cell(AGENT_COLS[1], titleNode));
       row.appendChild(cell(AGENT_COLS[2], el('span', { class: 'cell-model', text: s.model || '·' })));
       row.appendChild(cell(AGENT_COLS[3], el('span', { class: 'cell-tokens', text: fmtNum(s.messageCount) })));
       row.appendChild(cell(AGENT_COLS[4], el('span', { class: 'cell-tokens', text: fmtNum(s.inputTokens + s.outputTokens) })));
@@ -3003,20 +3328,26 @@
       ]);
       if (!a.enabled) {
         wrap.appendChild(el('div', { class: 'ai-hint' }, [
-          document.createTextNode('Summarize this session using your Codex subscription. '),
+          document.createTextNode('Summarize this session using your Codex subscription. This is the one feature that sends your content off this device. '),
           el('a', { href: '#/settings', text: 'Enable in Settings' }),
           document.createTextNode('.'),
         ]));
         return wrap;
       }
+      // Everything else in Saffev stays on the machine. This one does not, so it
+      // says so at the point of use, in full, rather than in a footnote.
+      wrap.appendChild(el('div', { class: 'ai-warn' }, [
+        el('strong', { text: 'This leaves your device.' }),
+        document.createTextNode(' Clicking below uploads this session’s full text to OpenAI through your own Codex sign-in, and it is the only part of Saffev that sends your content anywhere. Nothing is sent until you click.'),
+      ]));
       const out = el('div', { class: 'ai-out' });
       const btn = el('button', { class: 'btn ai-btn', type: 'button' }, [
         el('span', { class: 'aiblk-ic', html: ICON.sparkles }),
-        document.createTextNode(' Summarize this session'),
+        document.createTextNode(' Send to OpenAI and summarize'),
       ]);
       btn.addEventListener('click', () => this.runSummary(s.id, out, btn));
       wrap.appendChild(btn);
-      wrap.appendChild(el('div', { class: 'ai-note', text: 'Sends this session’s text to OpenAI via your Codex · uses your subscription' }));
+      wrap.appendChild(el('div', { class: 'ai-note', text: 'Uses your ChatGPT subscription · sandboxed, read-only, no tools' }));
       wrap.appendChild(out);
       return wrap;
     },
@@ -3068,7 +3399,135 @@
 
   // Privacy + Quality are folded into Analytics tabs (see navigate() redirects);
   // they stay as objects (Analytics renders their bodies) but aren't top-level routes.
-  const ROUTES = { live: Live, history: History, agents: Agents, analytics: Analytics, engines: Engines, settings: Settings, about: About };
+  /* =========================================================================
+     PAGE: TIMELINE — one record of everything AI touched on this machine.
+
+     Saffev knows about AI activity two different ways: calls proxied through it,
+     and coding-agent sessions read off disk. Those used to be separate pages with
+     separate searches, so you had to already know which half your memory lived in
+     before you could go looking for it. This is the page that removes that.
+     ========================================================================= */
+  const Timeline = {
+    title: 'Timeline',
+    sub: 'Everything AI touched on this machine, in order · proxied calls and coding sessions together.',
+    q: '', kind: '', rangeMs: 0,
+    RANGES: [
+      { value: 0, label: 'All time' },
+      { value: 86400000, label: 'Last 24 hours' },
+      { value: 7 * 86400000, label: 'Last 7 days' },
+      { value: 30 * 86400000, label: 'Last 30 days' },
+    ],
+    SCOPES: [
+      { value: '', label: 'Everything' },
+      { value: 'proxy', label: 'Proxied calls' },
+      { value: 'agent', label: 'Coding sessions' },
+    ],
+
+    async render(view) {
+      view.innerHTML = '';
+      const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
+      const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search everything…', value: this.q });
+      let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
+      view.appendChild(el('div', { class: 'filterbar reveal' }, [
+        el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]),
+        dropdown(this.SCOPES, this.kind, (v) => { if (this.kind === v) return; this.kind = v; this.reload(); }, { ariaLabel: 'Filter by source' }),
+        dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.reload(); }, { ariaLabel: 'Time range', align: 'right' }),
+      ]));
+      view.appendChild(el('div', { class: 'searchnote reveal', id: 'tlNote' }));
+      view.appendChild(el('div', { class: 'card reveal', style: 'padding:0;overflow:hidden' }, [
+        el('div', { class: 'ttable', style: '--gtc:' + this.gtc() }, [
+          el('div', { class: 'thead' }, this.COLS.map((c) => el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label }))),
+          el('div', { class: 'list', id: 'tlList' }),
+        ]),
+      ]));
+      await this.reload();
+    },
+
+    COLS: [
+      { label: 'Source', w: 'minmax(140px,1.1fr)' },
+      { label: 'What', w: 'minmax(260px,2.6fr)' },
+      { label: 'Model', w: 'minmax(130px,1.1fr)' },
+      { label: 'Tokens', w: 'minmax(90px,.8fr)', r: true },
+      { label: 'When', w: 'minmax(120px,1fr)', r: true },
+    ],
+    gtc() { return this.COLS.map((c) => c.w).join(' '); },
+
+    async reload() {
+      const list = $('#tlList');
+      if (!list) return;
+      list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Gathering…' })]));
+      let d;
+      try {
+        d = await api('/timeline?limit=250'
+          + (this.q ? '&q=' + encodeURIComponent(this.q) : '')
+          + (this.kind ? '&kind=' + this.kind : '')
+          + (this.rangeMs ? '&rangeMs=' + this.rangeMs : ''));
+        hideBanner();
+      } catch (e) {
+        handleApiError(e);
+        list.innerHTML = ''; list.appendChild(el('div', { class: 'state sm', text: e.message || 'Could not load.' }));
+        return;
+      }
+
+      const note = $('#tlNote');
+      if (note) {
+        note.textContent = fmtNum(d.proxyCount) + ' proxied call' + (d.proxyCount === 1 ? '' : 's')
+          + ' · ' + fmtNum(d.agentCount) + ' coding session' + (d.agentCount === 1 ? '' : 's')
+          + (this.q
+            ? (d.contentSearch
+              ? ' · searching inside preserved conversations as well as metadata.'
+              : ' · searching metadata only. Turn on Preservation to search what was actually said.')
+            : '.');
+      }
+
+      list.innerHTML = '';
+      if (!d.entries.length) {
+        list.appendChild(el('div', { class: 'state sm', style: 'padding:28px', text: this.q ? 'Nothing matches.' : 'Nothing recorded yet.' }));
+        return;
+      }
+      d.entries.forEach((e) => list.appendChild(this.row(e)));
+    },
+
+    row(e) {
+      const row = el('div', { class: 'trow', tabindex: '0' });
+      const cell = (c, node) => { const dv = el('div', { class: 'tcell' + (c.r ? ' r' : '') }); dv.appendChild(node); return dv; };
+
+      // The source badge is what makes the merge readable: every row says plainly
+      // where it came from.
+      const src = e.kind === 'agent'
+        ? toolBadge(e.source, e.label)
+        : el('span', { class: 'tt-src' }, [
+            el('span', { class: 'tt-ic', html: ICON.server }),
+            el('span', { class: 'tt-nm', text: e.label }),
+          ]);
+      row.appendChild(cell(this.COLS[0], src));
+
+      const what = el('div', { class: 'cell-app' }, [el('span', { class: 'nm', title: e.project || '', text: e.title })]);
+      if (e.failed) what.appendChild(el('span', { class: 'piibadge', text: 'failed' }));
+      if (e.piiCount > 0) what.appendChild(el('span', { class: 'piibadge key', title: e.piiCount + ' PII findings', text: 'PII' }));
+      if (e.safetyFlagged) what.appendChild(el('span', { class: 'safetybadge', title: 'Safety flagged', text: '⚠ safety' }));
+      if (e.preserved) what.appendChild(el('span', { class: 'presbadge', title: 'A durable copy is in your archive', text: 'archived' }));
+      let whatNode = what;
+      if (e.snippets && e.snippets.length) {
+        const stack = el('div', { class: 'cellstack' }, [what]);
+        e.snippets.slice(0, 2).forEach((sn) => stack.appendChild(snippetLine(sn)));
+        whatNode = stack;
+      }
+      row.appendChild(cell(this.COLS[1], whatNode));
+
+      row.appendChild(cell(this.COLS[2], el('span', { class: 'cell-model', title: e.model || '', text: e.model || '·' })));
+      row.appendChild(cell(this.COLS[3], el('span', { class: 'cell-tokens', text: fmtNum(e.inputTokens + e.outputTokens) })));
+      row.appendChild(cell(this.COLS[4], el('span', { class: 'cell-time', title: new Date(e.ts).toLocaleString(), text: fmtStamp(e.ts) })));
+
+      // Each row opens the right detail view for its kind.
+      const open = () => { if (e.kind === 'agent') Agents.openDetail(e.id); else openDetail(e.id); };
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+      return row;
+    },
+  };
+
+  const ROUTES = { timeline: Timeline, live: Live, history: History, agents: Agents, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
 
   function setActiveNav(route) {

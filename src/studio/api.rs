@@ -593,6 +593,14 @@ pub async fn quality(
     }))
 }
 
+/// Query params for endpoints that take only a time window.
+#[derive(serde::Deserialize)]
+pub struct RangeParams {
+    /// Window length in millis. Omitted or 0 means "everything".
+    #[serde(rename = "rangeMs")]
+    range_ms: Option<i64>,
+}
+
 /// Query params for `GET /api/analytics`.
 #[derive(serde::Deserialize)]
 pub struct AnalyticsParams {
@@ -608,11 +616,9 @@ pub struct AnalyticsParams {
 const ANALYTICS_DEFAULT_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
 const ANALYTICS_MIN_RANGE_MS: i64 = 60 * 60 * 1000;
 const ANALYTICS_MAX_RANGE_MS: i64 = 92 * 24 * 60 * 60 * 1000;
-/// Cloud price assumptions for the "cost saved" estimate (USD per 1M tokens).
-/// Honest + labeled in the report; not a precise bill, a motivating comparison.
-const CLOUD_IN_PER_M: f64 = 2.50; // ~GPT-4o input
-const CLOUD_OUT_PER_M: f64 = 10.0; // ~GPT-4o output
-const CLOUD_BASIS: &str = "vs GPT-4o cloud pricing";
+// The cloud price assumptions behind the "cost saved" estimate now live in
+// `config.pricing`, so a published price change can be corrected without waiting
+// for a release. They remain an estimate, and the report keeps saying so.
 
 /// `GET /api/analytics` — comprehensive on-device analytics for a time window.
 pub async fn analytics(
@@ -689,6 +695,24 @@ pub async fn analytics(
         .filter_map(|r| r.response.as_ref().and_then(|x| x.output_tokens))
         .map(|v| v as u64)
         .sum();
+
+    // Provenance of those totals. Per-row views already mark an estimated count
+    // with a tilde, but the headline numbers silently blended engine-reported
+    // counts with ones we estimated from a bundled tokenizer — and the headline
+    // is the number people quote. Carry the split so the UI can qualify it.
+    let estimated_input_tokens: u64 = cur
+        .iter()
+        .filter(|r| r.request.input_tokens_src == crate::store::TokenSource::Estimated)
+        .filter_map(|r| r.request.input_tokens)
+        .map(|v| v as u64)
+        .sum();
+    let estimated_output_tokens: u64 = cur
+        .iter()
+        .filter_map(|r| r.response.as_ref())
+        .filter(|x| x.output_tokens_src == crate::store::TokenSource::Estimated)
+        .filter_map(|x| x.output_tokens)
+        .map(|v| v as u64)
+        .sum();
     let mut lats: Vec<u32> = cur.iter().filter_map(|r| lat(r)).collect();
     let p50_latency_ms = percentile(&mut lats, 50);
     let p90_latency_ms = percentile(&mut lats, 90);
@@ -699,8 +723,10 @@ pub async fn analytics(
         .collect();
     let avg_ttft_ms = mean_u32(&ttfts);
 
-    let est_cost_saved_usd = (total_input_tokens as f64 / 1_000_000.0) * CLOUD_IN_PER_M
-        + (total_output_tokens as f64 / 1_000_000.0) * CLOUD_OUT_PER_M;
+    let pricing = &state.config.load().pricing;
+    let est_cost_saved_usd = (total_input_tokens as f64 / 1_000_000.0) * pricing.cloud_input_per_m
+        + (total_output_tokens as f64 / 1_000_000.0) * pricing.cloud_output_per_m;
+    let cloud_basis = format!("vs {}", pricing.cloud_label);
 
     // in-range row lookup + finding attribution
     let mut row_by_id: BTreeMap<&str, &HistoryRow> = BTreeMap::new();
@@ -1019,6 +1045,8 @@ pub async fn analytics(
             crate::store::PiiAction::Observed => "observed",
             crate::store::PiiAction::WouldMask => "would_mask",
             crate::store::PiiAction::Masked => "masked",
+            crate::store::PiiAction::WouldBlock => "would_block",
+            crate::store::PiiAction::Blocked => "blocked",
         };
         *action_map.entry(action_name.to_string()).or_insert(0) += 1;
         if let Some(r) = row_by_id.get(f.record_id.as_str()) {
@@ -1048,6 +1076,7 @@ pub async fn analytics(
         &pii_by_app,
         pii_req,
         &finish_reasons,
+        &cloud_basis,
     );
 
     Ok(Json(dto::AnalyticsReport {
@@ -1056,6 +1085,8 @@ pub async fn analytics(
         bucket_ms,
         total_requests,
         total_input_tokens,
+        estimated_input_tokens,
+        estimated_output_tokens,
         total_output_tokens,
         p50_latency_ms,
         p90_latency_ms,
@@ -1066,7 +1097,7 @@ pub async fn analytics(
         active_apps: by_app.len() as u64,
         active_models: by_model.len() as u64,
         est_cost_saved_usd: (est_cost_saved_usd * 100.0).round() / 100.0,
-        cost_basis: CLOUD_BASIS.to_string(),
+        cost_basis: cloud_basis.clone(),
         prev_total_requests,
         prev_total_tokens,
         prev_p50_latency_ms,
@@ -1169,6 +1200,7 @@ fn build_insights(
     pii_by_app: &[dto::NamedCount],
     pii_request_side: u64,
     finish_reasons: &[dto::NamedCount],
+    cloud_basis: &str,
 ) -> Vec<dto::Insight> {
     let mut out: Vec<dto::Insight> = Vec::new();
     if total_requests == 0 {
@@ -1187,7 +1219,7 @@ fn build_insights(
             title: format!("≈ ${:.2} kept off the cloud", cost_saved),
             detail: format!(
                 "{} requests · {} output tokens ran on-device {}.",
-                total_requests, total_output_tokens, CLOUD_BASIS
+                total_requests, total_output_tokens, cloud_basis
             ),
         });
     }
@@ -1607,6 +1639,11 @@ pub struct AgentSessionsParams {
     pub preserved: Option<bool>,
 }
 
+/// Ceiling on how many sessions one content search resolves. Generous relative
+/// to any realistic page of results, bounded so a one-letter query cannot pull
+/// the whole archive into memory.
+const CONTENT_SEARCH_SESSION_CAP: usize = 300;
+
 fn agent_session_view(s: &crate::agents::AgentSession, pii_count: u32) -> dto::AgentSessionView {
     dto::AgentSessionView {
         id: s.id.clone(),
@@ -1633,6 +1670,8 @@ fn agent_session_view(s: &crate::agents::AgentSession, pii_count: u32) -> dto::A
         source_path: s.source_path.clone(),
         preserved: false,
         source_deleted: false,
+        snippets: Vec::new(),
+        match_count: 0,
     }
 }
 
@@ -1667,6 +1706,8 @@ fn archived_session_view(a: &crate::store::ArchivedSession) -> dto::AgentSession
         source_path: a.source_path.clone().unwrap_or_default(),
         preserved: true,
         source_deleted: a.source_deleted,
+        snippets: Vec::new(),
+        match_count: 0,
     }
 }
 
@@ -1928,17 +1969,46 @@ pub async fn agents_sessions(
         out.retain(|v| v.tool == tool);
     }
     if !q.is_empty() {
+        // Search is two things at once, and users should not have to know which.
+        //
+        // 1. Metadata (title / project / model / tool) — works for every session,
+        //    archived or not, because it comes from the cheap list parse.
+        // 2. Content (what was actually said) — served by the archive's full-text
+        //    index, so it covers PRESERVED sessions. Scanning every live
+        //    transcript per keystroke would mean re-parsing hundreds of megabytes,
+        //    which is exactly the cost the archive exists to pay once.
+        //
+        // A session matching either way is kept; content matches also carry the
+        // excerpts that explain the hit. When content search finds nothing because
+        // nothing is preserved yet, this degrades to the old metadata-only
+        // behavior rather than failing.
+        let content: std::collections::HashMap<String, crate::store::ArchiveSearchHit> = state
+            .store
+            .search_archive(&q, CONTENT_SEARCH_SESSION_CAP)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| (h.session_id.clone(), h))
+            .collect();
+
         out.retain(|v| {
-            format!(
-                "{} {} {} {}",
-                v.title.as_deref().unwrap_or(""),
-                v.project.as_deref().unwrap_or(""),
-                v.model.as_deref().unwrap_or(""),
-                v.label
-            )
-            .to_lowercase()
-            .contains(&q)
+            content.contains_key(&v.id)
+                || format!(
+                    "{} {} {} {}",
+                    v.title.as_deref().unwrap_or(""),
+                    v.project.as_deref().unwrap_or(""),
+                    v.model.as_deref().unwrap_or(""),
+                    v.label
+                )
+                .to_lowercase()
+                .contains(&q)
         });
+        for v in out.iter_mut() {
+            if let Some(hit) = content.get(&v.id) {
+                v.snippets = hit.snippets.clone();
+                v.match_count = hit.match_count;
+            }
+        }
     }
     if p.preserved == Some(true) {
         out.retain(|v| v.preserved);
@@ -2066,17 +2136,376 @@ pub async fn agents_detail(
 pub async fn archive_run(
     State(state): State<StudioState>,
 ) -> Result<Json<crate::agents::archive::SnapshotSummary>, Response> {
-    if !state.config.load().archive.enabled {
+    let cfg = state.config.load();
+    if !cfg.archive.enabled {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "archive_disabled",
             "Preservation is off. Enable it in Settings to archive your history.",
         ));
     }
-    let summary = crate::agents::archive::run_snapshot(&state.store)
+    // If the user asked for redaction and the detector will not build, refuse
+    // rather than archive raw secrets under a setting that says otherwise.
+    let redaction = crate::agents::archive::Redaction::from_config(&cfg).map_err(|e| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "redaction_unavailable",
+            &format!(
+                "Redaction is on but a PII pattern failed to compile, so nothing was archived \
+                 (archiving would have stored unredacted text): {e}"
+            ),
+        )
+    })?;
+    let summary = crate::agents::archive::run_snapshot(&state.store, redaction)
         .await
         .map_err(internal)?;
     Ok(Json(summary))
+}
+
+/// Query params for `GET /api/timeline`.
+#[derive(serde::Deserialize)]
+pub struct TimelineParams {
+    /// Free-text query. Matches proxy metadata, session metadata, and (for
+    /// preserved sessions) what was actually said.
+    pub q: Option<String>,
+    /// Window length in millis; omitted or 0 means everything.
+    #[serde(rename = "rangeMs")]
+    pub range_ms: Option<i64>,
+    /// Restrict to one side: `proxy` or `agent`.
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/timeline` — everything AI touched on this machine, in order.
+///
+/// Merges the two halves of what Saffev knows: model calls that went through the
+/// proxy, and coding-agent sessions read from disk. A user should not have to
+/// know which of those a memory lives in to go looking for it.
+pub async fn timeline(
+    State(state): State<StudioState>,
+    Query(p): Query<TimelineParams>,
+) -> Result<Json<dto::TimelineView>, Response> {
+    let q = p.q.unwrap_or_default().trim().to_lowercase();
+    let limit = p.limit.unwrap_or(200).clamp(1, 1_000);
+    let range_ms = p.range_ms.unwrap_or(0).max(0);
+    let since = if range_ms > 0 {
+        crate::agents::now_ms() - range_ms
+    } else {
+        0
+    };
+    let want_proxy = p.kind.as_deref() != Some("agent");
+    let want_agent = p.kind.as_deref() != Some("proxy");
+
+    let mut entries: Vec<dto::TimelineEntry> = Vec::new();
+    let mut proxy_count = 0u32;
+    let mut agent_count = 0u32;
+
+    // --- proxied exchanges ---
+    if want_proxy {
+        let rows = state
+            .store
+            .history(crate::store::HistoryQuery {
+                q: if q.is_empty() { None } else { Some(q.clone()) },
+                limit: Some(limit as u32),
+                ..Default::default()
+            })
+            .await
+            .map_err(internal)?;
+        for r in rows {
+            if r.request.ts < since {
+                continue;
+            }
+            proxy_count += 1;
+            let resp = r.response.as_ref();
+            let failed = resp
+                .map(|x| x.error_kind.is_some() || x.status.map(|s| s >= 400).unwrap_or(false))
+                .unwrap_or(false);
+            entries.push(dto::TimelineEntry {
+                kind: dto::TimelineKind::Proxy,
+                ts: r.request.ts,
+                source: r
+                    .request
+                    .source_app
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".into()),
+                label: r
+                    .request
+                    .source_app
+                    .clone()
+                    .unwrap_or_else(|| "Unknown app".into()),
+                title: r.request.endpoint.clone(),
+                model: r.request.model.clone(),
+                project: None,
+                input_tokens: r.request.input_tokens.unwrap_or(0) as u64,
+                output_tokens: resp.and_then(|x| x.output_tokens).unwrap_or(0) as u64,
+                pii_count: r.pii_count,
+                failed,
+                safety_flagged: r.safety_count > 0,
+                preserved: false,
+                snippets: Vec::new(),
+                id: r.request.id,
+            });
+        }
+    }
+
+    // --- coding-agent sessions ---
+    if want_agent {
+        let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
+            .await
+            .unwrap_or_default();
+        let archived_ids: std::collections::HashSet<String> = state
+            .store
+            .archived_index()
+            .await
+            .unwrap_or_default()
+            .into_keys()
+            .collect();
+
+        // Content search reaches preserved sessions (same reasoning as the
+        // Agents page: scanning every live transcript per query is the cost the
+        // archive exists to pay once).
+        let content: std::collections::HashMap<String, crate::store::ArchiveSearchHit> =
+            if q.is_empty() {
+                Default::default()
+            } else {
+                state
+                    .store
+                    .search_archive(&q, CONTENT_SEARCH_SESSION_CAP)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|h| (h.session_id.clone(), h))
+                    .collect()
+            };
+
+        for s in sessions {
+            if s.updated_ts < since {
+                continue;
+            }
+            let matches = q.is_empty()
+                || content.contains_key(&s.id)
+                || format!(
+                    "{} {} {}",
+                    s.title.as_deref().unwrap_or(""),
+                    s.project.as_deref().unwrap_or(""),
+                    s.model.as_deref().unwrap_or("")
+                )
+                .to_lowercase()
+                .contains(&q);
+            if !matches {
+                continue;
+            }
+            agent_count += 1;
+            let hit = content.get(&s.id);
+            entries.push(dto::TimelineEntry {
+                kind: dto::TimelineKind::Agent,
+                ts: s.updated_ts,
+                source: s.tool.key().to_string(),
+                label: s.tool.label().to_string(),
+                title: s
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Untitled session".to_string()),
+                model: s.model.clone(),
+                project: s.project.clone(),
+                input_tokens: s.input_tokens,
+                output_tokens: s.output_tokens,
+                pii_count: 0,
+                failed: false,
+                safety_flagged: false,
+                preserved: archived_ids.contains(&s.id),
+                snippets: hit.map(|h| h.snippets.clone()).unwrap_or_default(),
+                id: s.id.clone(),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+    let content_search = state
+        .store
+        .archive_stats()
+        .await
+        .map(|s| s.count > 0)
+        .unwrap_or(false);
+    entries.truncate(limit);
+
+    Ok(Json(dto::TimelineView {
+        entries,
+        proxy_count,
+        agent_count,
+        content_search,
+    }))
+}
+
+/// `GET /api/archive/verify` — walk the integrity chain and report the result.
+pub async fn archive_verify(
+    State(state): State<StudioState>,
+) -> Result<Json<dto::ArchiveIntegrityView>, Response> {
+    let v = state.store.verify_archive().await.map_err(internal)?;
+    Ok(Json(dto::ArchiveIntegrityView {
+        entries: v.entries,
+        sessions: v.sessions,
+        intact: v.intact,
+        broken_at: v.broken_at,
+        altered_sessions: v.altered_sessions,
+        head_digest: v.head_digest,
+        head_ts: v.head_ts,
+    }))
+}
+
+/// `POST /api/archive/audit` — write an audit bundle to a folder on disk.
+///
+/// The point is to be handed to someone else. A reviewer who has never run
+/// Saffev should be able to open the folder and check the claims themselves:
+/// the transcripts, the integrity chain, what each digest covers, and how to
+/// recompute them. So the bundle carries a README explaining the method,
+/// including its limits.
+pub async fn archive_audit(
+    State(state): State<StudioState>,
+) -> Result<Json<dto::AuditExportResult>, Response> {
+    if !state.config.load().archive.enabled {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "archive_disabled",
+            "Preservation is off, so there is nothing to audit.",
+        ));
+    }
+
+    let integrity = state.store.verify_archive().await.map_err(internal)?;
+    let log = state.store.archive_log().await.map_err(internal)?;
+    let sessions = state.store.archived_sessions().await.map_err(internal)?;
+
+    let stamp = crate::agents::now_ms();
+    let dir = crate::agents::home().join(format!("Saffev-Audit-{stamp}"));
+    let transcripts = dir.join("transcripts");
+    std::fs::create_dir_all(&transcripts).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_failed",
+            &format!("could not create {}: {e}", dir.display()),
+        )
+    })?;
+
+    // The chain, verbatim, so it can be recomputed independently.
+    let chain: Vec<serde_json::Value> = log
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "seq": e.seq,
+                "ts": e.ts,
+                "sessionId": e.session_id,
+                "contentDigest": e.content_digest,
+                "prevDigest": e.prev_digest,
+                "entryDigest": e.entry_digest,
+            })
+        })
+        .collect();
+
+    let manifest = serde_json::json!({
+        "tool": crate::brand::APP_NAME,
+        "version": crate::VERSION,
+        "generatedTs": stamp,
+        "integrity": {
+            "intact": integrity.intact,
+            "entries": integrity.entries,
+            "sessions": integrity.sessions,
+            "brokenAt": integrity.broken_at,
+            "alteredSessions": integrity.altered_sessions,
+            "headDigest": integrity.head_digest,
+            "headTs": integrity.head_ts,
+        },
+        "chain": chain,
+    });
+    write_export(&dir.join("manifest.json"), &manifest.to_string())?;
+    write_export(&dir.join("README.md"), &audit_readme(&integrity))?;
+
+    // One readable transcript per session, named by its id so a manifest entry
+    // points at a file the reviewer can actually open.
+    let mut written = 0u32;
+    let mut errors = 0u32;
+    for s in &sessions {
+        match state.store.archived_detail(&s.id).await {
+            Ok(Some(full)) => {
+                let detail = archived_to_detail(full);
+                let name = format!("{}.md", s.id.replace(':', "_"));
+                if write_export(
+                    &transcripts.join(name),
+                    &crate::agents::export::to_markdown(&detail),
+                )
+                .is_ok()
+                {
+                    written += 1;
+                } else {
+                    errors += 1;
+                }
+            }
+            _ => errors += 1,
+        }
+    }
+
+    Ok(Json(dto::AuditExportResult {
+        dir: dir.to_string_lossy().to_string(),
+        sessions: written,
+        errors,
+        intact: integrity.intact,
+        head_digest: integrity.head_digest,
+    }))
+}
+
+fn write_export(path: &std::path::Path, body: &str) -> Result<(), Response> {
+    std::fs::write(path, body).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_failed",
+            &format!("could not write {}: {e}", path.display()),
+        )
+    })
+}
+
+/// The explanation that ships inside the audit bundle. Written for someone who
+/// has never seen this tool, and honest about what the evidence does not prove.
+fn audit_readme(v: &crate::store::ArchiveIntegrity) -> String {
+    let verdict = if v.intact {
+        "INTACT — every entry recomputed correctly and every archived session still \
+         matches what was recorded when it was preserved."
+    } else {
+        "NOT INTACT — see `brokenAt` in manifest.json."
+    };
+    format!(
+        "# {app} audit bundle\n\n\
+         ## What this is\n\n\
+         A copy of the AI coding sessions preserved on this machine, plus the integrity \
+         chain that shows they have not been altered since they were preserved.\n\n\
+         - `transcripts/` — one Markdown file per session.\n\
+         - `manifest.json` — the full integrity chain and the verification result.\n\n\
+         ## Verification result\n\n\
+         {verdict}\n\n\
+         - Entries in the chain: {entries}\n\
+         - Sessions covered: {sessions}\n\
+         - Head digest: `{head}`\n\n\
+         ## How the chain works\n\n\
+         Every time a session is preserved, one entry is appended to a log. Each entry \
+         contains a SHA-256 digest of that session's stored content, and a SHA-256 digest \
+         of itself that also covers the previous entry's digest. Changing, inserting, or \
+         removing any entry therefore breaks every entry after it.\n\n\
+         To check it yourself, walk `chain` in order and confirm that:\n\n\
+         1. each entry's `prevDigest` equals the previous entry's `entryDigest` (empty for \
+         the first), and\n\
+         2. `entryDigest` = SHA-256 of `seq`, `ts`, `sessionId`, `contentDigest` and \
+         `prevDigest`, each followed by a zero byte.\n\n\
+         ## What this does not prove\n\n\
+         This shows the archive is internally consistent and has not been edited by \
+         anything that did not also rewrite the whole chain. It is **not** proof against \
+         someone who controls this machine and recomputes every digest deliberately. \
+         Proving that would need the head digest to be recorded somewhere outside this \
+         machine at the time of preservation. If you need that, record the head digest \
+         above with a third party and compare it later.\n",
+        app = crate::brand::APP_NAME,
+        verdict = verdict,
+        entries = v.entries,
+        sessions = v.sessions,
+        head = v.head_digest.as_deref().unwrap_or("(nothing archived)"),
+    )
 }
 
 /// Query for the export endpoint.
@@ -2255,6 +2684,81 @@ pub async fn archive_export(
 }
 
 /// `GET /api/agents/analytics` — cross-session rollups (by tool, by model).
+/// `GET /api/agents/privacy?rangeMs=…`
+///
+/// The cross-history privacy report: what kinds of secrets appear in your
+/// preserved coding-agent transcripts, in which tools and projects, and which
+/// sessions to look at. `rangeMs` bounds the window; omit it for everything.
+///
+/// Scans the archive rather than the live files (see `agents::privacy`), and
+/// reports its own coverage so the numbers are never mistaken for a full sweep.
+pub async fn agents_privacy(
+    State(state): State<StudioState>,
+    Query(p): Query<RangeParams>,
+) -> Json<dto::AgentPrivacyReport> {
+    let cfg = state.config.load();
+    let range_ms = p.range_ms.unwrap_or(0).max(0);
+    let r = crate::agents::privacy::report(&state.store, &cfg, range_ms).await;
+
+    let group = |g: &crate::agents::privacy::NamedCount| dto::AgentPiiGroup {
+        name: g.name.clone(),
+        count: g.count,
+    };
+
+    Json(dto::AgentPrivacyReport {
+        generated_ts: r.generated_ts,
+        range_ms: r.range_ms,
+        sessions_with_findings: r.sessions_with_findings,
+        total_findings: r.total_findings,
+        user_side_findings: r.user_side_findings,
+        high_signal_findings: r.high_signal_findings,
+        high_signal_user_side: r.high_signal_user_side,
+        by_kind: r
+            .by_kind
+            .iter()
+            .map(|k| dto::AgentPiiKind {
+                name: k.name.clone(),
+                count: k.count,
+                noisy: k.noisy,
+            })
+            .collect(),
+        by_tool: r
+            .by_tool
+            .iter()
+            .map(|g| dto::AgentPiiGroup {
+                // Tools are stored by key; show the human label.
+                name: crate::agents::split_id(&format!("{}:x", g.name))
+                    .map(|(t, _)| t.label().to_string())
+                    .unwrap_or_else(|| g.name.clone()),
+                count: g.count,
+            })
+            .collect(),
+        by_project: r.by_project.iter().map(group).collect(),
+        top_sessions: r
+            .top_sessions
+            .iter()
+            .map(|s| dto::AgentPiiSession {
+                session_id: s.session_id.clone(),
+                tool: s.tool.clone(),
+                label: crate::agents::split_id(&s.session_id)
+                    .map(|(t, _)| t.label().to_string())
+                    .unwrap_or_else(|| s.tool.clone()),
+                title: s.title.clone(),
+                project: s.project.clone(),
+                updated_ts: s.updated_ts,
+                findings: s.findings,
+                user_side: s.user_side,
+                kinds: s.kinds.clone(),
+            })
+            .collect(),
+        coverage: dto::AgentPiiCoverage {
+            preserved: r.coverage.preserved,
+            total: r.coverage.total,
+            archive_enabled: cfg.archive.enabled,
+        },
+    })
+}
+
 pub async fn agents_analytics(State(_state): State<StudioState>) -> Json<dto::AgentAnalytics> {
     let sessions = crate::agents::all_sessions();
     let by_tool = crate::agents::detected();
@@ -2411,6 +2915,37 @@ pub async fn settings_put(
         });
     }
 
+    // A shared team policy outranks the Studio. Refuse rather than silently
+    // accept-then-ignore: a switch that appears to flip but does nothing is worse
+    // than one that says no.
+    for (field, requested) in [
+        ("masking.enabled", body.masking_enabled.is_some()),
+        ("masking.dry_run", body.masking_dry_run.is_some()),
+        ("masking.block_kinds", body.masking_block_kinds.is_some()),
+    ] {
+        if requested && crate::policy::governs(field) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "governed_by_policy",
+                &format!(
+                    "`{field}` is set by your team policy and cannot be changed here. \
+                     Edit the policy file instead."
+                ),
+            ));
+        }
+    }
+
+    // masking.block_kinds — HOT-RELOADABLE. The one setting that can stop a
+    // user's request, so it is logged explicitly like the other protective ones.
+    if let Some(kinds) = body.masking_block_kinds.clone() {
+        persisted.masking.block_kinds = kinds.clone();
+        live.masking.block_kinds = kinds.clone();
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "masking_block_kinds".to_string(),
+            value: serde_json::to_string(&kinds).unwrap_or_default(),
+        });
+    }
+
     // Eval pipeline toggles — all hot-reloadable (the worker reads config live).
     if let Some(v) = body.eval_enabled {
         persisted.eval.enabled = v;
@@ -2458,6 +2993,18 @@ pub async fn settings_put(
         live.archive.enabled = v;
         state.store.enqueue(crate::store::WriteOp::Setting {
             key: "archive_enabled".to_string(),
+            value: v.to_string(),
+        });
+    }
+    // archive.redact — HOT-RELOADABLE. Changing it also rewrites what is already
+    // stored on the next snapshot (the archive change key includes this setting),
+    // so a user who turns it on does not keep a pile of raw transcripts they now
+    // believe are safe.
+    if let Some(v) = body.archive_redact {
+        persisted.archive.redact = v;
+        live.archive.redact = v;
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "archive_redact".to_string(),
             value: v.to_string(),
         });
     }
@@ -2544,6 +3091,8 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         studio_port: cfg.ports.studio,
         masking_enabled: cfg.masking.enabled,
         masking_dry_run: cfg.masking.dry_run,
+        masking_block_kinds: cfg.masking.block_kinds.clone(),
+        policy: crate::policy::current(),
         eval_enabled: cfg.eval.enabled,
         eval_safety: cfg.eval.safety,
         eval_quality: cfg.eval.quality,
@@ -2553,6 +3102,7 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         analysis_available: crate::agents::codex_server::is_available(),
         archive_enabled: cfg.archive.enabled,
         archive_auto: cfg.archive.auto,
+        archive_redact: cfg.archive.redact,
         restart_required: Vec::new(),
         restart_note: None,
     }

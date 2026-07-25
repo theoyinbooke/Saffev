@@ -1,0 +1,195 @@
+# Linux Gateway adoption, verified end to end on a real systemd host.
+#
+# This is the test for the one claim the project could not previously back up.
+# Gateway mode rewrites a systemd unit, disables the engine's autostart, and
+# promises to put all of it back *exactly* on revert. That mechanism was covered
+# by unit tests and code review but had never actually run against systemd,
+# because the maintainer's machine is a Mac.
+#
+# GitHub's ubuntu runners are full VMs with systemd as PID 1, so the real path
+# runs here on every push: real `systemctl`, real drop-in files, real unit
+# enable/disable. The only stand-in is the engine itself (see
+# .github/ci/fake-ollama.py) because none of this is about inference.
+#
+# The revert assertions matter more than the adopt ones. Adopting badly is
+# recoverable; failing to restore someone's machine is not.
+
+name: Linux Gateway
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  adopt-revert:
+    name: adopt / revert against real systemd
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Plain SQLite: at-rest encryption is irrelevant to a systemd mechanism and
+      # the bundled SQLCipher + vendored OpenSSL build dominates CI time.
+      CARGO_TERM_COLOR: always
+      SAFFEV_CONFIG: /tmp/saffev-ci/saffev.toml
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gateway-${{ hashFiles('Cargo.lock') }}
+
+      - name: Confirm systemd is actually running
+        run: |
+          set -euo pipefail
+          # If this ever stops being true the whole job is meaningless, so fail
+          # loudly rather than silently testing nothing.
+          test "$(ps -p 1 -o comm=)" = "systemd"
+          systemctl --version | head -1
+
+      - name: Build
+        run: cargo build --no-default-features --locked
+
+      - name: Install the stand-in engine as ollama.service
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 .github/ci/fake-ollama.py /usr/local/bin/fake-ollama
+
+          # A real unit at the real path with the real name: adoption targets
+          # `ollama.service` by name, so the stand-in has to own that name.
+          sudo tee /etc/systemd/system/ollama.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Fake Ollama (CI stand-in for Saffev's Gateway test)
+          After=network.target
+
+          [Service]
+          Type=simple
+          Environment="OLLAMA_HOST=127.0.0.1:11434"
+          ExecStart=/usr/local/bin/fake-ollama
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ollama.service
+
+      - name: Baseline — engine on the public port, autostart enabled
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags | grep -q '"models"'
+          test "$(systemctl is-enabled ollama.service)" = "enabled"
+          # Nothing of ours exists yet.
+          test ! -e /etc/systemd/system/ollama.service.d/saffev.conf
+          test ! -e /etc/systemd/system/saffev.service
+          echo "baseline OK"
+
+      - name: Write a Gateway config
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/saffev-ci
+          cat > "$SAFFEV_CONFIG" <<'TOML'
+          mode = "gateway"
+          data_dir = "/tmp/saffev-ci"
+
+          [ports]
+          bind = "127.0.0.1"
+          proxy = 11434      # the public port Saffev takes over
+          studio = 7199
+          shadow = 11999     # where the engine gets relocated
+          upstream = 11434
+          TOML
+
+      - name: Adopt
+        run: |
+          set -euo pipefail
+          sudo -E ./target/debug/saffev adopt --engine ollama --config "$SAFFEV_CONFIG"
+
+      - name: Assert the host was actually adopted
+        run: |
+          set -euo pipefail
+
+          # 1. The drop-in exists and relocates the engine to the shadow port.
+          test -f /etc/systemd/system/ollama.service.d/saffev.conf
+          grep -q 'OLLAMA_HOST=127.0.0.1:11999' /etc/systemd/system/ollama.service.d/saffev.conf
+
+          # 2. systemd agrees the override is in effect, not just the file on disk.
+          systemctl show ollama.service -p Environment | grep -q '11999'
+
+          # 3. Autostart is disabled so the engine cannot race for the public port.
+          test "$(systemctl is-enabled ollama.service)" != "enabled"
+
+          # 4. Saffev registered its own unit.
+          test -f /etc/systemd/system/saffev.service
+          test "$(systemctl is-enabled saffev.service)" = "enabled"
+
+          # 5. The engine really moved: it answers on the shadow port now.
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11999/api/tags >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:11999/api/tags | grep -q '"models"'
+
+          # 6. And it released the public port for Saffev to own.
+          if curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+            echo "FAIL: engine still answering on the public port after adoption" >&2
+            exit 1
+          fi
+          echo "adopt OK"
+
+      - name: Revert
+        run: |
+          set -euo pipefail
+          sudo -E ./target/debug/saffev revert --engine ollama --config "$SAFFEV_CONFIG"
+
+      - name: Assert the host was restored exactly
+        run: |
+          set -euo pipefail
+
+          # This is the promise that matters: leave no trace.
+          test ! -e /etc/systemd/system/ollama.service.d/saffev.conf
+          test ! -e /etc/systemd/system/saffev.service
+
+          # Autostart restored.
+          test "$(systemctl is-enabled ollama.service)" = "enabled"
+
+          # The override is gone from systemd's view, not just from disk.
+          if systemctl show ollama.service -p Environment | grep -q '11999'; then
+            echo "FAIL: shadow-port override still in effect after revert" >&2
+            exit 1
+          fi
+
+          # The engine is back where it started.
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags | grep -q '"models"'
+          echo "revert OK — host restored"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== ollama.service ==="
+          systemctl status ollama.service --no-pager -l || true
+          systemctl cat ollama.service --no-pager || true
+          echo "=== saffev.service ==="
+          systemctl status saffev.service --no-pager -l || true
+          echo "=== drop-in dir ==="
+          ls -la /etc/systemd/system/ollama.service.d/ 2>/dev/null || true
+          echo "=== listening ports ==="
+          ss -ltnp || true
+          echo "=== saffev log ==="
+          tail -100 /tmp/saffev-ci/*.log 2>/dev/null || true

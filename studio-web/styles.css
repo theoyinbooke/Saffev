@@ -413,6 +413,9 @@ a{color:inherit}
 .ai-btn .aiblk-ic{color:#fff}
 .ai-note{font-family:var(--font-mono);font-size:.62rem;color:var(--text-3);margin-top:6px}
 .ai-hint{font-size:.82rem;color:var(--text-2)}
+/* The one place content leaves the device: say so loudly, before the button. */
+.ai-warn{font-size:.82rem;line-height:1.5;color:var(--text-1);background:var(--gold-soft);border:1px solid color-mix(in srgb,var(--gold) 35%,transparent);border-radius:var(--r-sm);padding:10px 12px;margin-bottom:10px}
+.ai-warn strong{color:var(--gold)}
 .ai-hint a{color:var(--brand);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--brand) 40%,transparent)}
 .ai-out{margin-top:10px}
 .ai-summary{font-size:.86rem;line-height:1.55;color:var(--text-1)}
@@ -453,6 +456,19 @@ a{color:inherit}
 /* preserved / resurrected badges */
 .presbadge{font-family:var(--font-mono);font-size:.56rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 6px;border-radius:var(--r-sm);background:var(--brand-soft);color:var(--brand);white-space:nowrap}
 .presbadge.deleted{background:var(--gold-soft);color:var(--gold)}
+/* Blockable-kind chips (Settings > PII masking > Block outright) */
+.chiprow{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
+.chip{font-family:var(--font-mono);font-size:.66rem;letter-spacing:.02em;padding:5px 10px;border-radius:var(--r-sm);border:1px solid var(--rule);background:var(--surface-2);color:var(--text-2);cursor:pointer;white-space:nowrap}
+.chip:hover:not(:disabled){border-color:var(--brand);color:var(--brand)}
+.chip.on{background:var(--danger-soft);border-color:color-mix(in srgb,var(--danger) 45%,transparent);color:var(--danger);font-weight:600}
+.chip:disabled{opacity:.45;cursor:default}
+/* full-text search: hit count badge, excerpt line, coverage note */
+.hitbadge{font-family:var(--font-mono);font-size:.56rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 6px;border-radius:var(--r-sm);background:var(--surface-3);color:var(--text-2);white-space:nowrap}
+.cellstack{display:flex;flex-direction:column;gap:3px;min-width:0}
+.cellstack .cell-app{min-width:0}
+.snip{font-family:var(--font-mono);font-size:.68rem;line-height:1.45;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.snip mark{background:var(--gold-soft);color:var(--gold);border-radius:2px;padding:0 2px;font-weight:600}
+.searchnote{font-size:.74rem;color:var(--text-3);margin:-8px 0 16px 2px}
 /* export row in the drawer */
 .exprow{display:flex;align-items:center;gap:8px;margin-top:14px}
 .exp-l{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3)}
@@ -716,3 +732,13 @@ a{color:inherit}
 .dd-menu::-webkit-scrollbar,.codeblock pre::-webkit-scrollbar{width:9px;height:9px}
 .dd-menu::-webkit-scrollbar-thumb,.codeblock pre::-webkit-scrollbar-thumb{background:var(--line);border-radius:var(--r-full)}
 .dd-menu::-webkit-scrollbar-track,.codeblock pre::-webkit-scrollbar-track{background:transparent}
+/* Preservation integrity line: is the copy provably unaltered? */
+.integrity{flex-basis:100%;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule);font-size:.76rem;color:var(--text-3);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.integrity.ok{color:var(--text-2)}
+.integrity.bad{color:var(--danger)}
+.integrity .digest{font-family:var(--font-mono);font-size:.66rem;background:var(--surface-3);border-radius:var(--r-sm);padding:2px 6px;color:var(--text-2)}
+/* Team policy notice on Settings: what governs these controls, and from where. */
+.policycard{border-left:3px solid var(--brand)}
+.policycard.bad{border-left-color:var(--danger)}
+.policycard.bad h3{color:var(--danger)}
+.policycard .digest{display:inline-block;margin-top:4px}

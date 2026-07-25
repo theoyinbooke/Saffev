@@ -368,6 +368,14 @@ pub struct SettingsView {
     /// Masking dry-run: when true (default), record what *would* be masked but
     /// forward traffic unchanged. Only `enabled && !dry_run` redacts requests.
     pub masking_dry_run: bool,
+    /// PII kinds that stop a request outright instead of being masked. Empty
+    /// (default) means nothing is ever blocked.
+    #[serde(default)]
+    pub masking_block_kinds: Vec<PiiKind>,
+    /// The shared team policy in force, if any. When present and active, the
+    /// settings it names are read-only here and the UI says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::PolicyStatus>,
     /// Eval pipeline master switch (off by default).
     #[serde(default)]
     pub eval_enabled: bool,
@@ -398,6 +406,9 @@ pub struct SettingsView {
     /// Auto-snapshot on start + periodically.
     #[serde(default)]
     pub archive_auto: bool,
+    /// Replace detected secrets with a placeholder before archiving (opt-in, lossy).
+    #[serde(default)]
+    pub archive_redact: bool,
     /// Fields whose new value was persisted to TOML but is **not** applied to the
     /// running process because it cannot be safely changed at runtime — `mode` and
     /// the ports rebind the listeners / re-adopt the engine. Empty when the last
@@ -429,6 +440,8 @@ pub struct SettingsUpdate {
     /// Toggle masking dry-run. Setting this to `false` turns on real request
     /// redaction — the only traffic-mutating action in v1.
     pub masking_dry_run: Option<bool>,
+    #[serde(default)]
+    pub masking_block_kinds: Option<Vec<PiiKind>>,
     /// Toggle the eval pipeline (safety guard + judge). Async, off hot path.
     pub eval_enabled: Option<bool>,
     /// Toggle the deterministic safety guard.
@@ -446,6 +459,8 @@ pub struct SettingsUpdate {
     pub archive_enabled: Option<bool>,
     /// Toggle automatic snapshots.
     pub archive_auto: Option<bool>,
+    #[serde(default)]
+    pub archive_redact: Option<bool>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.
@@ -678,6 +693,15 @@ pub struct AgentSessionView {
     /// The source app has deleted its copy; Saffev's archive is the only one left.
     #[serde(default)]
     pub source_deleted: bool,
+    /// Excerpts showing why this session matched a content search. Empty unless
+    /// the current query matched inside the transcript. Matched terms are wrapped
+    /// in `‹` … `›` for the UI to mark up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<String>,
+    /// How many messages in this session matched the content search (0 if the
+    /// session matched on metadata only).
+    #[serde(default)]
+    pub match_count: u32,
 }
 
 /// One message in a session transcript.
@@ -723,6 +747,183 @@ pub struct AgentAnalytics {
     pub by_model: Vec<AgentModelStat>,
 }
 
+// ===========================================================================
+// Agent privacy report (`GET /api/agents/privacy?rangeMs=...`)
+//
+// The cross-history answer to "where did I leak a secret?", computed over the
+// preserved archive. Counts and kinds only — never the matched text.
+// ===========================================================================
+
+/// A `(name, count)` pair for the grouped breakdowns.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPiiGroup {
+    pub name: String,
+    pub count: u64,
+}
+
+/// A per-kind count, flagged when the kind over-matches on source code so the UI
+/// can show it without letting it inflate the headline.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPiiKind {
+    pub name: String,
+    pub count: u64,
+    pub noisy: bool,
+}
+
+/// One session containing findings, for the drill-down table.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPiiSession {
+    pub session_id: String,
+    pub tool: String,
+    pub label: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub updated_ts: i64,
+    pub findings: u32,
+    /// Of those, how many were in a message the user wrote.
+    pub user_side: u32,
+    pub kinds: Vec<String>,
+}
+
+/// How much of the history the scan could see. Surfaced so the report never
+/// implies it examined sessions it could not reach.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPiiCoverage {
+    /// Sessions preserved in the archive (what was scanned).
+    pub preserved: u32,
+    /// Sessions visible on this machine in total.
+    pub total: u32,
+    /// True when the archive is off, so the report is empty for that reason
+    /// rather than because nothing was found.
+    pub archive_enabled: bool,
+}
+
+/// The whole-history privacy report.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPrivacyReport {
+    pub generated_ts: i64,
+    pub range_ms: i64,
+    pub sessions_with_findings: u32,
+    pub total_findings: u64,
+    /// Findings in messages the user wrote.
+    pub user_side_findings: u64,
+    /// Findings excluding kinds that over-match on code — the number worth
+    /// showing a person.
+    pub high_signal_findings: u64,
+    /// The headline: high-signal findings in messages the user wrote.
+    pub high_signal_user_side: u64,
+    pub by_kind: Vec<AgentPiiKind>,
+    pub by_tool: Vec<AgentPiiGroup>,
+    pub by_project: Vec<AgentPiiGroup>,
+    pub top_sessions: Vec<AgentPiiSession>,
+    pub coverage: AgentPiiCoverage,
+}
+
+// ===========================================================================
+// Unified timeline (`GET /api/timeline`)
+//
+// Saffev sees AI activity two different ways: model calls proxied through it,
+// and coding-agent sessions read off disk. They were separate pages with
+// separate searches, so nobody could ask one question and get one answer. This
+// is the single chronological record of everything AI touched on this machine.
+// ===========================================================================
+
+/// Where a timeline entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimelineKind {
+    /// A model call that went through the proxy.
+    Proxy,
+    /// A coding-agent session read from that tool's own history.
+    Agent,
+}
+
+/// One entry in the unified timeline.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEntry {
+    /// Id, routed back to the right detail view by `kind`.
+    pub id: String,
+    pub kind: TimelineKind,
+    /// When it happened (unix millis).
+    pub ts: i64,
+    /// Where it came from, for the badge: an app name for proxied calls, a tool
+    /// key for agent sessions.
+    pub source: String,
+    /// Human label for `source`.
+    pub label: String,
+    /// One-line description: the endpoint, or the session title.
+    pub title: String,
+    pub model: Option<String>,
+    /// Project, for agent sessions.
+    pub project: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// PII findings recorded against this entry, when known.
+    pub pii_count: u32,
+    /// The exchange failed (transport error or HTTP >= 400).
+    #[serde(default)]
+    pub failed: bool,
+    /// The safety guard flagged this exchange.
+    #[serde(default)]
+    pub safety_flagged: bool,
+    /// A durable copy exists in the archive (agent sessions).
+    #[serde(default)]
+    pub preserved: bool,
+    /// Excerpts explaining a content-search match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<String>,
+}
+
+/// `GET /api/timeline` — the merged record, plus what it could see.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineView {
+    pub entries: Vec<TimelineEntry>,
+    /// Proxied exchanges considered.
+    pub proxy_count: u32,
+    /// Agent sessions considered.
+    pub agent_count: u32,
+    /// True when content search was available (i.e. something is preserved), so
+    /// the UI can say what the search actually covered.
+    pub content_search: bool,
+}
+
+/// `GET /api/archive/verify` — the integrity-chain verdict.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveIntegrityView {
+    /// Entries in the chain.
+    pub entries: u64,
+    /// Distinct sessions covered.
+    pub sessions: u64,
+    /// Everything recomputed correctly and nothing was altered after the fact.
+    pub intact: bool,
+    /// Plain-language description of the first problem found, if any.
+    pub broken_at: Option<String>,
+    /// Sessions whose stored content no longer matches what was recorded.
+    pub altered_sessions: Vec<String>,
+    /// Newest entry digest — the value to record elsewhere to anchor the archive.
+    pub head_digest: Option<String>,
+    pub head_ts: Option<i64>,
+}
+
+/// `POST /api/archive/audit` — where the bundle was written.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditExportResult {
+    pub dir: String,
+    pub sessions: u32,
+    pub errors: u32,
+    pub intact: bool,
+    pub head_digest: Option<String>,
+}
+
 /// Uniform error envelope for any failed `/api/*` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -755,6 +956,14 @@ pub struct AnalyticsReport {
     pub total_requests: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// How much of `total_input_tokens` was ESTIMATED by the bundled tokenizer
+    /// rather than reported by the engine. Surfaced so a headline number is never
+    /// presented as exact when part of it is a guess.
+    #[serde(default)]
+    pub estimated_input_tokens: u64,
+    /// Same, for `total_output_tokens`.
+    #[serde(default)]
+    pub estimated_output_tokens: u64,
     pub p50_latency_ms: Option<u32>,
     pub p90_latency_ms: Option<u32>,
     pub p99_latency_ms: Option<u32>,

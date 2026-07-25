@@ -180,6 +180,21 @@ pub struct MaskingConfig {
     /// regardless of this list.
     #[serde(default)]
     pub kinds: Option<Vec<crate::brain::PiiKind>>,
+    /// Kinds that **stop the request** instead of being masked.
+    ///
+    /// Masking quietly rewrites a secret out of the prompt, which is the right
+    /// default. But some things must never reach a model at all, and for those
+    /// "we replaced it for you" is not an acceptable answer — the user wants to
+    /// know it happened and wants the call to fail.
+    ///
+    /// Empty (the default) means **nothing is ever blocked**. Blocking is only
+    /// ever a deliberate policy decision: it requires `enabled && !dry_run` and an
+    /// explicit kind in this list. No internal error can cause a block — every
+    /// failure path still forwards, so the fail-open invariant is intact.
+    ///
+    /// A blocked kind is not also masked; the request simply does not go.
+    #[serde(default)]
+    pub block_kinds: Vec<crate::brain::PiiKind>,
 }
 
 fn default_true() -> bool {
@@ -192,6 +207,7 @@ impl Default for MaskingConfig {
             enabled: false,
             dry_run: true,
             kinds: None,
+            block_kinds: Vec::new(),
         }
     }
 }
@@ -232,9 +248,21 @@ pub struct EvalConfig {
     #[serde(default)]
     pub quality: bool,
     /// Model the LLM judge asks (on the user's own engine). `None` = use a small
-    /// default. Also the slot a purpose-trained localized guard plugs into.
+    /// default.
     #[serde(default)]
     pub judge_model: Option<String>,
+    /// Model-backed **safety guard** to run alongside the deterministic floor.
+    ///
+    /// This is the slot a purpose-trained localized guard occupies. `None`
+    /// (default) = deterministic floor only. It is **additive**: the floor keeps
+    /// running, because small local guards are unreliable on adversarial input
+    /// and markedly worse on African and other low-resource languages, so a model
+    /// guard adds recall rather than earning trust on its own.
+    ///
+    /// Runs on the user's own engine, under the same concurrency cap as the
+    /// judge, so it can never thrash VRAM.
+    #[serde(default)]
+    pub guard_model: Option<String>,
     /// Max concurrent judge calls — the VRAM-contention guard. Default 1.
     #[serde(default = "default_eval_concurrency")]
     pub max_concurrency: u32,
@@ -261,6 +289,7 @@ impl Default for EvalConfig {
             safety: true,
             quality: false,
             judge_model: None,
+            guard_model: None,
             max_concurrency: default_eval_concurrency(),
             timeout_ms: default_eval_timeout_ms(),
         }
@@ -318,6 +347,21 @@ pub struct ArchiveConfig {
     /// user explicitly wants us to prune — we never do so on our own.
     #[serde(default)]
     pub retention_days: Option<u32>,
+    /// Replace detected secrets with a typed placeholder before writing a session
+    /// into the archive.
+    ///
+    /// **Off by default**, because it is lossy: the archive is meant to be the
+    /// last surviving copy, and redaction permanently removes something the
+    /// source may already have deleted. But leaving it unavailable was worse — the
+    /// proxy side never stores a raw secret while the archive stored complete
+    /// transcripts, secrets included. This closes that gap for people who would
+    /// rather keep a safe copy than a complete one.
+    ///
+    /// Applies to sessions archived from the moment it is switched on; existing
+    /// entries are re-archived (redacted) on the next snapshot, because the change
+    /// key accounts for this setting.
+    #[serde(default)]
+    pub redact: bool,
 }
 
 impl Default for ArchiveConfig {
@@ -326,7 +370,117 @@ impl Default for ArchiveConfig {
             enabled: false,
             auto: false,
             retention_days: None,
+            redact: false,
         }
+    }
+}
+
+/// One entry in the model price table. USD per 1,000,000 tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// Case-insensitive substring matched against the model name. First match in
+    /// list order wins, so put specific names before general ones.
+    #[serde(rename = "match")]
+    pub match_: String,
+    /// Price per 1M input tokens.
+    pub input: f64,
+    /// Price per 1M output tokens.
+    pub output: f64,
+    /// Price per 1M cached-input tokens.
+    #[serde(default)]
+    pub cache: f64,
+}
+
+/// Cost estimation inputs.
+///
+/// These were hardcoded constants, which meant every published price change made
+/// the figures quietly wrong with no way to correct them short of a release.
+/// They are estimates either way — the point of moving them here is that a wrong
+/// number is now the user's to fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingConfig {
+    /// Price table for coding-agent cost estimates. Empty = use the built-in
+    /// defaults ([`PricingConfig::default`]).
+    #[serde(default)]
+    pub models: Vec<ModelPrice>,
+    /// The cloud model the "cost avoided" figure compares local runs against:
+    /// USD per 1M input tokens.
+    #[serde(default = "default_cloud_in")]
+    pub cloud_input_per_m: f64,
+    /// USD per 1M output tokens for that same comparison.
+    #[serde(default = "default_cloud_out")]
+    pub cloud_output_per_m: f64,
+    /// Human label for the comparison baseline, shown next to the figure so the
+    /// number is never presented without saying what it is compared to.
+    #[serde(default = "default_cloud_label")]
+    pub cloud_label: String,
+}
+
+fn default_cloud_in() -> f64 {
+    2.50
+}
+fn default_cloud_out() -> f64 {
+    10.0
+}
+fn default_cloud_label() -> String {
+    "GPT-4o list price".to_string()
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        PricingConfig {
+            models: default_model_prices(),
+            cloud_input_per_m: default_cloud_in(),
+            cloud_output_per_m: default_cloud_out(),
+            cloud_label: default_cloud_label(),
+        }
+    }
+}
+
+/// Built-in price table. Public list prices at the time of writing; correct them
+/// in config rather than waiting for a release.
+pub fn default_model_prices() -> Vec<ModelPrice> {
+    let p = |m: &str, i: f64, o: f64, c: f64| ModelPrice {
+        match_: m.to_string(),
+        input: i,
+        output: o,
+        cache: c,
+    };
+    vec![
+        p("opus", 15.0, 75.0, 1.5),
+        p("sonnet", 3.0, 15.0, 0.3),
+        p("haiku", 1.0, 5.0, 0.1),
+        p("fable", 1.0, 5.0, 0.1),
+        p("gpt-5", 1.25, 10.0, 0.125),
+        p("gpt5", 1.25, 10.0, 0.125),
+        p("gpt-4o", 2.5, 10.0, 0.25),
+        p("gpt-4.1", 2.5, 10.0, 0.25),
+        p("gemini", 1.25, 10.0, 0.125),
+    ]
+}
+
+impl PricingConfig {
+    /// Look up `(input, output, cache)` per-1M prices for a model name.
+    ///
+    /// Locally-run models cost nothing, so they resolve to zero before any table
+    /// lookup — a local model must never show a dollar figure.
+    pub fn lookup(&self, model: &str) -> (f64, f64, f64) {
+        let m = model.to_lowercase();
+        if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") || m.contains(':')
+        {
+            return (0.0, 0.0, 0.0);
+        }
+        let table = if self.models.is_empty() {
+            return Self::default().lookup(model);
+        } else {
+            &self.models
+        };
+        for e in table {
+            if !e.match_.is_empty() && m.contains(&e.match_.to_lowercase()) {
+                return (e.input, e.output, e.cache);
+            }
+        }
+        (0.0, 0.0, 0.0)
     }
 }
 
@@ -379,6 +533,20 @@ pub struct Config {
     /// Opt-in Preservation archive (durable, encrypted copy of agent history).
     #[serde(default)]
     pub archive: ArchiveConfig,
+
+    /// Prices used for the cost estimates. Editable so a published price change
+    /// does not silently make the figures wrong.
+    #[serde(default)]
+    pub pricing: PricingConfig,
+
+    /// Optional path to a **shared team policy** file (see [`crate::policy`]).
+    ///
+    /// A team commits one TOML file to their own repo and everyone points here.
+    /// The policy wins over local settings for the protective fields it states,
+    /// which is the point of having one. `None` (default) = no policy, and no
+    /// behaviour change for anyone working alone. A leading `~` is expanded.
+    #[serde(default)]
+    pub policy_file: Option<PathBuf>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -398,6 +566,8 @@ impl Default for Config {
             masking: MaskingConfig::default(),
             eval: EvalConfig::default(),
             analysis: AnalysisConfig::default(),
+            pricing: PricingConfig::default(),
+            policy_file: None,
             archive: ArchiveConfig::default(),
         }
     }
@@ -1054,8 +1224,21 @@ days = 14
             "a port we are actively holding must not be reported free"
         );
         drop(listener);
+
+        // The port should read free again now. This half is inherently racy under
+        // a parallel test run: the number we just released is an ephemeral one,
+        // and another test binding ephemerally can legitimately claim it in the
+        // gap. That would be a scheduling coincidence, not a bug in
+        // `port_is_free`, so retry briefly and only then treat it as a failure.
+        let freed = (0..20).any(|_| {
+            if port_is_free(loop_back, held) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
         assert!(
-            port_is_free(loop_back, held),
+            freed,
             "the port must be free again once the listener is dropped"
         );
     }
