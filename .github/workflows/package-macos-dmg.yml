@@ -26,6 +26,14 @@
 
 name: Package macOS DMG
 
+# Needed to upload the DMG as a release asset. `release.yml` declares this at the
+# workflow level and reusable workflows inherit it, which is why the sibling
+# notarize job gets away without one. This workflow also runs standalone via
+# workflow_dispatch, where nothing is inherited — without this the build succeeds
+# and the upload fails with "Resource not accessible by integration".
+permissions:
+  contents: write
+
 on:
   workflow_call:
     inputs:
