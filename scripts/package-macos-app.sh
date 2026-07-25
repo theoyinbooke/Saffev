@@ -9,6 +9,11 @@
 # Usage:
 #   scripts/package-macos-app.sh [--sign "Developer ID Application: NAME (TEAMID)"]
 #                                [--notarize KEYCHAIN_PROFILE]
+#                                [--keychain /path/to/signing.keychain-db]
+#
+# --keychain pins which keychain holds the identity and the notarytool profile.
+# Needed in CI, where the certificate is imported into a throwaway keychain rather
+# than the login one. Omit it locally to use the default search list.
 #
 # --notarize requires --sign and a notarytool keychain profile created once via:
 #   xcrun notarytool store-credentials PROFILE \
@@ -22,10 +27,12 @@ cd "$(dirname "$0")/.."
 
 SIGN_ID=""
 NOTARY_PROFILE=""
+KEYCHAIN=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sign)     SIGN_ID="${2:?--sign needs an identity}"; shift 2 ;;
     --notarize) NOTARY_PROFILE="${2:?--notarize needs a keychain profile}"; shift 2 ;;
+    --keychain) KEYCHAIN="${2:?--keychain needs a path}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -112,7 +119,8 @@ fi
 # rejects signatures without a secure timestamp.
 if [[ -n "$SIGN_ID" ]]; then
   echo "==> Codesigning with: $SIGN_ID"
-  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+  codesign --force --options runtime --timestamp \
+    ${KEYCHAIN:+--keychain "$KEYCHAIN"} --sign "$SIGN_ID" "$APP"
   codesign --verify --deep --strict "$APP" && echo "   signature OK"
 fi
 
@@ -127,7 +135,8 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
   ZIP="target/Saffev-$VERSION.zip"
   rm -f "$ZIP"
   ditto -c -k --keepParent "$APP" "$ZIP"
-  xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" \
+    ${KEYCHAIN:+--keychain "$KEYCHAIN"} --wait
   xcrun stapler staple "$APP"
   rm -f "$ZIP"
 
@@ -142,8 +151,9 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
   # Sign the DMG itself (not just the app inside) so Gatekeeper has a usable
   # primary signature on the downloaded image, then notarize + staple it.
   echo "==> Signing + notarizing DMG…"
-  codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
-  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  codesign --force --timestamp ${KEYCHAIN:+--keychain "$KEYCHAIN"} --sign "$SIGN_ID" "$DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
+    ${KEYCHAIN:+--keychain "$KEYCHAIN"} --wait
   xcrun stapler staple "$DMG"
   spctl -a -t open --context context:primary-signature -vv "$DMG" \
     && echo "   DMG notarization OK (Gatekeeper accepts the download)"
@@ -151,6 +161,23 @@ fi
 
 echo ""
 echo "Built $APP"
-[[ -f "$DMG" ]] && echo "Built $DMG  (drag-install: open it, drag Saffev.app to Applications)"
+
+# Only claim the DMG when THIS run actually produced it. The DMG is built inside
+# the --notarize branch above, but `target/` is not cleaned between runs, so a
+# stale image from an earlier version can sit there for months. Reporting "Built
+# <dmg>" because the file merely exists is how a months-old binary gets uploaded
+# under a new release tag — a far worse outcome than having no DMG at all.
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  echo "Built $DMG  (drag-install: open it, drag Saffev.app to Applications)"
+elif [[ -f "$DMG" ]]; then
+  STALE_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+    "$APP/Contents/Info.plist" 2>/dev/null || echo '?')"
+  echo ""
+  echo "NOTE: $DMG exists but was NOT rebuilt by this run (no --notarize)."
+  echo "      It is left over from an earlier build and may contain an older"
+  echo "      version than the $STALE_VER app just built. Do NOT ship it."
+  echo "      Re-run with --sign and --notarize to produce a current DMG."
+fi
+
 echo "  Install:  cp -R \"$APP\" /Applications/  &&  open /Applications/Saffev.app"
 echo "  It appears in the menu bar (no Dock icon). Click it -> Open Saffev Studio."
