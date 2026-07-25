@@ -535,8 +535,26 @@ pub struct ArchivePiiRow {
     pub findings: u32,
     /// Of those, how many were in a message the *user* wrote.
     pub user_side: u32,
-    /// Per (kind, custom label) counts.
-    pub kinds: Vec<(PiiKind, Option<String>, u32)>,
+    /// Per-kind counts, each carrying its own user-side share.
+    pub kinds: Vec<ArchivePiiKind>,
+}
+
+/// One kind's tally within a session.
+///
+/// `user_count` is tracked per kind rather than only per session on purpose. The
+/// headline "you shared N secrets" must count high-signal kinds that the USER
+/// wrote. With only a per-session user total you have to apportion it across
+/// kinds, and any apportioning can attribute a user's noisy IP matches to the
+/// trustworthy kinds, inflating exactly the number the report exists to keep
+/// honest.
+#[derive(Debug, Clone)]
+pub struct ArchivePiiKind {
+    pub kind: PiiKind,
+    pub label: Option<String>,
+    /// Findings of this kind in this session.
+    pub count: u32,
+    /// Of those, how many were in a message the user wrote.
+    pub user_count: u32,
 }
 
 /// Rollup of the archive's footprint (for storage awareness).
@@ -1033,13 +1051,22 @@ impl Store {
                     if f.side == Side::Request {
                         entry.user_side += 1;
                     }
+                    let is_user = f.side == Side::Request;
                     match entry
                         .kinds
                         .iter_mut()
-                        .find(|(k, l, _)| *k == f.kind && *l == f.label)
+                        .find(|k| k.kind == f.kind && k.label == f.label)
                     {
-                        Some((_, _, n)) => *n += 1,
-                        None => entry.kinds.push((f.kind, f.label.clone(), 1)),
+                        Some(k) => {
+                            k.count += 1;
+                            k.user_count += u32::from(is_user);
+                        }
+                        None => entry.kinds.push(ArchivePiiKind {
+                            kind: f.kind,
+                            label: f.label.clone(),
+                            count: 1,
+                            user_count: u32::from(is_user),
+                        }),
                     }
                 }
             }

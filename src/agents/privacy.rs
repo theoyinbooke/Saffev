@@ -169,26 +169,21 @@ pub fn aggregate(rows: &[ArchivePiiRow], range_ms: i64, coverage: Coverage) -> P
             .unwrap_or("(no project)");
         *by_project.entry(project.to_string()).or_insert(0) += r.findings as u64;
 
-        let mut row_noisy = 0u64;
-        for (kind, label, n) in &r.kinds {
-            let noisy = is_noisy_in_code(*kind);
+        for k in &r.kinds {
+            let noisy = is_noisy_in_code(k.kind);
             let e = by_kind
-                .entry(kind_name(*kind, label.as_deref()))
+                .entry(kind_name(k.kind, k.label.as_deref()))
                 .or_insert((0, noisy));
-            e.0 += *n as u64;
-            if noisy {
-                row_noisy += *n as u64;
-            } else {
-                high_signal += *n as u64;
+            e.0 += k.count as u64;
+            if !noisy {
+                high_signal += k.count as u64;
+                // Exact, because each kind carries its own user-side count. An
+                // earlier version apportioned the session's user total across
+                // kinds, which could credit a user's noisy IP matches to the
+                // trustworthy ones and inflate the headline this number exists
+                // to keep honest.
+                high_signal_user += k.user_count as u64;
             }
-        }
-        // The per-session split of user vs assistant is not tracked per kind, so
-        // apportion it by the row's high-signal share rather than inventing
-        // precision we do not have.
-        let row_total = r.findings as u64;
-        if row_total > 0 {
-            let hs = row_total.saturating_sub(row_noisy);
-            high_signal_user += (r.user_side as u64).min(hs);
         }
     }
 
@@ -199,7 +194,7 @@ pub fn aggregate(rows: &[ArchivePiiRow], range_ms: i64, coverage: Coverage) -> P
             let mut kinds: Vec<(String, u32)> = r
                 .kinds
                 .iter()
-                .map(|(k, l, n)| (kind_name(*k, l.as_deref()), *n))
+                .map(|k| (kind_name(k.kind, k.label.as_deref()), k.count))
                 .collect();
             kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             SessionFindings {
@@ -318,7 +313,7 @@ mod tests {
         project: Option<&str>,
         findings: u32,
         user_side: u32,
-        kinds: &[(PiiKind, u32)],
+        kinds: &[(PiiKind, u32, u32)],
     ) -> ArchivePiiRow {
         ArchivePiiRow {
             session_id: id.into(),
@@ -328,7 +323,15 @@ mod tests {
             updated_ts: 1000,
             findings,
             user_side,
-            kinds: kinds.iter().map(|(k, n)| (*k, None, *n)).collect(),
+            kinds: kinds
+                .iter()
+                .map(|(k, n, u)| crate::store::ArchivePiiKind {
+                    kind: *k,
+                    label: None,
+                    count: *n,
+                    user_count: *u,
+                })
+                .collect(),
         }
     }
 
@@ -341,7 +344,7 @@ mod tests {
                 Some("/one"),
                 5,
                 4,
-                &[(PiiKind::ApiKey, 3), (PiiKind::Email, 2)],
+                &[(PiiKind::ApiKey, 3, 3), (PiiKind::Email, 2, 1)],
             ),
             row(
                 "codex:b",
@@ -349,9 +352,9 @@ mod tests {
                 Some("/two"),
                 2,
                 0,
-                &[(PiiKind::Email, 2)],
+                &[(PiiKind::Email, 2, 0)],
             ),
-            row("codex:c", "codex", None, 1, 1, &[(PiiKind::ApiKey, 1)]),
+            row("codex:c", "codex", None, 1, 1, &[(PiiKind::ApiKey, 1, 1)]),
         ];
         let r = aggregate(
             &rows,
@@ -397,7 +400,12 @@ mod tests {
     #[test]
     fn custom_patterns_keep_their_label() {
         let mut r = row("codex:a", "codex", None, 1, 1, &[]);
-        r.kinds = vec![(PiiKind::Custom, Some("Employee ID".into()), 2)];
+        r.kinds = vec![crate::store::ArchivePiiKind {
+            kind: PiiKind::Custom,
+            label: Some("Employee ID".into()),
+            count: 2,
+            user_count: 2,
+        }];
         let out = aggregate(&[r], 0, Coverage::default());
         assert_eq!(out.by_kind[0].name, "Employee ID");
         assert_eq!(out.top_sessions[0].kinds, vec!["Employee ID".to_string()]);
@@ -414,9 +422,9 @@ mod tests {
             104,
             104,
             &[
-                (PiiKind::IpAddress, 80),
-                (PiiKind::Phone, 20),
-                (PiiKind::ApiKey, 4),
+                (PiiKind::IpAddress, 80, 80),
+                (PiiKind::Phone, 20, 20),
+                (PiiKind::ApiKey, 4, 4),
             ],
         )];
         let r = aggregate(&rows, 0, Coverage::default());
@@ -430,6 +438,57 @@ mod tests {
         assert!(!r.by_kind[0].noisy);
         assert!(r.by_kind[1].noisy && r.by_kind[2].noisy);
         assert_eq!(r.by_kind[1].name, "IP address");
+    }
+
+    /// The headline number must not borrow user-side credit from noisy kinds.
+    ///
+    /// The case that caught this: a session where the user pasted a pile of
+    /// things that merely LOOK like IPs and phones, while the only trustworthy
+    /// findings came from the model's replies. An earlier version apportioned the
+    /// session's user total across kinds and reported those API keys as "you
+    /// shared", which is precisely the inflation this report exists to avoid.
+    #[test]
+    fn the_headline_never_credits_noisy_user_findings_to_trustworthy_kinds() {
+        let rows = vec![row(
+            "claude_code:a",
+            "claude_code",
+            None,
+            104,
+            100, // 100 user-side findings in this session...
+            &[
+                (PiiKind::IpAddress, 80, 80), // ...but 80 of them are IP noise,
+                (PiiKind::Phone, 20, 20),     // ...and 20 are phone noise.
+                (PiiKind::ApiKey, 4, 0),      // The real keys came from the model.
+            ],
+        )];
+        let r = aggregate(&rows, 0, Coverage::default());
+
+        assert_eq!(r.high_signal_findings, 4, "4 API keys are present");
+        assert_eq!(
+            r.high_signal_user_side, 0,
+            "none of them were written by the user, so the headline must be 0"
+        );
+        // The raw tallies stay available and unchanged.
+        assert_eq!(r.total_findings, 104);
+        assert_eq!(r.user_side_findings, 100);
+    }
+
+    #[test]
+    fn the_headline_counts_trustworthy_kinds_the_user_did_write() {
+        let rows = vec![row(
+            "codex:a",
+            "codex",
+            None,
+            10,
+            6,
+            &[
+                (PiiKind::ApiKey, 4, 3), // 3 of 4 keys pasted by the user
+                (PiiKind::IpAddress, 6, 3),
+            ],
+        )];
+        let r = aggregate(&rows, 0, Coverage::default());
+        assert_eq!(r.high_signal_findings, 4);
+        assert_eq!(r.high_signal_user_side, 3);
     }
 
     #[test]

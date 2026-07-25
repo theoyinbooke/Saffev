@@ -112,7 +112,7 @@ impl DeterministicGuard {
 ///
 /// ## If your guard calls a model
 /// Use [`ModelGuard`] as the reference. One non-obvious constraint: the backend
-/// the proxy injects forces Ollama\'s `format:"json"` (it is what stops small
+/// the proxy injects forces Ollama's `format:"json"` (it is what stops small
 /// "thinking" models returning empty content), so **prompt for JSON and parse
 /// JSON**. Ask for a bare line and you will silently receive JSON instead.
 #[async_trait::async_trait]
@@ -229,22 +229,59 @@ fn build_guard_prompt(text: &str) -> String {
     )
 }
 
-/// Parse a guard reply leniently. Small models rarely answer exactly as asked, so
-/// anything that is not a recognizable "unsafe" verdict is treated as no finding
-/// rather than guessed at.
+/// Parse a guard reply.
+///
+/// The backend forces JSON, so JSON is the contract and is tried first. The text
+/// fallback exists only for a model that ignored the format, and it is
+/// deliberately STRICT: an earlier version treated any occurrence of the
+/// substring "unsafe" as a verdict, which flagged `"not unsafe"` and any reply
+/// that merely echoed the prompt (which itself contains the word). A guard that
+/// cries wolf on its own instructions is worse than no guard.
+///
+/// Anything that is not a clear unsafe verdict yields no finding. Absence of a
+/// hit is not an assertion of safety, it is just an absence.
 fn parse_guard_reply(reply: &str) -> Vec<GuardHit> {
-    let lower = reply.trim().to_lowercase();
-    if lower.is_empty() {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
         return Vec::new();
     }
-    // Only an explicit unsafe verdict produces a finding.
-    let Some(idx) = lower.find("unsafe") else {
+
+    // The contract: {"verdict": "...", "category": "..."}
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let verdict = v
+            .get("verdict")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        if verdict != "unsafe" {
+            return Vec::new();
+        }
+        let category = v
+            .get("category")
+            .and_then(|x| x.as_str())
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| KNOWN_CATEGORIES.contains(&c.as_str()))
+            .unwrap_or_else(|| "unspecified".to_string());
+        return vec![GuardHit {
+            category,
+            verdict: VERDICT_FLAGGED.to_string(),
+            score: None,
+        }];
+    }
+
+    // Fallback: only a reply whose FIRST meaningful token is "unsafe" counts.
+    // That rules out negations and prompt echoes without trying to parse English.
+    let first_line = trimmed.lines().next().unwrap_or_default().to_lowercase();
+    let head = first_line
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    if !head.starts_with("unsafe") {
         return Vec::new();
-    };
-    let tail = &lower[idx + "unsafe".len()..];
+    }
     let category = KNOWN_CATEGORIES
         .iter()
-        .find(|c| tail.contains(*c) || lower.contains(*c))
+        .find(|c| first_line.contains(*c))
         .copied()
         .unwrap_or("unspecified");
     vec![GuardHit {
@@ -360,10 +397,14 @@ mod socket_tests {
     }
 
     #[tokio::test]
-    async fn a_model_guard_reports_a_category() {
+    async fn a_model_guard_reports_a_category_from_json() {
         let g = ModelGuard::new("some-guard:1b");
+        // The contract: the backend forces JSON, so this is the real shape.
         let hits = g
-            .scan_with(&Canned(Some("unsafe: weapons".into())), "…")
+            .scan_with(
+                &Canned(Some(r#"{"verdict":"unsafe","category":"weapons"}"#.into())),
+                "…",
+            )
             .await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].category, "weapons");
@@ -373,10 +414,49 @@ mod socket_tests {
     #[tokio::test]
     async fn a_model_guard_flags_nothing_when_it_says_safe() {
         let g = ModelGuard::new("m");
-        assert!(g
-            .scan_with(&Canned(Some("safe".into())), "hello")
-            .await
-            .is_empty());
+        for reply in [r#"{"verdict":"safe"}"#, "safe", "{}"] {
+            assert!(
+                g.scan_with(&Canned(Some(reply.into())), "hello")
+                    .await
+                    .is_empty(),
+                "reply {reply:?} must not flag"
+            );
+        }
+    }
+
+    /// The false-positive cases that made the first parser unusable: it matched
+    /// the substring "unsafe" ANYWHERE, so a negation, or a model echoing its own
+    /// instructions back (the prompt contains the word "unsafe"), produced a
+    /// finding. A guard that cries wolf on its own prompt is worse than no guard.
+    #[tokio::test]
+    async fn negations_and_prompt_echoes_do_not_flag() {
+        let g = ModelGuard::new("m");
+        for reply in [
+            "not unsafe",
+            "This content is not unsafe.",
+            r#"{"verdict":"not unsafe"}"#,
+            "You are a content safety classifier. Decide whether the CONTENT below is unsafe.",
+            "The text does not appear unsafe to me.",
+        ] {
+            assert!(
+                g.scan_with(&Canned(Some(reply.into())), "x")
+                    .await
+                    .is_empty(),
+                "reply {reply:?} must NOT be read as an unsafe verdict"
+            );
+        }
+    }
+
+    /// A model that ignores the JSON format is still understood, but only when it
+    /// actually leads with a verdict.
+    #[tokio::test]
+    async fn a_plain_text_verdict_still_works() {
+        let g = ModelGuard::new("m");
+        let hits = g
+            .scan_with(&Canned(Some("unsafe: weapons".into())), "x")
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "weapons");
     }
 
     /// Fail-open is the load-bearing property: a guard that cannot run must never
@@ -396,7 +476,7 @@ mod socket_tests {
             .is_empty());
         // Empty input is never sent to the model at all.
         assert!(g
-            .scan_with(&Canned(Some("unsafe: violence".into())), "   ")
+            .scan_with(&Canned(Some(r#"{"verdict":"unsafe"}"#.into())), "   ")
             .await
             .is_empty());
     }
@@ -405,7 +485,12 @@ mod socket_tests {
     async fn an_unrecognized_category_is_kept_but_labelled() {
         let g = ModelGuard::new("m");
         let hits = g
-            .scan_with(&Canned(Some("unsafe: something_new".into())), "x")
+            .scan_with(
+                &Canned(Some(
+                    r#"{"verdict":"unsafe","category":"something_new"}"#.into(),
+                )),
+                "x",
+            )
             .await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].category, "unspecified");
