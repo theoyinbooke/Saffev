@@ -1,0 +1,55 @@
+# Saffev team policy — commit this file to your own repository.
+#
+# One file, agreed by a team, honored locally by every install. There is no
+# server, no account, and no sync: each person points their Saffev at this file
+# and their machine enforces it. Nothing about their activity is reported
+# anywhere, because reporting would mean shipping it somewhere, which is the one
+# thing Saffev does not do.
+#
+# To use it, add this to each person's saffev.toml:
+#
+#     policy_file = "~/work/our-repo/saffev-policy.toml"
+#
+# Settings named here become read-only in the Studio. A rule an individual can
+# quietly switch off is not a policy.
+
+version = 1
+description = "Acme engineering — AI usage policy"
+
+[masking]
+# Turn detection on for everyone.
+enabled = true
+
+# Leave dry-run to actually protect people. While dry_run = true, Saffev only
+# RECORDS what it would have done and changes nothing. That is the right place to
+# start: run for a week, look at Analytics to see what would have been masked or
+# blocked, then set this to false.
+dry_run = false
+
+# Which kinds to redact before a prompt reaches a model. Omit this line entirely
+# to cover all high-confidence kinds (email, card, API key, IP, phone).
+# kinds = ["email", "credit_card", "api_key"]
+
+# Which kinds must never reach a model AT ALL. These requests are stopped and the
+# calling app gets a clear error explaining why.
+#
+# Start with api_key and probably stay there. It is entropy-validated, so false
+# positives are rare, and a leaked credential is the failure worth being strict
+# about. Blocking email or phone is not recommended: those detectors are
+# pattern-only and a wrongly blocked request is far more disruptive than a
+# wrongly flagged one.
+block_kinds = ["api_key"]
+
+# Shared patterns for things only your team knows are sensitive. These are ADDED
+# to whatever each person has configured locally; their own patterns are kept.
+#
+# `regex` is RE2-style (the Rust `regex` crate). A pattern that does not compile
+# is a policy error and Saffev will refuse the whole file rather than quietly
+# protect nothing.
+[[custom_patterns]]
+name = "Employee ID"
+regex = "EMP-[0-9]{6}"
+
+[[custom_patterns]]
+name = "Internal ticket"
+regex = "ACME-[0-9]{4,6}"

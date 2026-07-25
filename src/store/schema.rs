@@ -164,6 +164,72 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_archived_updated ON archived_sessions(updated_ts);
     CREATE INDEX idx_archived_tool ON archived_sessions(tool, source_id);
     "#,
+    // --- v6: full-text search over preserved transcripts ---
+    //
+    // An archive you cannot search is a warehouse with the lights off. Until now
+    // a session could only be found by its title, project, or model — never by
+    // what was actually said in it. This is the index that fixes that.
+    //
+    // A standalone (not external-content) FTS5 table keeps the triggers trivial
+    // and survives the archive's DELETE-then-INSERT upsert without special
+    // casing. `session_id`/`seq` ride along UNINDEXED purely so a hit can be
+    // mapped back to its session and position without a join.
+    //
+    // The backfill at the end indexes whatever is already archived, so upgrading
+    // users get search over their existing history immediately rather than only
+    // over sessions archived from here on.
+    r#"
+    CREATE VIRTUAL TABLE archived_messages_fts USING fts5(
+        content,
+        session_id UNINDEXED,
+        seq        UNINDEXED,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    CREATE TRIGGER archived_messages_fts_ai AFTER INSERT ON archived_messages BEGIN
+        INSERT INTO archived_messages_fts (rowid, content, session_id, seq)
+        VALUES (new.rowid, new.content, new.session_id, new.seq);
+    END;
+
+    CREATE TRIGGER archived_messages_fts_ad AFTER DELETE ON archived_messages BEGIN
+        DELETE FROM archived_messages_fts WHERE rowid = old.rowid;
+    END;
+
+    CREATE TRIGGER archived_messages_fts_au AFTER UPDATE ON archived_messages BEGIN
+        DELETE FROM archived_messages_fts WHERE rowid = old.rowid;
+        INSERT INTO archived_messages_fts (rowid, content, session_id, seq)
+        VALUES (new.rowid, new.content, new.session_id, new.seq);
+    END;
+
+    INSERT INTO archived_messages_fts (rowid, content, session_id, seq)
+        SELECT rowid, content, session_id, seq FROM archived_messages;
+    "#,
+    // --- v7: tamper-evident archive (the hash chain) ---
+    //
+    // The archive's value is being the last surviving copy of a conversation. That
+    // is only worth something if you can show it was not edited afterwards, so
+    // every write appends one row here, each one committing to the row before it.
+    // Change or remove any entry and every later `entry_digest` stops matching.
+    //
+    // This is an APPEND-ONLY LOG, deliberately separate from `archived_sessions`.
+    // Sessions are upserted (a growing session is re-archived), so chaining the
+    // mutable table itself would break on the first legitimate re-archive. The log
+    // records each archival as an event instead, which re-archiving handles
+    // naturally: you simply see the session archived twice, with both digests.
+    r#"
+    CREATE TABLE archive_log (
+        seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts             INTEGER NOT NULL,
+        session_id     TEXT    NOT NULL,
+        -- SHA-256 over the session's stored content at the moment it was written.
+        content_digest TEXT    NOT NULL,
+        -- The previous entry's `entry_digest` ("" for the first entry).
+        prev_digest    TEXT    NOT NULL,
+        -- SHA-256 over (seq, ts, session_id, content_digest, prev_digest).
+        entry_digest   TEXT    NOT NULL
+    );
+    CREATE INDEX idx_archive_log_session ON archive_log(session_id);
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

@@ -116,6 +116,27 @@ pub async fn forward_streaming(
     // never buffered whole.
     let (forward_bytes, mask_action) = mask_request_body(state, &req_bytes);
 
+    // Policy block: some things must never reach a model at all, and for those
+    // masking ("we quietly replaced it") is the wrong answer. Evaluated here,
+    // before anything is forwarded. Only a deliberate, live policy can stop a
+    // request — see `block_decision`.
+    let cfg = state.config.load();
+    let blocked = block_decision(
+        &cfg.masking,
+        &state.detector,
+        crate::brain::Side::Request,
+        &req_bytes,
+    );
+    let (mask_action, blocked) = match blocked {
+        // Policy names a kind that is present, but masking is still in dry-run:
+        // record the intent and let the request through, exactly like dry-run
+        // masking does. Turning off dry-run is the single explicit step that
+        // makes both masking and blocking real.
+        Some(_) if cfg.masking.dry_run => (MaskAction::WouldBlock, None),
+        Some(kinds) => (MaskAction::Blocked, Some(kinds)),
+        None => (mask_action, None),
+    };
+
     // Tee the request start with the ORIGINAL (unredacted) body so the logger
     // records the true findings + offsets, plus what masking did to the
     // forwarded body. Best-effort; never blocks.
@@ -130,6 +151,30 @@ pub async fn forward_streaming(
             headers: req_headers.clone(),
         },
     );
+
+    // Stop here when policy says so: the engine is never contacted. The exchange
+    // is still closed out on the tee so it appears in Live/History with a clear
+    // reason, rather than hanging as a request that never finished.
+    if let Some(kinds) = blocked {
+        tracing::info!(
+            target: "saffev::policy",
+            kinds = ?kinds,
+            endpoint = %endpoint,
+            "request blocked by policy; not forwarded"
+        );
+        tee_drop_oldest(
+            state,
+            TeeEvent::ResponseFinished {
+                id: id.clone(),
+                ttft_ms: None,
+                total_ms: Some(elapsed_ms(start)),
+                status: Some(StatusCode::FORBIDDEN.as_u16()),
+                error_kind: Some("blocked_by_policy".to_string()),
+                resp_mask_action: MaskAction::Observed,
+            },
+        );
+        return blocked_response(&kinds);
+    }
 
     // Build the upstream URL: base + original path + query, verbatim.
     let path_and_query = parts
@@ -920,6 +965,71 @@ fn mask_body_with(
     (Bytes::from(redacted.into_bytes()), MaskAction::Masked)
 }
 
+/// Decide whether a request must be **stopped** rather than masked.
+///
+/// Returns the kinds that triggered the block, or `None` to proceed.
+///
+/// Blocking is the one place Saffev deliberately interferes with traffic, so the
+/// conditions are narrow and all of them must hold: masking is enabled, it is out
+/// of dry-run, the policy names at least one kind, and that kind is actually
+/// present. Anything else proceeds.
+///
+/// This does **not** weaken fail-open. Fail-open means an *internal error* never
+/// harms the user's traffic; every error path here still forwards. A block is not
+/// an error, it is the user's stated policy being carried out.
+fn block_decision(
+    masking: &crate::config::MaskingConfig,
+    detector: &crate::brain::pii::Detector,
+    side: crate::brain::Side,
+    body: &Bytes,
+) -> Option<Vec<crate::brain::PiiKind>> {
+    if !masking.enabled || masking.block_kinds.is_empty() || body.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(body);
+    let mut hit: Vec<crate::brain::PiiKind> = Vec::new();
+    for f in detector.scan(side, &text) {
+        // Low-confidence guesses never stop a request. Blocking on a maybe would
+        // make the feature unusable and teach people to switch it off.
+        if f.confidence != crate::brain::Confidence::High {
+            continue;
+        }
+        if masking.block_kinds.contains(&f.kind) && !hit.contains(&f.kind) {
+            hit.push(f.kind);
+        }
+    }
+    (!hit.is_empty()).then_some(hit)
+}
+
+/// The response a blocked request gets.
+///
+/// Shaped like an OpenAI-style error object, because that is what the calling SDK
+/// knows how to surface. The point is that the developer sees a clear reason in
+/// their own terminal, not a mysterious hang or an empty completion.
+fn blocked_response(kinds: &[crate::brain::PiiKind]) -> Response {
+    let names: Vec<&str> = kinds.iter().map(crate::brain::pii::kind_key).collect();
+    let message = format!(
+        "Saffev blocked this request: it contains {} that your policy does not allow to be \
+         sent to a model. Nothing was forwarded to the engine. Remove it, or change the \
+         blocked kinds in Saffev Settings.",
+        names.join(" and ")
+    );
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "saffev_policy_block",
+            "code": "pii_blocked",
+            "blocked_kinds": names,
+        }
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Compute the stable hash stored as `requests.request_hash`.
 ///
 /// Uses a non-cryptographic-but-stable FNV-1a digest rendered as hex. We do not
@@ -1083,6 +1193,129 @@ where
 mod tests {
     use super::*;
 
+    // ---- policy blocking -------------------------------------------------
+    //
+    // Blocking is the only place Saffev deliberately stops a user's traffic, so
+    // the tests are about when it must NOT fire at least as much as when it must.
+
+    /// A body carrying an API key that passes the entropy gate.
+    fn body_with_key() -> Bytes {
+        Bytes::from_static(b"{\"prompt\":\"use sk-abc123XYZdef456GHIjkl789MNO please\"}")
+    }
+
+    fn masking(
+        enabled: bool,
+        dry_run: bool,
+        block: Vec<crate::brain::PiiKind>,
+    ) -> crate::config::MaskingConfig {
+        crate::config::MaskingConfig {
+            enabled,
+            dry_run,
+            kinds: None,
+            block_kinds: block,
+        }
+    }
+
+    fn policy_detector() -> crate::brain::pii::Detector {
+        crate::brain::pii::Detector::new(&[]).unwrap()
+    }
+
+    #[test]
+    fn blocks_only_when_policy_is_live_and_names_the_kind() {
+        let body = body_with_key();
+        let side = crate::brain::Side::Request;
+
+        // Live policy naming the present kind: blocked.
+        let hit = block_decision(
+            &masking(true, false, vec![crate::brain::PiiKind::ApiKey]),
+            &policy_detector(),
+            side,
+            &body,
+        );
+        assert_eq!(hit, Some(vec![crate::brain::PiiKind::ApiKey]));
+
+        // Masking disabled entirely: never blocks, whatever the list says.
+        assert!(block_decision(
+            &masking(false, false, vec![crate::brain::PiiKind::ApiKey]),
+            &policy_detector(),
+            side,
+            &body
+        )
+        .is_none());
+
+        // Empty policy: the default, and it must never block.
+        assert!(block_decision(
+            &masking(true, false, vec![]),
+            &policy_detector(),
+            side,
+            &body
+        )
+        .is_none());
+
+        // Policy names a DIFFERENT kind than the one present.
+        assert!(block_decision(
+            &masking(true, false, vec![crate::brain::PiiKind::CreditCard]),
+            &policy_detector(),
+            side,
+            &body
+        )
+        .is_none());
+
+        // Empty body.
+        assert!(block_decision(
+            &masking(true, false, vec![crate::brain::PiiKind::ApiKey]),
+            &policy_detector(),
+            side,
+            &Bytes::new()
+        )
+        .is_none());
+
+        // Clean body.
+        let clean = Bytes::from_static(b"{\"prompt\":\"hello there\"}");
+        assert!(block_decision(
+            &masking(true, false, vec![crate::brain::PiiKind::ApiKey]),
+            &policy_detector(),
+            side,
+            &clean
+        )
+        .is_none());
+    }
+
+    /// Dry-run is the safety catch: the decision is computed, but the caller
+    /// downgrades it to `WouldBlock` and still forwards. `block_decision` itself
+    /// reports the match; the forwarder owns the dry-run downgrade.
+    #[test]
+    fn dry_run_still_reports_the_match_for_the_caller_to_downgrade() {
+        let hit = block_decision(
+            &masking(true, true, vec![crate::brain::PiiKind::ApiKey]),
+            &policy_detector(),
+            crate::brain::Side::Request,
+            &body_with_key(),
+        );
+        assert_eq!(hit, Some(vec![crate::brain::PiiKind::ApiKey]));
+    }
+
+    #[test]
+    fn blocked_response_tells_the_developer_what_happened() {
+        let r = blocked_response(&[
+            crate::brain::PiiKind::ApiKey,
+            crate::brain::PiiKind::CreditCard,
+        ]);
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn blocked_action_maps_to_a_storable_action() {
+        assert_eq!(
+            MaskAction::Blocked.to_pii_action(),
+            crate::store::PiiAction::Blocked
+        );
+        assert_eq!(
+            MaskAction::WouldBlock.to_pii_action(),
+            crate::store::PiiAction::WouldBlock
+        );
+    }
+
     #[test]
     fn hash_body_is_stable_and_hex() {
         let a = Bytes::from_static(b"{\"model\":\"llama3\"}");
@@ -1153,6 +1386,7 @@ mod tests {
             enabled: false,
             dry_run: true,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let body = body_with_pii();
         let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
@@ -1166,6 +1400,7 @@ mod tests {
             enabled: true,
             dry_run: true,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let body = body_with_pii();
         let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
@@ -1188,6 +1423,7 @@ mod tests {
             enabled: true,
             dry_run: false,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let body = body_with_pii();
         let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
@@ -1206,6 +1442,7 @@ mod tests {
             enabled: true,
             dry_run: false,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let body = Bytes::from_static(br#"{"model":"llama3","messages":[]}"#);
         let (out, action) = mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &body);
@@ -1221,6 +1458,7 @@ mod tests {
             enabled: true,
             dry_run: false,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let (out, action) = mask_body_with(
             &cfg,
@@ -1239,6 +1477,7 @@ mod tests {
             enabled: true,
             dry_run: false,
             kinds: Some(vec![crate::brain::PiiKind::IpAddress]),
+            block_kinds: Vec::new(),
         };
         let body =
             Bytes::from_static(br#"{"content":"reach me at jane@example.com via 192.168.1.100"}"#);
@@ -1279,6 +1518,7 @@ mod tests {
             enabled: true,
             dry_run: false,
             kinds: None,
+            block_kinds: Vec::new(),
         };
         let body = Bytes::from_static(
             br#"{"choices":[{"message":{"content":"sure, email jane@example.com"}}]}"#,

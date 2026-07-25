@@ -96,6 +96,11 @@ dirs = "5.0"
 once_cell = "1.19"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tiktoken-rs = "0.11.0"
+# SHA-256 for the archive's tamper-evident integrity chain. The archive is meant
+# to be usable as evidence that a session existed and was not altered, and the
+# non-cryptographic FNV digest used elsewhere (cache keys, request fingerprints)
+# is trivially forgeable — fine for dedup, useless for that claim.
+sha2 = "0.10"
 
 [profile.release]
 strip = true

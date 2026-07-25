@@ -94,6 +94,8 @@ impl StudioServer {
         // The JSON + SSE API subtree. All routes here are control-plane.
         let api = Router::new()
             .route("/health", get(api::health))
+            // The single record: proxied calls + coding-agent sessions, merged.
+            .route("/timeline", get(api::timeline))
             .route("/live", get(api::live))
             .route("/history", get(api::history))
             .route("/history/:id", get(api::history_detail))
@@ -124,10 +126,15 @@ impl StudioServer {
             )
             .route("/agents/sessions/:id/export", get(api::agents_export))
             .route("/agents/analytics", get(api::agents_analytics))
+            // Whole-history privacy report over the preserved archive.
+            .route("/agents/privacy", get(api::agents_privacy))
             // Preservation: trigger a snapshot into the durable archive.
             .route("/archive/run", post(api::archive_run))
             // Preservation: bulk-export all sessions to a folder on disk.
             .route("/archive/export", post(api::archive_export))
+            // Preservation: integrity chain — verify, and export an audit bundle.
+            .route("/archive/verify", get(api::archive_verify))
+            .route("/archive/audit", post(api::archive_audit))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
             // Host checked first (cheapest reject), then token, then CORS

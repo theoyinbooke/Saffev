@@ -31,21 +31,74 @@ pub struct SnapshotSummary {
     pub errors: u32,
 }
 
+/// How a session's text is written into the archive.
+#[derive(Clone)]
+pub struct Redaction {
+    /// When set, detected secrets are replaced with a typed placeholder before
+    /// the transcript is stored.
+    pub detector: Option<std::sync::Arc<crate::brain::pii::Detector>>,
+}
+
+impl Redaction {
+    /// Store transcripts verbatim (the default, and what every existing archive
+    /// contains).
+    pub fn off() -> Self {
+        Self { detector: None }
+    }
+
+    /// Build from config. A detector that fails to compile disables redaction
+    /// rather than silently archiving nothing — but the caller is told, because
+    /// quietly storing raw secrets when the user asked for redaction would be the
+    /// worst possible failure mode.
+    pub fn from_config(cfg: &crate::config::Config) -> crate::Result<Self> {
+        if !cfg.archive.redact {
+            return Ok(Self::off());
+        }
+        let d = crate::brain::pii::Detector::new(&cfg.custom_patterns)?;
+        Ok(Self {
+            detector: Some(std::sync::Arc::new(d)),
+        })
+    }
+
+    fn is_on(&self) -> bool {
+        self.detector.is_some()
+    }
+
+    /// Redact one message body, returning the text to store.
+    fn apply(&self, role: Role, text: &str) -> String {
+        let Some(d) = self.detector.as_ref() else {
+            return text.to_string();
+        };
+        let side = if role == Role::User {
+            crate::brain::Side::Request
+        } else {
+            crate::brain::Side::Response
+        };
+        let findings = d.scan(side, text);
+        if findings.is_empty() {
+            return text.to_string();
+        }
+        // `None` = all high-confidence kinds. Low-confidence spans are never
+        // masked, so a loose guess can't eat real content.
+        crate::brain::pii::mask(text, &findings, None).0
+    }
+}
+
 /// Run one incremental snapshot into the archive. Off the hot path; heavy parsing
 /// happens on the blocking pool.
-pub async fn run_snapshot(store: &Store) -> crate::Result<SnapshotSummary> {
+pub async fn run_snapshot(store: &Store, redaction: Redaction) -> crate::Result<SnapshotSummary> {
     // Existing archive summaries (with content_hash + source_path + deleted flag)
     // drive both the incremental skip and accurate deletion detection.
     let existing = store.archived_sessions().await.unwrap_or_default();
     let store2 = store.clone();
-    let summary = tokio::task::spawn_blocking(move || build(&store2, existing))
+    let summary = tokio::task::spawn_blocking(move || build(&store2, existing, &redaction))
         .await
         .map_err(|e| crate::Error::Store(format!("archive join: {e}")))?;
     store.flush().await?;
     Ok(summary)
 }
 
-fn build(store: &Store, existing: Vec<ArchivedSession>) -> SnapshotSummary {
+fn build(store: &Store, existing: Vec<ArchivedSession>, redaction: &Redaction) -> SnapshotSummary {
     let now = super::now_ms();
     let sessions = super::all_sessions();
     let mut seen: HashSet<String> = HashSet::with_capacity(sessions.len());
@@ -55,7 +108,7 @@ fn build(store: &Store, existing: Vec<ArchivedSession>) -> SnapshotSummary {
 
     for s in &sessions {
         seen.insert(s.id.clone());
-        let hash = content_hash(s);
+        let hash = content_hash(s, redaction.is_on());
         if let Some(a) = by_id.get(s.id.as_str()) {
             if a.content_hash == hash {
                 summary.skipped += 1;
@@ -71,7 +124,7 @@ fn build(store: &Store, existing: Vec<ArchivedSession>) -> SnapshotSummary {
         }
         match super::detail(&s.id) {
             Some(d) => {
-                let archived = to_archived(&d, &hash, now);
+                let archived = to_archived(&d, &hash, now, redaction);
                 if store
                     .enqueue_blocking(WriteOp::ArchiveSession(Box::new(archived)))
                     .is_ok()
@@ -118,15 +171,20 @@ fn source_is_gone(source_path: &str) -> bool {
 /// Cheap change key from list metadata — changes whenever a session grows or is
 /// touched, so unchanged sessions skip re-parsing. Stable (FNV-1a) so it compares
 /// correctly across daemon restarts.
-fn content_hash(s: &AgentSession) -> String {
+///
+/// `redacted` is part of the key on purpose. Turning redaction on has to rewrite
+/// what is already stored, otherwise the user flips the switch, sees no error,
+/// and keeps a pile of unredacted transcripts that they now believe are safe.
+fn content_hash(s: &AgentSession, redacted: bool) -> String {
     fnv1a_hex(&format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|r{}",
         s.updated_ts,
         s.message_count,
         s.tool_call_count,
         s.input_tokens,
         s.output_tokens,
-        s.cache_tokens
+        s.cache_tokens,
+        u8::from(redacted)
     ))
 }
 
@@ -139,7 +197,12 @@ fn fnv1a_hex(s: &str) -> String {
     format!("{h:016x}")
 }
 
-fn to_archived(d: &AgentSessionDetail, hash: &str, now: i64) -> ArchivedSession {
+fn to_archived(
+    d: &AgentSessionDetail,
+    hash: &str,
+    now: i64,
+    redaction: &Redaction,
+) -> ArchivedSession {
     let s = &d.session;
     let source_id = super::split_id(&s.id)
         .map(|(_, r)| r.to_string())
@@ -163,15 +226,19 @@ fn to_archived(d: &AgentSessionDetail, hash: &str, now: i64) -> ArchivedSession 
         content_hash: hash.to_string(),
         archived_ts: now,
         source_deleted: false,
-        messages: d.messages.iter().map(msg_to_archived).collect(),
+        messages: d
+            .messages
+            .iter()
+            .map(|m| msg_to_archived(m, redaction))
+            .collect(),
     }
 }
 
-fn msg_to_archived(m: &AgentMessage) -> ArchivedMessage {
+fn msg_to_archived(m: &AgentMessage, redaction: &Redaction) -> ArchivedMessage {
     ArchivedMessage {
         role: role_str(m.role).to_string(),
         kind: kind_str(m.kind).to_string(),
-        content: m.content.clone(),
+        content: redaction.apply(m.role, &m.content),
         ts: m.ts,
         tool_name: m.tool_name.clone(),
     }
@@ -215,6 +282,91 @@ mod tests {
         let _ = std::fs::remove_file(&f);
     }
 
+    fn redacting() -> Redaction {
+        Redaction {
+            detector: Some(std::sync::Arc::new(
+                crate::brain::pii::Detector::new(&[]).unwrap(),
+            )),
+        }
+    }
+
+    #[test]
+    fn redaction_removes_secrets_but_keeps_the_conversation() {
+        let r = redacting();
+        let text = "deploy with sk-abc123XYZdef456GHIjkl789MNO and mail ops@example.com";
+        let out = r.apply(Role::User, text);
+
+        // The secret and the address are gone...
+        assert!(!out.contains("sk-abc123XYZdef456GHIjkl789MNO"), "{out}");
+        assert!(!out.contains("ops@example.com"), "{out}");
+        // ...but the surrounding text (the reason to keep the session) survives.
+        assert!(out.contains("deploy with"), "{out}");
+        assert!(out.contains("and mail"), "{out}");
+    }
+
+    #[test]
+    fn redaction_off_is_byte_for_byte_verbatim() {
+        let text = "token sk-abc123XYZdef456GHIjkl789MNO stays";
+        assert_eq!(Redaction::off().apply(Role::User, text), text);
+    }
+
+    #[test]
+    fn redaction_leaves_clean_text_untouched() {
+        let out = redacting().apply(Role::Assistant, "just some ordinary prose");
+        assert_eq!(out, "just some ordinary prose");
+    }
+
+    /// Turning redaction on must invalidate what is already archived, or the user
+    /// flips the switch and unknowingly keeps raw transcripts.
+    #[test]
+    fn toggling_redaction_forces_a_re_archive() {
+        let s = AgentSession {
+            id: AgentSession::make_id(super::super::AgentTool::Codex, "x"),
+            tool: super::super::AgentTool::Codex,
+            title: None,
+            project: None,
+            git_branch: None,
+            model: None,
+            started_ts: 1,
+            updated_ts: 100,
+            message_count: 4,
+            tool_call_count: 2,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_tokens: 0,
+            source_path: String::new(),
+        };
+        assert_ne!(content_hash(&s, false), content_hash(&s, true));
+        assert_eq!(content_hash(&s, true), content_hash(&s, true));
+    }
+
+    #[test]
+    fn redaction_from_config_is_off_by_default() {
+        let cfg = crate::config::Config::default();
+        assert!(!Redaction::from_config(&cfg).unwrap().is_on());
+    }
+
+    #[test]
+    fn redaction_from_config_turns_on_when_asked() {
+        let mut cfg = crate::config::Config::default();
+        cfg.archive.redact = true;
+        assert!(Redaction::from_config(&cfg).unwrap().is_on());
+    }
+
+    /// A pattern that will not compile must surface as an error, so the caller
+    /// can refuse to archive rather than store raw text under a "redact" setting.
+    #[test]
+    fn redaction_from_config_errors_on_a_bad_pattern() {
+        let mut cfg = crate::config::Config::default();
+        cfg.archive.redact = true;
+        cfg.custom_patterns = vec![crate::config::CustomPattern {
+            name: "broken".into(),
+            regex: "([unclosed".into(),
+            confidence: Default::default(),
+        }];
+        assert!(Redaction::from_config(&cfg).is_err());
+    }
+
     #[test]
     fn hash_is_stable_and_sensitive() {
         let mut s = AgentSession {
@@ -233,10 +385,10 @@ mod tests {
             cache_tokens: 0,
             source_path: String::new(),
         };
-        let h1 = content_hash(&s);
-        assert_eq!(h1, content_hash(&s)); // stable
+        let h1 = content_hash(&s, false);
+        assert_eq!(h1, content_hash(&s, false)); // stable
         s.message_count = 5;
-        assert_ne!(h1, content_hash(&s)); // sensitive to growth
+        assert_ne!(h1, content_hash(&s, false)); // sensitive to growth
     }
 
     /// Manual: archives the real machine into a temp store, then re-runs (must be
@@ -248,7 +400,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("saffev-archive-{}.db", uuid::Uuid::new_v4()));
         let store = Store::open(&path).await.unwrap();
 
-        let r1 = run_snapshot(&store).await.unwrap();
+        let r1 = run_snapshot(&store, Redaction::off()).await.unwrap();
         eprintln!("run1: {r1:?}");
         let st = store.archive_stats().await.unwrap();
         eprintln!(
@@ -258,7 +410,7 @@ mod tests {
             st.bytes as f64 / 1e6
         );
 
-        let r2 = run_snapshot(&store).await.unwrap();
+        let r2 = run_snapshot(&store, Redaction::off()).await.unwrap();
         eprintln!("run2 (expect all skipped): {r2:?}");
         assert_eq!(r2.archived, 0, "unchanged sessions must be skipped");
         assert!(st.count > 0, "should have archived something");

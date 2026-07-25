@@ -1,14 +1,41 @@
-# Saffev — local ai studio
+# Saffev — the black box recorder for AI on your machine
 
-Saffev is a single Rust binary that sits transparently **in front of a local LLM
-engine** (Ollama on `127.0.0.1:11434`, LM Studio later) and **observes** its
-traffic on-device. It is a reverse proxy + a local web "Studio" that lets you
-see, structure, and protect everything your local models send and receive —
-without ever leaving the machine and without changing what the engine returns.
+**Saffev remembers what every AI tool on your computer did, protects what you did
+not mean to share, and keeps the record even after those tools throw theirs away.**
 
-It is the **passive core** of a larger vision: usable today with zero research
-dependency, with a pluggable judgment interface that later guard/eval work plugs
-into.
+It is one Rust binary and a local web Studio. Nothing is uploaded, nothing is
+sent to us, and there is no account. Three things it does:
+
+### See
+
+Every model call your apps make, recorded on this machine: which app, which
+model, how long it took, what it cost, what failed. Plus every coding session
+from Claude Code, Codex, Cursor, OpenCode, and VS Code Copilot, read straight
+from the files those tools already write. One **Timeline** shows all of it
+together, and one search box looks through all of it at once, including what was
+actually said inside your conversations.
+
+### Protect
+
+An on-device detector finds personal data and credentials in your traffic. It can
+show you where they are, quietly replace them before they reach a model, or stop
+the request entirely for the things that must never be sent. There is a
+whole-history **Privacy report** that answers the question people actually have:
+*what have I been pasting into AI tools, and where?*
+
+### Keep
+
+This is the part nobody else does. Your AI coding tools delete their own history
+on their own clocks (Claude Code prunes transcripts after about 30 days, Cursor
+rotates its store). You are not warned and you cannot get it back. Saffev shows
+you what is scheduled to disappear and keeps an encrypted copy that survives it,
+with a tamper-evident record so you can prove a session was not altered
+afterwards. Export any of it to Markdown or JSON at any time. It is your data.
+
+> **Positioning.** Cloud observability tools watch the app *you are building* and
+> need you to instrument your code. Enterprise DLP sits on the network and belongs
+> to IT. Saffev watches the *machine you are sitting at*, needs no instrumentation,
+> and never phones home.
 
 ## Install
 
@@ -187,20 +214,36 @@ front of your inference path:
 - **Privacy true by default.** The database stores **metadata only**; raw
   prompt/response text is written only behind an explicit, logged opt-in
   (`payload_storage`). Detected PII is **hashed**, never stored raw.
-- **Nothing leaves the device.** The only outbound network calls are to the local
-  engine on loopback and — only when you ask for it (or on Studio load) — an
-  anonymous check of **GitHub release metadata** for the in-app updater. That
-  check sends nothing about you or your traffic; it just asks "what's the latest
-  version?" See **Updating in place** above.
+- **Nothing leaves the device**, with exactly two exceptions, both named here
+  rather than buried:
+  1. The **update check** contacts GitHub release metadata to ask "what is the
+     latest version?" It sends nothing about you or your traffic.
+  2. The optional **AI summary** sends one session's text to OpenAI through your
+     own Codex sign-in. It is **off by default**, it happens **only when you
+     click the button**, and the button says so before you press it. This is the
+     one path where your content is transmitted. If that is not acceptable, leave
+     it off and everything else still works.
+
+  There are no other outbound calls except to your local engine on loopback.
 - **Observe by default.** Traffic is never mutated unless you explicitly opt in
   to PII masking *and* leave dry-run. Masking is fail-open: any error forwards the
   original request untouched.
+- **Blocking is never accidental.** A request is only ever stopped when you have
+  enabled masking, left dry-run, *and* named that kind of data as blockable. No
+  internal error can block traffic; every failure path still forwards.
 
-## What's new in v1
+## What's new
 
-v1 builds on the passive core with seven shipped features, all preserving the
-invariants above (fail-open, on-device, observe-by-default, transparent
-streaming):
+The most recent work, on top of everything below: the unified **Timeline**,
+**full-text search** inside preserved conversations, the whole-history **privacy
+report**, **redaction on preservation**, **blocking** as an alternative to
+masking, and a **tamper-evident archive** with an audit bundle. Listing a large
+history also went from ~27 seconds to ~30 milliseconds, and a token
+double-counting bug that overstated estimated cost more than tenfold is fixed.
+
+Before that, v1 built on the passive core with seven shipped features, all
+preserving the invariants above (fail-open, on-device, observe-by-default,
+transparent streaming):
 
 - **At-rest encryption ON by default.** The stock build links bundled SQLCipher;
   the database is encrypted with a key from the OS keyring (or `SAFFEV_DB_KEY`).
@@ -262,15 +305,30 @@ Codex (`~/.codex/sessions/**/rollout-*.jsonl`), OpenCode (`opencode.db`), Cursor
 (`state.vscdb`), and VS Code / GitHub Copilot Chat (`workspaceStorage/**/
 chatSessions/*.jsonl`). Each session and message is **tagged with its source**;
 SQLite stores are read via a read-only snapshot that never touches the live DB.
-DB/file reads are cached by a stat-only fingerprint, so repeat page loads are
-instant and only re-parse when a source file actually changes.
+Reads are cached per file, keyed on modification time and size, so a finished
+session is parsed once and never re-read. (This matters: on a real 521-session
+history, listing took **27 seconds** before that cache and takes about **30
+milliseconds** after it. The cache is warmed in the background at startup, so
+your first visit to the page is fast too.)
 
 - **See everything, per tool.** Sessions, models, message/tool-call counts, token
-  usage, and an estimated cloud-cost-avoided figure, in a per-tool table plus a
-  searchable, source-tagged session list with a full-transcript drawer.
-- **Privacy lens.** The on-device PII detector scans each transcript for what you
-  pasted into the agent (emails, cards, API keys, IPs, phones) — offsets + a
-  stable hash only, never the raw secret.
+  usage, and estimated cost, in a per-tool table plus a source-tagged session list
+  with a full-transcript drawer.
+- **Search what was actually said.** A full-text index over your preserved
+  transcripts, so you can find a conversation by its content rather than guessing
+  at its title. Results show the matching excerpts inline. Titles and projects are
+  always searchable; searching *inside* conversations covers preserved sessions,
+  and the UI says so rather than pretending otherwise.
+- **Privacy report.** A whole-history answer to "where did I leak a secret?",
+  broken down by kind, tool and project, with the sessions to go and look at.
+  Counts and kinds only, never the secret itself.
+
+  It deliberately separates what is worth trusting from what is not. IP and phone
+  detection is pattern-only, and source code is full of version strings, ports and
+  numeric ids that look just like them. On a real archive those two were **83%**
+  of all matches while API keys were 0.1%. So they are shown, clearly marked as
+  low confidence, and kept out of the headline number. A privacy tool that claims
+  eleven thousand leaks teaches you to ignore it.
 - **Preservation (opt-in, off by default).** These tools delete their own history
   on their own clocks (Claude Code prunes after `cleanupPeriodDays`, default 30;
   Cursor rotates its DB). Saffev surfaces **what is scheduled for deletion** per
@@ -279,6 +337,23 @@ instant and only re-parse when a source file actually changes.
   incremental (unchanged sessions are skipped), never mutates source files, and
   flags but never deletes sessions the source has removed ("resurrected" from the
   archive). Our own retention defaults to keep-forever.
+- **Redaction on preservation (opt-in).** By default the archive keeps transcripts
+  exactly as they were, secrets included. Turn this on and detected secrets are
+  replaced with a placeholder before anything is stored, so you keep a safe copy
+  rather than a complete one. It is lossy on purpose, the setting says so, and
+  switching it on re-archives what you already have so you are never left with old
+  raw transcripts you believe are safe.
+- **Tamper-evident.** Every preservation appends an entry to an append-only log,
+  each committing to a SHA-256 digest of the session's content *and* to the entry
+  before it. Change or remove anything and the chain stops verifying. The Agents
+  page shows the verdict and a head digest you can record elsewhere to anchor your
+  archive at a point in time.
+- **Audit bundle.** One click writes a folder containing every transcript, the
+  full integrity chain, and a README explaining how to recompute the digests
+  yourself. It is meant to be handed to someone who has never run Saffev. That
+  README is also honest about the limit: this proves the archive is internally
+  consistent and unedited, not that someone who controls the machine could not
+  have rewritten the whole chain deliberately.
 - **Export.** Any session (or all of them, bulk) to open **Markdown / JSON**, to a
   folder you own — your data, portable, yours to keep.
 - **AI summaries (opt-in).** If you have the Codex CLI installed and signed in,
@@ -290,9 +365,134 @@ instant and only re-parse when a source file actually changes.
 
 > **Verification note:** these adapters are validated against real on-disk data on
 > **macOS**. The Linux/Windows storage paths are implemented but not yet verified
-> on those platforms. First load of a very large history can take a few seconds
-> while sources are parsed (then cached); the archive's first snapshot is
-> proportional to history size, and subsequent runs are near-instant.
+> on those platforms. The archive's first snapshot is proportional to history size
+> (about 100 seconds for 521 sessions / 69k messages); subsequent runs skip
+> anything unchanged and are near-instant.
+
+## Timeline — one record of everything
+
+Saffev learns about AI activity two different ways: calls proxied through it, and
+coding sessions read off disk. **Timeline** merges them into one chronological,
+searchable list, because you should not have to already know which half a memory
+lives in before you can look for it.
+
+Every row is tagged with where it came from, badged if it failed, contained PII,
+was flagged by the safety guard, or is preserved. One search box covers proxy
+metadata, session metadata, and the contents of preserved conversations. Clicking
+a row opens the right detail view for its kind.
+
+## Blocking, not just masking
+
+Masking quietly rewrites a secret out of a prompt, which is the right default. But
+some things must never reach a model at all, and for those "we replaced it for
+you" is the wrong answer.
+
+In **Settings → PII masking → Block outright**, pick the kinds that should stop a
+request. Nothing is blocked unless you pick something *and* dry-run is off. A
+blocked request never reaches the engine and the calling app gets a clear,
+well-formed error saying exactly why:
+
+```json
+{"error": {"message": "Saffev blocked this request: it contains api_key that your
+policy does not allow to be sent to a model. Nothing was forwarded to the engine.",
+"type": "saffev_policy_block", "code": "pii_blocked",
+"blocked_kinds": ["api_key"]}}
+```
+
+Only high-confidence findings can block; a low-confidence guess never stops your
+traffic.
+
+## Plugging in your own safety guard
+
+Saffev has long said a purpose-trained guard could plug into its judgment socket.
+That was an intention, not a fact: the safety path called the built-in
+deterministic guard as a concrete type, so there was nothing to plug into. There
+is now.
+
+```toml
+[eval]
+enabled = true
+safety = true
+guard_model = "your-guard:1b"   # runs on your own local engine
+```
+
+Two deliberate choices:
+
+- **It is additive, not a replacement.** The deterministic floor keeps running
+  alongside it. Every finding records which guard produced it, so the two never
+  get confused in the store or the UI.
+- **It is gated exactly like the judge.** Same non-blocking concurrency cap, so
+  under load an extra guard call is dropped rather than queued, and it can never
+  thrash the VRAM your own model needs.
+
+Verified live with a small general model standing in for a trained guard. On a
+single unsafe prompt both guards fired and stayed distinguishable:
+
+```text
+guard=deterministic:v2   category=weapons        verdict=flagged
+guard=gemma3:1b          category=illicit        verdict=flagged
+```
+
+They disagreed on the category. That is the honest state of the art for small
+local guards, and it is precisely why the deterministic floor stays: a model
+guard adds recall, it does not earn trust on its own. Small guards are
+particularly unreliable on adversarial input and markedly worse on African and
+other low-resource languages, which is the gap purpose-trained localized guards
+exist to close.
+
+**Writing a guard:** implement `brain::guard::SafetyGuard`, or use `ModelGuard` as
+a reference. One non-obvious constraint: the backend Saffev injects forces
+Ollama's `format:"json"`, because that is what stops small "thinking" models
+returning empty content. Prompt for JSON and parse JSON.
+
+## Team policy, without a server
+
+A team usually wants one agreed answer to "what must never be sent to a model".
+The normal way to do that is a hosted control plane with accounts and sync, which
+would cost Saffev the one claim nobody else can make.
+
+So: **a policy is a TOML file you commit to your own repo.** A lead writes it,
+everyone points their Saffev at it, and every install enforces the same rules
+locally. No accounts, no sync, no telemetry, and no way for anyone to check up on
+you, because that would require reporting your activity somewhere.
+
+```toml
+# in each person's saffev.toml
+policy_file = "~/work/our-repo/saffev-policy.toml"
+```
+
+See [`examples/saffev-policy.toml`](examples/saffev-policy.toml) for a commented
+starting point. A policy can set the masking posture, which kinds are blocked
+outright, and shared custom patterns. It deliberately **cannot** set ports, data
+directories, or retention: a file in a repo should not be able to reconfigure
+someone's machine.
+
+Two deliberate behaviours:
+
+- **The policy wins.** Settings it names become read-only in the Studio, which
+  refuses the change rather than accepting it and quietly ignoring it. A rule an
+  individual can silently switch off is not a policy.
+- **A broken policy is loud, not silent.** A missing or invalid file never blocks
+  startup or your traffic, but it is reported at startup and shown in the Studio,
+  because the dangerous failure is everyone believing they are covered when they
+  are not.
+
+## About the numbers
+
+Cost and token figures are estimates, and the tool says so where it shows them:
+
+- **Prices are configurable.** They used to be hardcoded constants, which meant a
+  published price change silently made every figure wrong. Override them under
+  `[pricing]` in your config; the built-in table is only a default.
+- **Cached tokens are priced as cache.** Vendors disagree on reporting here:
+  Anthropic reports input tokens excluding cache reads, OpenAI reports a total
+  with cached tokens as a subset. Counting the cached portion at full input price
+  overstated one real history's cost by more than tenfold. Readers now normalize
+  to non-cached input.
+- **Estimated vs exact is visible.** When the engine reports token counts we use
+  them; otherwise we estimate with a bundled tokenizer. The Analytics tokens
+  figure now tells you what share of the total was estimated instead of blending
+  the two silently.
 
 ## Build / run / test
 
@@ -401,6 +601,28 @@ days = 30
 enabled = false              # master switch; false = pure observe
 dry_run = true               # when enabled, true = preview only (would_mask)
 # kinds = ["email", "credit_card"]  # omit for all high-confidence kinds
+# block_kinds = ["api_key"]  # STOP these requests instead of masking them.
+                             # Empty (default) = nothing is ever blocked. Only
+                             # applies when enabled = true and dry_run = false.
+
+[archive]                     # Preservation (off by default)
+enabled = false              # keep a durable copy of coding-agent history
+auto = false                 # snapshot on start and periodically
+redact = false               # replace secrets with a placeholder before storing
+                             # (lossy: turning this on re-archives what you have)
+# retention_days = 365       # omit to keep forever, which is the default
+
+[pricing]                     # cost estimates — override when prices change
+cloud_input_per_m = 2.50     # the baseline "cost avoided" compares against
+cloud_output_per_m = 10.0
+cloud_label = "GPT-4o list price"
+# USD per 1M tokens, matched by substring against the model name, first wins.
+# Omit `models` entirely to use the built-in table.
+# [[pricing.models]]
+# match = "opus"
+# input = 15.0
+# output = 75.0
+# cache = 1.5
 ```
 
 `Config::validate()` rejects port collisions (e.g. in Cooperative mode the proxy
@@ -443,43 +665,64 @@ client app ──▶ proxy (:proxy) ──▶ upstream engine (Ollama :11434)
 
 ## Status: v0/v1 implemented vs deferred
 
-This build is the **passive core, v1 complete**
-(see "What's new in v1" above). The model-based capabilities are in the deferred
-set. Everything in scope is independently reliable and ships no unreliable model
-signal.
-
 **Implemented and verified in this build:**
 
 - Transparent streaming passthrough for Ollama NDJSON **and** OpenAI SSE, teeing
   both into a bounded, decoupled logger (`proxy`).
 - On-device SQLite store, single-writer, with the metadata/payload split and a
   migrated schema (`store`). Retention by age/size. **Encrypted at rest by
-  default** (bundled SQLCipher). 207 passing unit tests.
-- Deterministic PII detection (observe-only): email, phone, Luhn-validated cards,
-  entropy-gated API keys, IPv4/IPv6, and custom patterns — values hashed, never
-  stored raw (`brain/pii.rs`).
+  default** (bundled SQLCipher). 329 passing unit tests.
+- Deterministic PII detection: email, phone, Luhn-validated cards, entropy-gated
+  API keys, IPv4/IPv6, and custom patterns — values hashed, never stored raw
+  (`brain/pii.rs`). Masking of requests, non-streamed responses, and live streams
+  (bounded holdback). Optional **blocking** for kinds that must never be sent.
+- Coding-agent history: five readers, full-text search over preserved
+  transcripts, the whole-history privacy report, opt-in redaction, and the
+  tamper-evident archive with an audit bundle.
+- The unified **Timeline** across proxied calls and coding sessions.
+- The eval pipeline: a deterministic 8-category safety guard and an opt-in,
+  sampled, concurrency-capped LLM-as-judge, both **off by default** and never on
+  the request path.
 - The Studio web server: embedded SPA + token-gated JSON API + SSE live stream,
   loopback-bound with Host allowlist + CORS (`studio`).
-- The CLI: `status`, `doctor`, `start`, `stop`, `logs`, `adopt`, `revert`, with
-  fail-open rendering (`cli`).
+- The CLI: `status`, `doctor`, `start`, `stop`, `logs`, `adopt`, `revert`,
+  `run`/`env`/`shell`, `update`, with fail-open rendering (`cli`).
 - Cooperative mode everywhere (no system changes), the default on macOS.
 - Exposure doctor, source-app attribution, token accounting, keyring-backed
   secrets, config load/save/validate.
 - Linux/Ollama Gateway adoption + reversible revert via systemd drop-ins
   (`engine/systemd.rs`, compiled `cfg(target_os = "linux")`).
 
+**Known limits — stated plainly rather than discovered later:**
+
+- **The coding-agent readers are proven on macOS only.** The Linux and Windows
+  storage paths are implemented but not yet validated against real on-disk data.
+- **Linux Gateway adoption now has an end-to-end test** in CI
+  (`.github/workflows/linux-gateway.yml`). GitHub's ubuntu runners are full VMs
+  with systemd, so every push exercises the real path: write the drop-in, disable
+  autostart, relocate the engine to the shadow port, then revert and assert the
+  host came back exactly as it was. The engine itself is a small stand-in
+  (`.github/ci/fake-ollama.py`) because the thing under test is a systemd
+  mechanism, not inference.
+- **The Windows binary is unsigned**, so SmartScreen will warn. There is no
+  PowerShell installer yet; the shell installer covers macOS and Linux.
+- **Searching inside conversations covers preserved sessions**, not every session
+  on disk. Scanning every live transcript per keystroke would mean re-parsing
+  hundreds of megabytes; the archive exists to pay that cost once. The UI says
+  which it is doing.
+- **Small local guards are unreliable on adversarial input**, and markedly worse
+  on African and other low-resource languages. That is why no guard runs inline
+  and why the judgment interface is a socket rather than a shipped verdict.
+
 **Deferred (not in this build):**
 
 - **macOS Gateway adoption** — Homebrew/CLI, only if it passes the reversibility
-  bar (v2). macOS today runs Cooperative.
-- **LM Studio Gateway** — Cooperative only later; LM Studio's Auto-Evict and
-  opt-in server make adoption unsafe until the serving research lands.
-- **Windows** — out of scope.
-- **Model-based capabilities** — guards, judges, evaluation, and the scheduler.
-  The schema and a pluggable judgment interface are *ready* (Safety / Evaluation
-  tables and Studio panels exist as disabled placeholders), but this build ships
-  **none** of them. They light up only once those components graduate, behind a
-  device-capability gate, labeled honestly.
+  bar. macOS today runs Cooperative.
+- **LM Studio Gateway** — Cooperative only; LM Studio is a GUI app with no
+  systemd unit to rebind, so `adopt --engine lmstudio` deliberately stays
+  Cooperative.
+- **Purpose-trained localized guards** — the highest-value thing that could plug
+  into the judgment socket, and a research effort rather than a code change.
 
 ## Smoke test (the exact commands used to verify this build)
 

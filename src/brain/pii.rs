@@ -415,6 +415,22 @@ pub fn placeholder(kind: PiiKind) -> &'static str {
     }
 }
 
+/// The stable wire key for a kind (`api_key`, `credit_card`, …).
+///
+/// Matches the `serde(rename_all = "snake_case")` representation of [`PiiKind`],
+/// so config files, the API, and human-facing messages all name a kind the same
+/// way.
+pub fn kind_key(kind: &PiiKind) -> &'static str {
+    match kind {
+        PiiKind::Email => "email",
+        PiiKind::CreditCard => "credit_card",
+        PiiKind::ApiKey => "api_key",
+        PiiKind::IpAddress => "ip_address",
+        PiiKind::Phone => "phone",
+        PiiKind::Custom => "custom",
+    }
+}
+
 /// Whether a finding is eligible to be masked.
 ///
 /// **Hard rule:** only HIGH-confidence findings are ever masked — best-effort /

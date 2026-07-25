@@ -211,6 +211,12 @@ pub enum PiiAction {
     WouldMask,
     /// Masked before forwarding to the engine (opt-in, live, §7.6).
     Masked,
+    /// Policy is set to block this kind, but masking is in dry-run, so the
+    /// request was forwarded anyway and only the intent recorded.
+    WouldBlock,
+    /// The request was **stopped** because of this finding and never reached the
+    /// engine (explicit policy, live).
+    Blocked,
 }
 
 impl PiiFindingRecord {
@@ -359,6 +365,178 @@ pub struct ArchivedMessage {
     pub content: String,
     pub ts: Option<i64>,
     pub tool_name: Option<String>,
+}
+
+/// How many excerpts we keep per matching session. Enough to show why it
+/// matched, few enough that a broad query stays readable.
+const MAX_SNIPPETS_PER_SESSION: usize = 3;
+
+/// One session that matched a full-text search, with excerpts showing why.
+#[derive(Debug, Clone)]
+pub struct ArchiveSearchHit {
+    /// Namespaced session id (`"<tool>:<raw>"`), joinable to `archived_sessions`.
+    pub session_id: String,
+    /// How many messages in this session matched, within the scanned window.
+    pub match_count: u32,
+    /// Highlighted excerpts. Matched terms are wrapped in `‹` … `›` so the UI can
+    /// mark them without the store needing to know anything about HTML.
+    pub snippets: Vec<String>,
+}
+
+/// Turn user-typed text into a safe FTS5 `MATCH` expression.
+///
+/// Users type search boxes, not query languages. Passing raw input to FTS5 means
+/// a lone `"`, a `-`, or the word `AND` produces a query error instead of
+/// results. So every token is quoted as a literal phrase (internal quotes
+/// doubled, which is FTS5's own escape), and tokens are joined implicitly, which
+/// FTS5 reads as AND. The final token gets a prefix match so search feels live
+/// as you type.
+///
+/// Returns `None` when there is nothing searchable, which callers treat as
+/// "no results" rather than an error.
+pub fn fts_query(raw: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for tok in raw.split_whitespace() {
+        // Drop characters that carry no lexical meaning on their own, so a query
+        // of `"` or `--` degrades to empty instead of matching nothing forever.
+        let cleaned: String = tok
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '/' | '\''))
+            .collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        parts.push(format!("\"{}\"", cleaned.replace('"', "\"\"")));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Prefix-match the last token only: "conn" finds "connection" while the user
+    // is still typing, without making every earlier term fuzzy.
+    if let Some(last) = parts.last_mut() {
+        last.push('*');
+    }
+    Some(parts.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// Archive integrity chain
+//
+// Being the last surviving copy of a conversation is only worth something if you
+// can show the copy was not edited after the fact. Each archival appends a log
+// entry committing to the content AND to the previous entry, so any later edit,
+// insertion, or deletion breaks the chain from that point on.
+//
+// What this does and does not prove, stated plainly: it detects tampering by
+// anything that does not rewrite the whole chain. It is not a defence against an
+// attacker who controls the machine and simply recomputes every digest. Doing
+// that properly needs an external notary or a signing key held elsewhere, which
+// is a different feature. Anchoring here is honest evidence of self-consistency.
+// ---------------------------------------------------------------------------
+
+/// Hex SHA-256 of `parts`, joined with a separator that cannot appear in the
+/// hex digests or ids being joined (so the concatenation is unambiguous).
+fn sha256_hex(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update([0u8]);
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Digest over an archived session's stored content: its identifying metadata
+/// plus every message, in order. This is what the chain commits to.
+fn session_content_digest(s: &ArchivedSession) -> String {
+    let mut parts: Vec<String> = vec![
+        s.id.clone(),
+        s.tool.clone(),
+        s.title.clone().unwrap_or_default(),
+        s.project.clone().unwrap_or_default(),
+        s.model.clone().unwrap_or_default(),
+        s.started_ts.to_string(),
+        s.updated_ts.to_string(),
+        s.message_count.to_string(),
+    ];
+    for m in &s.messages {
+        parts.push(m.role.clone());
+        parts.push(m.kind.clone());
+        parts.push(m.content.clone());
+    }
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    sha256_hex(&refs)
+}
+
+/// Digest of one chain entry, committing to its own fields and to the entry
+/// before it.
+fn entry_digest(
+    seq: i64,
+    ts: i64,
+    session_id: &str,
+    content_digest: &str,
+    prev_digest: &str,
+) -> String {
+    sha256_hex(&[
+        &seq.to_string(),
+        &ts.to_string(),
+        session_id,
+        content_digest,
+        prev_digest,
+    ])
+}
+
+/// One entry in the archive's integrity chain.
+#[derive(Debug, Clone)]
+pub struct ArchiveLogEntry {
+    pub seq: i64,
+    pub ts: i64,
+    pub session_id: String,
+    pub content_digest: String,
+    pub prev_digest: String,
+    pub entry_digest: String,
+}
+
+/// The result of walking the chain.
+#[derive(Debug, Clone, Default)]
+pub struct ArchiveIntegrity {
+    /// Entries checked.
+    pub entries: u64,
+    /// Distinct sessions covered.
+    pub sessions: u64,
+    /// True when every entry's digest and linkage recomputed correctly AND every
+    /// session's stored content still matches what was committed.
+    pub intact: bool,
+    /// The first problem found, in plain language. `None` when intact.
+    pub broken_at: Option<String>,
+    /// Sessions whose current stored content no longer matches its latest logged
+    /// digest — i.e. the archive was edited after the fact.
+    pub altered_sessions: Vec<String>,
+    /// Digest of the newest entry: a short value a user can record elsewhere to
+    /// anchor the whole archive at a point in time.
+    pub head_digest: Option<String>,
+    /// When the newest entry was written.
+    pub head_ts: Option<i64>,
+}
+
+/// One preserved session's PII rollup, from [`Store::scan_archive_pii`].
+///
+/// Counts and kinds only. The matched text is deliberately absent: the whole
+/// point of the privacy view is that you can see the shape of a leak without the
+/// tool itself becoming a second copy of the secret.
+#[derive(Debug, Clone)]
+pub struct ArchivePiiRow {
+    pub session_id: String,
+    pub tool: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub updated_ts: i64,
+    /// Total findings in this session.
+    pub findings: u32,
+    /// Of those, how many were in a message the *user* wrote.
+    pub user_side: u32,
+    /// Per (kind, custom label) counts.
+    pub kinds: Vec<(PiiKind, Option<String>, u32)>,
 }
 
 /// Rollup of the archive's footprint (for storage awareness).
@@ -702,6 +880,336 @@ impl Store {
         .await
     }
 
+    /// Full-text search across every preserved transcript.
+    ///
+    /// Returns one [`ArchiveSearchHit`] per matching session, best match first,
+    /// each carrying a few highlighted excerpts so the caller can show *why* the
+    /// session matched. `raw_query` is user-typed text, not FTS syntax — it is
+    /// sanitized by [`fts_query`] so a stray quote or operator can never produce
+    /// a query error.
+    ///
+    /// Fail-soft by design: an unusable query yields no hits rather than an
+    /// error, and a missing/damaged index degrades to "nothing found" so search
+    /// can never take the Agents page down.
+    pub async fn search_archive(
+        &self,
+        raw_query: &str,
+        session_limit: usize,
+    ) -> Result<Vec<ArchiveSearchHit>> {
+        let Some(q) = fts_query(raw_query) else {
+            return Ok(Vec::new());
+        };
+        // Scan a bounded window of best-ranked message hits, then fold them into
+        // sessions. The window is generous relative to the session cap so a
+        // session whose matches cluster late still surfaces.
+        let row_limit = (session_limit.saturating_mul(8)).clamp(64, 2_000) as i64;
+
+        self.read(move |conn| {
+            let mut stmt = match conn.prepare(
+                "SELECT f.session_id, \
+                        snippet(archived_messages_fts, 0, '\u{2039}', '\u{203a}', '\u{2026}', 14) \
+                 FROM archived_messages_fts f \
+                 WHERE archived_messages_fts MATCH ?1 \
+                 ORDER BY rank \
+                 LIMIT ?2",
+            ) {
+                Ok(s) => s,
+                // No FTS index (older/handmade DB) — behave as "no results".
+                Err(e) => {
+                    tracing::debug!("archive search unavailable: {e}");
+                    return Ok(Vec::new());
+                }
+            };
+            let rows = match stmt.query_map(rusqlite::params![q, row_limit], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) {
+                Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
+                // A malformed MATCH expression is a user-input problem, not a
+                // store failure. Report nothing found.
+                Err(e) => {
+                    tracing::debug!("archive search query rejected: {e}");
+                    return Ok(Vec::new());
+                }
+            };
+
+            // Fold message hits into sessions, preserving rank order.
+            let mut order: Vec<String> = Vec::new();
+            let mut by_session: std::collections::HashMap<String, ArchiveSearchHit> =
+                std::collections::HashMap::new();
+            for (session_id, snippet) in rows {
+                let entry = by_session.entry(session_id.clone()).or_insert_with(|| {
+                    order.push(session_id.clone());
+                    ArchiveSearchHit {
+                        session_id,
+                        match_count: 0,
+                        snippets: Vec::new(),
+                    }
+                });
+                entry.match_count += 1;
+                if entry.snippets.len() < MAX_SNIPPETS_PER_SESSION {
+                    let s = snippet.trim();
+                    if !s.is_empty() {
+                        entry.snippets.push(s.to_string());
+                    }
+                }
+            }
+
+            Ok(order
+                .into_iter()
+                .filter_map(|id| by_session.remove(&id))
+                .take(session_limit)
+                .collect())
+        })
+        .await
+    }
+
+    /// Scan every preserved transcript for PII and return a per-session rollup.
+    ///
+    /// This answers the question a user actually has — *"across everything, where
+    /// did I leak a secret?"* — which could not be asked before, because PII was
+    /// only ever scanned one session at a time when you opened it.
+    ///
+    /// The scan runs **inside the read connection** and keeps only aggregates, so
+    /// a 78 MB archive never lands in memory at once. Only counts, kinds and
+    /// offsets survive; the matched text is never retained, never returned and
+    /// never logged, exactly as on the proxy side.
+    ///
+    /// `since_ts` bounds the window (0 = everything). The caller supplies the
+    /// detector so the user's own custom patterns apply here too.
+    pub async fn scan_archive_pii(
+        &self,
+        detector: std::sync::Arc<crate::brain::pii::Detector>,
+        since_ts: i64,
+    ) -> Result<Vec<ArchivePiiRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.session_id, s.tool, s.title, s.project, s.updated_ts, m.role, m.content \
+                 FROM archived_messages m \
+                 JOIN archived_sessions s ON s.id = m.session_id \
+                 WHERE s.updated_ts >= ?1",
+            )?;
+            let mut rows = stmt.query([since_ts])?;
+
+            let mut by_session: std::collections::HashMap<String, ArchivePiiRow> =
+                std::collections::HashMap::new();
+
+            while let Some(r) = rows.next()? {
+                let session_id: String = r.get(0)?;
+                let role: String = r.get(5)?;
+                let content: String = r.get(6)?;
+                if content.is_empty() {
+                    continue;
+                }
+                // "What I sent" vs "what came back" — the headline claim is about
+                // what the user pasted in, so the split has to be honest.
+                let side = if role == "user" {
+                    Side::Request
+                } else {
+                    Side::Response
+                };
+                let found = detector.scan(side, &content);
+                if found.is_empty() {
+                    continue;
+                }
+
+                let entry = match by_session.get_mut(&session_id) {
+                    Some(e) => e,
+                    None => by_session
+                        .entry(session_id.clone())
+                        .or_insert(ArchivePiiRow {
+                            session_id,
+                            tool: r.get(1)?,
+                            title: r.get(2)?,
+                            project: r.get(3)?,
+                            updated_ts: r.get(4)?,
+                            findings: 0,
+                            user_side: 0,
+                            kinds: Vec::new(),
+                        }),
+                };
+
+                for f in found {
+                    entry.findings += 1;
+                    if f.side == Side::Request {
+                        entry.user_side += 1;
+                    }
+                    match entry
+                        .kinds
+                        .iter_mut()
+                        .find(|(k, l, _)| *k == f.kind && *l == f.label)
+                    {
+                        Some((_, _, n)) => *n += 1,
+                        None => entry.kinds.push((f.kind, f.label.clone(), 1)),
+                    }
+                }
+            }
+
+            let mut out: Vec<ArchivePiiRow> = by_session.into_values().collect();
+            out.sort_by(|a, b| {
+                b.findings
+                    .cmp(&a.findings)
+                    .then(b.updated_ts.cmp(&a.updated_ts))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Walk the archive's integrity chain and report whether it is intact.
+    ///
+    /// Two independent checks, because they catch different tampering:
+    /// 1. **Chain**: recompute every entry's digest and confirm each links to the
+    ///    one before it. Catches edited, inserted, or removed log entries.
+    /// 2. **Content**: for each session, recompute the digest of what is stored
+    ///    *now* and compare it to the newest entry logged for that session.
+    ///    Catches somebody editing an archived transcript directly in the database
+    ///    without touching the log.
+    pub async fn verify_archive(&self) -> Result<ArchiveIntegrity> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, ts, session_id, content_digest, prev_digest, entry_digest \
+                 FROM archive_log ORDER BY seq ASC",
+            )?;
+            let entries: Vec<ArchiveLogEntry> = stmt
+                .query_map([], |r| {
+                    Ok(ArchiveLogEntry {
+                        seq: r.get(0)?,
+                        ts: r.get(1)?,
+                        session_id: r.get(2)?,
+                        content_digest: r.get(3)?,
+                        prev_digest: r.get(4)?,
+                        entry_digest: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut out = ArchiveIntegrity {
+                entries: entries.len() as u64,
+                intact: true,
+                ..Default::default()
+            };
+            if entries.is_empty() {
+                // Nothing archived yet. Vacuously intact, and the UI says so
+                // rather than claiming a verified archive.
+                return Ok(out);
+            }
+
+            // 1. Chain.
+            let mut expected_prev = String::new();
+            let mut latest: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for e in &entries {
+                if e.prev_digest != expected_prev {
+                    out.intact = false;
+                    out.broken_at = Some(format!(
+                        "entry {} does not follow the entry before it — the log was \
+                         edited, reordered, or an entry was removed",
+                        e.seq
+                    ));
+                    break;
+                }
+                let recomputed = entry_digest(
+                    e.seq,
+                    e.ts,
+                    &e.session_id,
+                    &e.content_digest,
+                    &e.prev_digest,
+                );
+                if recomputed != e.entry_digest {
+                    out.intact = false;
+                    out.broken_at = Some(format!(
+                        "entry {} has been altered since it was written",
+                        e.seq
+                    ));
+                    break;
+                }
+                expected_prev = e.entry_digest.clone();
+                latest.insert(e.session_id.clone(), e.content_digest.clone());
+            }
+            out.sessions = latest.len() as u64;
+
+            // 2. Content, for the sessions still present.
+            if out.intact {
+                for (id, logged) in &latest {
+                    let Some(mut s) = conn
+                        .query_row(
+                            "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,\
+                             updated_ts,message_count,tool_call_count,input_tokens,output_tokens,\
+                             cache_tokens,source_path,content_hash,archived_ts,source_deleted \
+                             FROM archived_sessions WHERE id = ?1",
+                            [id],
+                            row_to_archived,
+                        )
+                        .optional()?
+                    else {
+                        // Logged but no longer stored. We never delete archived
+                        // sessions ourselves, so this is worth reporting.
+                        out.altered_sessions.push(id.clone());
+                        continue;
+                    };
+                    let mut ms = conn.prepare(
+                        "SELECT role,kind,content,ts,tool_name FROM archived_messages \
+                         WHERE session_id = ?1 ORDER BY seq",
+                    )?;
+                    s.messages = ms
+                        .query_map([id], |r| {
+                            Ok(ArchivedMessage {
+                                role: r.get(0)?,
+                                kind: r.get(1)?,
+                                content: r.get(2)?,
+                                ts: r.get(3)?,
+                                tool_name: r.get(4)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if session_content_digest(&s) != *logged {
+                        out.altered_sessions.push(id.clone());
+                    }
+                }
+                if !out.altered_sessions.is_empty() {
+                    out.intact = false;
+                    out.altered_sessions.sort();
+                    out.broken_at = Some(format!(
+                        "{} archived session(s) no longer match what was recorded when they \
+                         were preserved",
+                        out.altered_sessions.len()
+                    ));
+                }
+            }
+
+            if let Some(last) = entries.last() {
+                out.head_digest = Some(last.entry_digest.clone());
+                out.head_ts = Some(last.ts);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Every entry in the integrity chain, oldest first (for the audit export).
+    pub async fn archive_log(&self) -> Result<Vec<ArchiveLogEntry>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, ts, session_id, content_digest, prev_digest, entry_digest \
+                 FROM archive_log ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ArchiveLogEntry {
+                        seq: r.get(0)?,
+                        ts: r.get(1)?,
+                        session_id: r.get(2)?,
+                        content_digest: r.get(3)?,
+                        prev_digest: r.get(4)?,
+                        entry_digest: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Archive footprint: session count, message count, approximate bytes.
     pub async fn archive_stats(&self) -> Result<ArchiveStats> {
         self.read(|conn| {
@@ -1041,6 +1549,28 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                         m.tool_name,
                     ])?;
                 }
+
+                // Append the integrity-chain entry for this archival, inside the
+                // same transaction as the content it commits to — so the log can
+                // never describe a write that did not land, or miss one that did.
+                let content_digest = session_content_digest(s);
+                let (prev_seq, prev_digest): (i64, String) = tx
+                    .query_row(
+                        "SELECT seq, entry_digest FROM archive_log ORDER BY seq DESC LIMIT 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?
+                    .unwrap_or((0, String::new()));
+                let seq = prev_seq + 1;
+                let ts = now_millis();
+                let entry_digest = entry_digest(seq, ts, &s.id, &content_digest, &prev_digest);
+                tx.execute(
+                    "INSERT INTO archive_log \
+                     (seq, ts, session_id, content_digest, prev_digest, entry_digest) \
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    rusqlite::params![seq, ts, s.id, content_digest, prev_digest, entry_digest],
+                )?;
             }
             tx.commit()?;
         }
@@ -1438,6 +1968,8 @@ fn pii_action_str(a: PiiAction) -> &'static str {
         PiiAction::Observed => "observed",
         PiiAction::WouldMask => "would_mask",
         PiiAction::Masked => "masked",
+        PiiAction::WouldBlock => "would_block",
+        PiiAction::Blocked => "blocked",
     }
 }
 
@@ -1445,6 +1977,8 @@ fn parse_pii_action(s: &str) -> PiiAction {
     match s {
         "would_mask" => PiiAction::WouldMask,
         "masked" => PiiAction::Masked,
+        "would_block" => PiiAction::WouldBlock,
+        "blocked" => PiiAction::Blocked,
         _ => PiiAction::Observed,
     }
 }
@@ -1733,6 +2267,281 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Build an archived session with the given messages, for search tests.
+    #[cfg(test)]
+    fn archived(id: &str, title: &str, bodies: &[&str]) -> ArchivedSession {
+        ArchivedSession {
+            id: id.into(),
+            tool: id.split(':').next().unwrap_or("claude_code").into(),
+            source_id: id.split(':').nth(1).unwrap_or("x").into(),
+            title: Some(title.into()),
+            project: Some("/proj".into()),
+            git_branch: None,
+            model: Some("claude-opus-4-8".into()),
+            started_ts: 1000,
+            updated_ts: 2000,
+            message_count: bodies.len() as u32,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_tokens: 0,
+            source_path: None,
+            content_hash: "h".into(),
+            archived_ts: 3000,
+            source_deleted: false,
+            messages: bodies
+                .iter()
+                .map(|b| ArchivedMessage {
+                    role: "user".into(),
+                    kind: "text".into(),
+                    content: (*b).into(),
+                    ts: Some(1000),
+                    tool_name: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fts_query_is_safe_for_anything_a_user_types() {
+        // Ordinary words: quoted literals, last one prefix-matched.
+        assert_eq!(
+            fts_query("hello world").as_deref(),
+            Some("\"hello\" \"world\"*")
+        );
+        // FTS operators are neutralized, not honored.
+        assert_eq!(
+            fts_query("cat AND dog").as_deref(),
+            Some("\"cat\" \"AND\" \"dog\"*")
+        );
+        // A lone quote / punctuation cannot produce a syntax error.
+        assert_eq!(fts_query("\"").as_deref(), None);
+        assert_eq!(fts_query("   ").as_deref(), None);
+        assert_eq!(fts_query("").as_deref(), None);
+        // Identifier-ish characters survive, since people search for them.
+        assert_eq!(
+            fts_query("api_key-2 foo@bar.com").as_deref(),
+            Some("\"api_key-2\" \"foo@bar.com\"*")
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_search_finds_sessions_by_content() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "Untitled",
+            &[
+                "we need to fix the postgres connection pool",
+                "the pool exhausts under load",
+            ],
+        ))));
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "codex:b",
+            "Untitled",
+            &["rewrite the css grid layout"],
+        ))));
+        store.flush().await.unwrap();
+
+        // The whole point: found by what was SAID, not by title/project/model.
+        let hits = store.search_archive("postgres", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "claude_code:a");
+        assert_eq!(hits[0].match_count, 1);
+        assert!(
+            hits[0].snippets[0].contains('\u{2039}'),
+            "snippet must mark the matched term: {:?}",
+            hits[0].snippets
+        );
+
+        // Multiple matching messages in one session fold into one hit.
+        let hits = store.search_archive("pool", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_count, 2);
+
+        // Multi-token queries are AND, not OR.
+        assert!(store
+            .search_archive("postgres css", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Prefix match on the trailing token, so search works while typing.
+        assert_eq!(store.search_archive("postg", 10).await.unwrap().len(), 1);
+
+        // Nothing searchable / no match -> empty, never an error.
+        assert!(store.search_archive("", 10).await.unwrap().is_empty());
+        assert!(store.search_archive("\" ((", 10).await.unwrap().is_empty());
+        assert!(store
+            .search_archive("kangaroo", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn archive_search_index_follows_re_archive_and_stays_deduped() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "T",
+            &["the original mention of zebras"],
+        ))));
+        store.flush().await.unwrap();
+        assert_eq!(store.search_archive("zebras", 10).await.unwrap().len(), 1);
+
+        // Re-archiving the same session replaces its rows. The index must follow,
+        // or search would keep returning text the archive no longer holds.
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "T",
+            &["now it talks about giraffes instead"],
+        ))));
+        store.flush().await.unwrap();
+        assert!(
+            store.search_archive("zebras", 10).await.unwrap().is_empty(),
+            "stale content must leave the index"
+        );
+        let hits = store.search_archive("giraffes", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_count, 1, "re-archive must not duplicate rows");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Edit the database behind the store's back, the way someone with the file
+    /// would. Used to prove the integrity chain actually detects tampering.
+    fn tamper(path: &std::path::Path, f: impl FnOnce(&Connection)) {
+        let conn = open_connection(path).expect("open for tamper");
+        f(&conn);
+    }
+
+    #[tokio::test]
+    async fn archive_chain_is_intact_after_normal_use() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        // Nothing archived: vacuously intact, and honest about being empty.
+        let v = store.verify_archive().await.unwrap();
+        assert!(v.intact);
+        assert_eq!(v.entries, 0);
+        assert!(v.head_digest.is_none());
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "One",
+            &["hello", "world"],
+        ))));
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "codex:b",
+            "Two",
+            &["something else"],
+        ))));
+        store.flush().await.unwrap();
+
+        let v = store.verify_archive().await.unwrap();
+        assert!(v.intact, "{:?}", v.broken_at);
+        assert_eq!(v.entries, 2);
+        assert_eq!(v.sessions, 2);
+        assert!(v.altered_sessions.is_empty());
+        assert!(v.head_digest.is_some());
+
+        // Re-archiving a growing session is normal and must NOT read as tampering.
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "One",
+            &["hello", "world", "and more"],
+        ))));
+        store.flush().await.unwrap();
+        let v = store.verify_archive().await.unwrap();
+        assert!(v.intact, "re-archive must stay intact: {:?}", v.broken_at);
+        assert_eq!(v.entries, 3);
+        assert_eq!(v.sessions, 2, "same two sessions, one archived twice");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The claim being made: edit a preserved transcript in the database and the
+    /// archive can tell. Without this the chain is decoration.
+    #[tokio::test]
+    async fn editing_an_archived_transcript_is_detected() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:a",
+            "One",
+            &["the original words"],
+        ))));
+        store.flush().await.unwrap();
+        assert!(store.verify_archive().await.unwrap().intact);
+
+        // Tamper directly, the way someone with the DB file would.
+        tamper(&path, |conn| {
+            conn.execute(
+                "UPDATE archived_messages SET content = 'quietly changed' \
+                 WHERE session_id = 'claude_code:a'",
+                [],
+            )
+            .unwrap();
+        });
+
+        let v = store.verify_archive().await.unwrap();
+        assert!(!v.intact, "an edited transcript must not verify");
+        assert_eq!(v.altered_sessions, vec!["claude_code:a".to_string()]);
+        assert!(v.broken_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Removing a log entry breaks the linkage of everything after it.
+    #[tokio::test]
+    async fn removing_a_log_entry_breaks_the_chain() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        for (i, id) in ["claude_code:a", "codex:b", "codex:c"].iter().enumerate() {
+            store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+                id,
+                "T",
+                &[Box::leak(format!("body {i}").into_boxed_str())],
+            ))));
+        }
+        store.flush().await.unwrap();
+        assert!(store.verify_archive().await.unwrap().intact);
+
+        tamper(&path, |conn| {
+            conn.execute("DELETE FROM archive_log WHERE seq = 2", [])
+                .unwrap();
+        });
+
+        let v = store.verify_archive().await.unwrap();
+        assert!(!v.intact);
+        assert!(
+            v.broken_at.as_deref().unwrap_or("").contains("removed")
+                || v.broken_at.as_deref().unwrap_or("").contains("follow"),
+            "{:?}",
+            v.broken_at
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn digests_are_sha256_and_content_sensitive() {
+        let a = archived("codex:a", "T", &["one"]);
+        let mut b = archived("codex:a", "T", &["one"]);
+        let d1 = session_content_digest(&a);
+        assert_eq!(d1.len(), 64, "sha-256 hex");
+        assert_eq!(d1, session_content_digest(&b), "stable for equal content");
+        b.messages[0].content = "two".into();
+        assert_ne!(d1, session_content_digest(&b), "content changes the digest");
     }
 
     #[tokio::test]

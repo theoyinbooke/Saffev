@@ -3533,6 +3533,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "tao",
  "thiserror 1.0.69",
  "tiktoken-rs",

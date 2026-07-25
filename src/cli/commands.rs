@@ -540,6 +540,13 @@ pub async fn adopt(cli: &Cli, engine: EngineArg, cooperative: bool) -> Result<()
                 p.label("adopt"),
                 p.error("adoption unavailable on this host"),
             );
+            // Exit non-zero. Fail-open governs the user's model TRAFFIC, not CLI
+            // exit codes: a command that was asked to change the system and did
+            // not must say so, or scripts and CI silently treat a failed adoption
+            // as a successful one.
+            return Err(crate::Error::Engine(
+                "adoption failed — the host was not changed".into(),
+            ));
         }
     }
 
@@ -603,12 +610,20 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
             p.label("revert"),
             p.warn(&format!("no adoption journal found for {name}")),
         ),
-        None => println!(
-            "{} {} {}",
-            p.dot(Level::Err),
-            p.label("revert"),
-            p.error("revert unavailable on this host"),
-        ),
+        None => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("revert"),
+                p.error("revert unavailable on this host"),
+            );
+            // Non-zero for the same reason as `adopt`, and it matters more here:
+            // a revert that quietly did nothing leaves someone's machine adopted
+            // while telling them it is clean.
+            return Err(crate::Error::Engine(
+                "revert failed — the host may still be adopted".into(),
+            ));
+        }
     }
 
     Ok(())
@@ -1106,6 +1121,35 @@ fn open_in_browser(url: &str) {
 async fn run_servers(cfg: &Config) -> Result<()> {
     use std::sync::Arc;
 
+    // Apply the shared team policy (if one is configured) BEFORE the config is
+    // shared with either server, so the protective settings a team agreed on are
+    // already in force by the time the first request can arrive. A policy that
+    // failed to load never blocks startup, but the failure is recorded and
+    // surfaced rather than swallowed — see `crate::policy`.
+    let mut cfg_with_policy = cfg.clone();
+    if let Some(status) = crate::policy::apply_and_record(&mut cfg_with_policy) {
+        // Print, not just log: someone is relying on this file to protect them,
+        // so both outcomes have to be visible without going looking for a log.
+        if status.active {
+            println!(
+                "● policy     {} · governs {}",
+                status.description.as_deref().unwrap_or(&status.path),
+                if status.governs.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    status.governs.join(", ")
+                }
+            );
+        } else {
+            eprintln!(
+                "● policy     NOT APPLIED · {} · {}",
+                status.path,
+                status.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
+    let cfg = &cfg_with_policy;
+
     // ONE live, swappable config handle shared by BOTH servers. A Studio
     // `PUT /api/settings` swaps it in place, so the proxy + Studio see
     // hot-reloadable changes (masking / payload / retention) without a restart.
@@ -1192,19 +1236,50 @@ async fn run_servers(cfg: &Config) -> Result<()> {
         eval_rx,
     );
 
-    // Preservation: if auto-archive is enabled, snapshot the durable copy in the
-    // background on start so it stays current without a manual click. Off the hot
-    // path, fail-open.
+    // Warm the coding-agent session cache in the background.
+    //
+    // The per-file parse cache lives in this process, so the FIRST listing after
+    // a start pays the full read of every session file (measured at ~27s on a
+    // real history). Doing it here means that cost is paid by an idle background
+    // task at startup instead of by the operator's first click on the Agents
+    // page. Purely a cache fill: no writes, nothing user-visible, and failure
+    // just means the page warms lazily as before.
     {
+        let store = proxy_state.store.clone();
         let cfg = proxy_state.config.load();
-        if cfg.archive.enabled && cfg.archive.auto {
-            let store = proxy_state.store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::agents::archive::run_snapshot(&store).await {
-                    tracing::warn!(target: "saffev::archive", "auto snapshot failed: {e}");
+        let snapshot_after_warm = cfg.archive.enabled && cfg.archive.auto;
+        tokio::spawn(async move {
+            let t = std::time::Instant::now();
+            let n = tokio::task::spawn_blocking(|| crate::agents::all_sessions().len())
+                .await
+                .unwrap_or(0);
+            tracing::debug!(
+                target: "saffev::agents",
+                "warmed session cache: {n} sessions in {:?}", t.elapsed()
+            );
+
+            // Preservation: if auto-archive is on, snapshot the durable copy once
+            // the cache is warm, so the two passes do not read the same files
+            // twice. Off the hot path, fail-open.
+            if snapshot_after_warm {
+                match crate::agents::archive::Redaction::from_config(&cfg) {
+                    // Redaction was requested but its patterns will not compile.
+                    // Skip the snapshot entirely: archiving raw text under a
+                    // "redact" setting is worse than not archiving at all.
+                    Err(e) => tracing::warn!(
+                        target: "saffev::archive",
+                        "auto snapshot skipped — redaction is on but failed to build: {e}"
+                    ),
+                    Ok(redaction) => {
+                        if let Err(e) =
+                            crate::agents::archive::run_snapshot(&store, redaction).await
+                        {
+                            tracing::warn!(target: "saffev::archive", "auto snapshot failed: {e}");
+                        }
+                    }
                 }
-            });
-        }
+            }
+        });
     }
 
     // Run both servers concurrently under a shared graceful-shutdown signal.
@@ -2363,15 +2438,71 @@ mod tests {
 
     #[tokio::test]
     async fn load_config_falls_back_to_defaults() {
-        // With the config loader stubbed (panics), load_config must still yield
-        // a usable default config rather than aborting.
+        // A malformed config must still yield a usable default rather than
+        // aborting the command. Hermetic by construction: it points at a temp
+        // file, never the real data dir (`config: None` would read the operator's
+        // actual config and make the assertion depend on this machine).
+        let dir = std::env::temp_dir().join(format!("saffev-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("saffev.toml");
+        std::fs::write(&path, "this is not = valid toml [[[").unwrap();
+
         let cli = Cli {
-            config: None,
+            config: Some(path),
             no_color: true,
             command: crate::cli::Command::Status,
         };
         let cfg = load_config(&cli).await;
         assert_eq!(cfg.ports.proxy, crate::config::DEFAULT_PROXY_PORT);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a well-formed explicit config is honored
+    /// exactly, and its `data_dir` is anchored beside the file rather than in the
+    /// operator's real data dir.
+    #[tokio::test]
+    async fn load_config_honors_an_explicit_path() {
+        let dir = std::env::temp_dir().join(format!("saffev-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("saffev.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "mode = \"cooperative\"\ndata_dir = {:?}\n\n\
+                 [ports]\nproxy = 8188\nstudio = 7188\nupstream = 11434\nshadow = 11999\n",
+                dir
+            ),
+        )
+        .unwrap();
+
+        let cli = Cli {
+            config: Some(path),
+            no_color: true,
+            command: crate::cli::Command::Status,
+        };
+        let cfg = load_config(&cli).await;
+        assert_eq!(cfg.ports.proxy, 8188);
+        assert_eq!(cfg.ports.studio, 7188);
+        assert_eq!(cfg.data_dir, dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Documents a real (and deliberate) sharp edge: [`Config::default`] is NOT a
+    /// valid cooperative config, because the default proxy port and the default
+    /// upstream port are both the well-known engine port. A usable first-run
+    /// config comes from `resolve_first_run`, which picks a free proxy port. This
+    /// is why `load_config`'s fallback is a last-resort shape, not a runnable one.
+    #[test]
+    fn default_config_is_not_a_runnable_cooperative_config() {
+        let cfg = Config::default();
+        assert_eq!(cfg.mode, Mode::Cooperative);
+        assert_eq!(cfg.ports.proxy, cfg.ports.upstream);
+        assert!(
+            cfg.validate().is_err(),
+            "default proxy == upstream must fail validation"
+        );
     }
 
     #[tokio::test]

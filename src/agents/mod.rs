@@ -26,6 +26,7 @@ pub mod codex_server;
 pub mod cursor;
 pub mod export;
 pub mod opencode;
+pub mod privacy;
 pub mod retention;
 pub mod vscode;
 
@@ -132,11 +133,18 @@ pub struct AgentSession {
     pub message_count: u32,
     /// Tool/function call count.
     pub tool_call_count: u32,
-    /// Summed input tokens across the session (0 if the tool doesn't record it).
+    /// Summed **non-cached** input tokens (0 if the tool doesn't record it).
+    ///
+    /// The contract is deliberate and every reader must honor it: vendors
+    /// disagree here. Anthropic reports `input_tokens` already excluding cache
+    /// reads; OpenAI reports a total prompt count with cached tokens as a subset.
+    /// Readers of the second kind must subtract, or the cached portion gets
+    /// counted (and priced) twice.
     pub input_tokens: u64,
     /// Summed output tokens.
     pub output_tokens: u64,
-    /// Summed cache-read/creation tokens (Anthropic-style), 0 if n/a.
+    /// Summed cache read/creation tokens, 0 if the tool does not report them.
+    /// Disjoint from [`Self::input_tokens`].
     pub cache_tokens: u64,
     /// The file/db this session was read from (the source tag).
     pub source_path: String,
@@ -233,6 +241,76 @@ pub(crate) fn hash_files(paths: impl Iterator<Item = PathBuf>) -> u64 {
     h.finish()
 }
 
+/// Upper bound on remembered per-file parses. Session metadata is tiny (a few
+/// hundred bytes each), so this is a generous ceiling; crossing it simply clears
+/// the cache, which costs one slow list and then recovers.
+const FILE_CACHE_MAX: usize = 8_192;
+
+/// One remembered parse: the `(mtime, size)` it was valid for, and the result
+/// (`None` = the file did not yield a session, which is worth remembering too).
+type FileCacheEntry = (i64, u64, Option<AgentSession>);
+
+/// Path-keyed cache of per-file parse results.
+type FileCache = std::sync::Mutex<std::collections::HashMap<PathBuf, FileCacheEntry>>;
+
+/// Process-wide cache of per-file parse results, keyed by path, validated by the
+/// file's `(mtime, size)`.
+fn file_cache() -> &'static FileCache {
+    static C: std::sync::OnceLock<FileCache> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Parse one session file's metadata, reusing the previous result when the file
+/// has not changed.
+///
+/// This is what makes the session list usable on a real history. The outer
+/// [`all_sessions`] cache is all-or-nothing: any single byte written by any tool
+/// invalidates it, and one of these tools is usually writing right now, so in
+/// practice it almost never hits and every page load re-read every file. On a
+/// real machine that measured **27 seconds** per listing (Codex alone: 21s for
+/// 399 rollups).
+///
+/// A finished session's file never changes again, so keying on `(mtime, size)`
+/// makes all but the actively-written file a stat-only lookup. Failures are
+/// cached too (as `None`), so an unparseable file is not re-read on every pass.
+///
+/// Fail-soft: if the file cannot be stat'ed we simply parse without caching.
+pub(crate) fn cached_file_parse<F>(path: &std::path::Path, parse: F) -> Option<AgentSession>
+where
+    F: FnOnce(&std::path::Path) -> Option<AgentSession>,
+{
+    let key = std::fs::metadata(path).ok().map(|m| {
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        (mtime, m.len())
+    });
+    let Some((mtime, size)) = key else {
+        return parse(path);
+    };
+
+    if let Ok(cache) = file_cache().lock() {
+        if let Some((m, s, hit)) = cache.get(path) {
+            if *m == mtime && *s == size {
+                return hit.clone();
+            }
+        }
+    }
+
+    let parsed = parse(path);
+
+    if let Ok(mut cache) = file_cache().lock() {
+        if cache.len() >= FILE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (mtime, size, parsed.clone()));
+    }
+    parsed
+}
+
 /// Current wall-clock time in unix millis (0 on the impossible pre-epoch error).
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -288,54 +366,57 @@ pub struct ToolStat {
     pub last_active: i64,
 }
 
-/// Process-wide cache of the merged session list, keyed by a cheap source
-/// fingerprint. Invalidated automatically when any source file changes.
-fn list_cache() -> &'static std::sync::Mutex<Option<(u64, Vec<AgentSession>)>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Vec<AgentSession>)>>> =
-        std::sync::OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(None))
+/// Per-tool cache of a reader's session list, keyed by the tool's stable key and
+/// validated by that reader's own source fingerprint.
+type ListCache =
+    std::sync::Mutex<std::collections::HashMap<&'static str, (u64, Vec<AgentSession>)>>;
+
+/// Process-wide cache of each reader's session list, keyed by that reader's own
+/// stat-only fingerprint.
+///
+/// Deliberately **per reader**, not one merged entry. A single combined
+/// fingerprint means any tool writing anywhere invalidates everything, and on a
+/// working machine one of these tools is nearly always writing — so a shared key
+/// almost never hits and every reader pays full cost every time. Cursor in
+/// particular re-copied its whole database because Claude Code appended a line.
+fn list_cache() -> &'static ListCache {
+    static C: std::sync::OnceLock<ListCache> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Combined fingerprint of all present sources; `None` if any present reader
-/// can't be fingerprinted (then the list is not cached — always fresh).
-fn source_fingerprint() -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let mut items: Vec<(String, u64)> = Vec::new();
-    for r in readers().iter().filter(|r| r.is_present()) {
-        items.push((r.tool().key().to_string(), r.source_fingerprint()?));
-    }
-    items.sort();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    items.hash(&mut h);
-    Some(h.finish())
-}
-
-/// Merged session list across all present tools (each already source-tagged),
-/// newest first. **Cached** by a stat-only source fingerprint: re-parses only
-/// when a source file changed since the last call, so repeat page loads are
-/// instant (and Cursor avoids re-copying its large DB every time).
-pub fn all_sessions() -> Vec<AgentSession> {
-    let fp = source_fingerprint();
+/// One reader's sessions, served from cache while its own sources are unchanged.
+/// A reader that cannot be fingerprinted is simply never cached (always fresh).
+fn sessions_for(r: &dyn AgentReader) -> Vec<AgentSession> {
+    let key = r.tool().key();
+    let fp = r.source_fingerprint();
     if let Some(fp) = fp {
-        if let Ok(guard) = list_cache().lock() {
-            if let Some((cached_fp, sessions)) = guard.as_ref() {
+        if let Ok(cache) = list_cache().lock() {
+            if let Some((cached_fp, sessions)) = cache.get(key) {
                 if *cached_fp == fp {
                     return sessions.clone();
                 }
             }
         }
     }
+    let sessions = r.list_sessions();
+    if let Some(fp) = fp {
+        if let Ok(mut cache) = list_cache().lock() {
+            cache.insert(key, (fp, sessions.clone()));
+        }
+    }
+    sessions
+}
+
+/// Merged session list across all present tools (each already source-tagged),
+/// newest first. Each reader is cached independently against its own sources, so
+/// a busy tool never forces the quiet ones to be re-read.
+pub fn all_sessions() -> Vec<AgentSession> {
     let mut out: Vec<AgentSession> = readers()
         .iter()
         .filter(|r| r.is_present())
-        .flat_map(|r| r.list_sessions())
+        .flat_map(|r| sessions_for(r.as_ref()))
         .collect();
     out.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
-    if let Some(fp) = fp {
-        if let Ok(mut guard) = list_cache().lock() {
-            *guard = Some((fp, out.clone()));
-        }
-    }
     out
 }
 
@@ -388,43 +469,32 @@ pub fn tool_stats(sessions: &[AgentSession]) -> Vec<ToolStat> {
         .collect()
 }
 
-/// Rough public $/1M-token prices `(input, output, cache_read)` for a model, by
-/// prefix. Cloud coding-agent models only; local/unknown models are free (0).
-/// These are ESTIMATES for a "cost avoided / spent" ballpark, not billing.
-fn price_per_m(model: &str) -> (f64, f64, f64) {
-    let m = model.to_lowercase();
-    // Local engines routed through a tool (OpenCode → Ollama) — no cloud cost.
-    if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") || m.contains(':') {
-        return (0.0, 0.0, 0.0);
-    }
-    // Anthropic.
-    if m.contains("opus") {
-        return (15.0, 75.0, 1.5);
-    }
-    if m.contains("sonnet") {
-        return (3.0, 15.0, 0.3);
-    }
-    if m.contains("haiku") || m.contains("fable") {
-        return (1.0, 5.0, 0.1);
-    }
-    // OpenAI GPT-5 family (incl. codex).
-    if m.contains("gpt-5") || m.contains("gpt5") {
-        return (1.25, 10.0, 0.125);
-    }
-    if m.contains("gpt-4o") || m.contains("gpt-4.1") {
-        return (2.5, 10.0, 0.25);
-    }
-    // Google Gemini.
-    if m.contains("gemini") {
-        return (1.25, 10.0, 0.125);
-    }
-    (0.0, 0.0, 0.0)
+/// Estimated USD cost for a session's token usage (0 if the model is unknown or
+/// runs locally), using the built-in price table.
+///
+/// `input` must be the **non-cached** input count (see [`AgentSession::input_tokens`]);
+/// pricing cached tokens at full input rate is exactly the mistake that inflated
+/// a real history's estimate more than tenfold.
+pub fn cost_usd(model: Option<&str>, input: u64, output: u64, cache: u64) -> f64 {
+    cost_usd_with(
+        &crate::config::PricingConfig::default(),
+        model,
+        input,
+        output,
+        cache,
+    )
 }
 
-/// Estimated USD cost for a session's token usage (0 if the model is unknown/local).
-pub fn cost_usd(model: Option<&str>, input: u64, output: u64, cache: u64) -> f64 {
+/// As [`cost_usd`], but against a caller-supplied (user-editable) price table.
+pub fn cost_usd_with(
+    pricing: &crate::config::PricingConfig,
+    model: Option<&str>,
+    input: u64,
+    output: u64,
+    cache: u64,
+) -> f64 {
     let Some(model) = model else { return 0.0 };
-    let (pin, pout, pcache) = price_per_m(model);
+    let (pin, pout, pcache) = pricing.lookup(model);
     (input as f64 * pin + output as f64 * pout + cache as f64 * pcache) / 1_000_000.0
 }
 
@@ -561,6 +631,55 @@ mod tests {
         assert_eq!(cost_usd(None, 100, 100, 0), 0.0);
     }
 
+    /// Cached tokens are far cheaper than fresh input, so they must be priced as
+    /// cache. Charging them at the input rate is what turned a real history's
+    /// estimate into a five-figure number.
+    #[test]
+    fn cached_tokens_are_priced_as_cache_not_as_input() {
+        // 1M cached vs 1M fresh input on Opus: $1.50 vs $15.00.
+        let cached = cost_usd(Some("claude-opus-4-8"), 0, 0, 1_000_000);
+        let fresh = cost_usd(Some("claude-opus-4-8"), 1_000_000, 0, 0);
+        assert!((cached - 1.5).abs() < 0.01, "cached: {cached}");
+        assert!((fresh - 15.0).abs() < 0.01, "fresh: {fresh}");
+        assert!(cached < fresh / 5.0);
+    }
+
+    #[test]
+    fn a_user_supplied_price_table_overrides_the_defaults() {
+        let pricing = crate::config::PricingConfig {
+            models: vec![crate::config::ModelPrice {
+                match_: "opus".into(),
+                input: 1.0,
+                output: 2.0,
+                cache: 0.5,
+            }],
+            ..Default::default()
+        };
+        // 1M input at the user's $1.00, not the built-in $15.00.
+        let c = cost_usd_with(&pricing, Some("claude-opus-4-8"), 1_000_000, 0, 0);
+        assert!((c - 1.0).abs() < 0.001, "{c}");
+        // A model missing from a user table costs nothing rather than guessing.
+        assert_eq!(
+            cost_usd_with(&pricing, Some("gpt-5.5"), 1_000_000, 0, 0),
+            0.0
+        );
+        // Local models stay free regardless of the table.
+        assert_eq!(
+            cost_usd_with(&pricing, Some("ollama/x:1b"), 1_000, 0, 0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn an_empty_price_table_falls_back_to_the_built_ins() {
+        let pricing = crate::config::PricingConfig {
+            models: Vec::new(),
+            ..Default::default()
+        };
+        let c = cost_usd_with(&pricing, Some("claude-opus-4-8"), 1_000_000, 0, 0);
+        assert!((c - 15.0).abs() < 0.01, "{c}");
+    }
+
     /// Manual: prints the retention/at-risk report for the real machine.
     /// `cargo test smoke_at_risk -- --ignored --nocapture`.
     #[test]
@@ -613,5 +732,126 @@ mod tests {
         ] {
             assert_eq!(split_id(&format!("{}:x", t.key())).unwrap().0, t);
         }
+    }
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+
+    /// Manual: per-reader listing cost against the real machine, cold then warm.
+    /// This is the check that caught the Agents page taking 27 seconds per load.
+    /// `cargo test per_reader_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn per_reader_timing() {
+        for r in readers() {
+            if !r.is_present() {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let n = r.list_sessions().len();
+            let cold = t.elapsed();
+            let t2 = std::time::Instant::now();
+            let _ = r.list_sessions();
+            let warm = t2.elapsed();
+            eprintln!(
+                "{:<12} cold {:>9.2?} · warm {:>9.2?}  ({n} sessions)",
+                r.tool().label(),
+                cold,
+                warm
+            );
+        }
+    }
+
+    /// The per-file cache must return an identical result to an uncached parse,
+    /// and must not re-invoke the parser for an unchanged file.
+    #[test]
+    fn file_cache_is_transparent_and_skips_unchanged() {
+        let f = std::env::temp_dir().join(format!("saffev-fc-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&f, "one").unwrap();
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let make = |tag: &str| {
+            let s = AgentSession {
+                id: AgentSession::make_id(AgentTool::Codex, tag),
+                tool: AgentTool::Codex,
+                title: Some(tag.to_string()),
+                project: None,
+                git_branch: None,
+                model: None,
+                started_ts: 1,
+                updated_ts: 2,
+                message_count: 1,
+                tool_call_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                source_path: String::new(),
+            };
+            Some(s)
+        };
+
+        let a = cached_file_parse(&f, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            make("first")
+        });
+        assert_eq!(a.as_ref().unwrap().title.as_deref(), Some("first"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Unchanged file: the parser must NOT run again, and the answer is same.
+        let b = cached_file_parse(&f, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            make("second")
+        });
+        assert_eq!(b.as_ref().unwrap().title.as_deref(), Some("first"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged file must not be re-parsed"
+        );
+
+        // Changed file (different size) invalidates: the parser runs again.
+        std::fs::write(&f, "one-plus-more").unwrap();
+        let c = cached_file_parse(&f, |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            make("third")
+        });
+        assert_eq!(c.as_ref().unwrap().title.as_deref(), Some("third"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A file that does not parse is remembered as a miss, so a broken record is
+    /// not re-read on every single listing.
+    #[test]
+    fn file_cache_remembers_failures() {
+        let f = std::env::temp_dir().join(format!("saffev-fc-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&f, "garbage").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..3 {
+            let got = cached_file_parse(&f, |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            });
+            assert!(got.is_none());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A file that cannot be stat'ed still parses (fail-soft, just uncached).
+    #[test]
+    fn missing_file_still_parses_uncached() {
+        let missing = std::env::temp_dir().join(format!("saffev-none-{}", uuid::Uuid::new_v4()));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let _ = cached_file_parse(&missing, |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            });
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

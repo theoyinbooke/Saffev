@@ -14,7 +14,17 @@
 //!   unchanged via a bounded, drop-oldest tee for logging.
 //! - **Metadata-only by default.** Raw payloads are stored only behind an
 //!   explicit opt-in (`payload_storage`).
-//! - **Nothing leaves the device.** No network calls except to the local engine.
+//! - **Nothing leaves the device**, with exactly two named exceptions, both
+//!   opt-in or content-free:
+//!   1. The update check, which contacts GitHub release metadata only (a version
+//!      number and an installer asset) and never sends user or content data.
+//!   2. The optional AI summary (`agents::codex_server`), which sends a session's
+//!      text to OpenAI through the user's own Codex sign-in. It is **off by
+//!      default** and runs **only on an explicit click**. This is the one path
+//!      where user content is transmitted, and it must stay loudly labelled
+//!      wherever it is offered.
+//!
+//!   No other network call is permitted except to the local engine.
 //!
 //! ## Architecture split
 //!
@@ -35,6 +45,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod exposure;
+pub mod policy;
 pub mod proxy;
 pub mod store;
 pub mod studio;
