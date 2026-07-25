@@ -153,7 +153,16 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
-          # Put our keychain first in the search list so codesign finds the identity.
+          # Make this the DEFAULT keychain and put it first in the search list.
+          #
+          # Deliberately not passed to the packaging script as a flag: this job
+          # checks out at the release TAG, so it runs whatever version of
+          # `package-macos-app.sh` shipped with that release. A CI-only flag added
+          # later would not exist there, and CI must be able to package any tag —
+          # including ones cut before the flag existed. Making the keychain the
+          # default means `codesign` and `notarytool` both find what they need
+          # with no extra arguments.
+          security default-keychain -s "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$KEYCHAIN" | head -3
 
@@ -164,11 +173,12 @@ jobs:
           set -euo pipefail
           # The packaging script takes a keychain profile name. Create it here from
           # the same Apple-ID secrets the notarize job already uses.
+          # Written to the default keychain (set to ours in the previous step),
+          # so the tagged script finds the profile without a --keychain argument.
           xcrun notarytool store-credentials "saffev-ci" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --keychain "$SIGNING_KEYCHAIN" >/dev/null
+            --password "$APPLE_APP_PASSWORD" >/dev/null
           echo "notarytool profile stored"
 
       - name: Build, sign, notarize, and staple the DMG
@@ -179,10 +189,11 @@ jobs:
           # The script builds the release binary with the `tray` feature, assembles
           # Saffev.app, signs it, notarizes + staples it, then wraps it in a
           # drag-install DMG which is itself signed, notarized and stapled.
+          # Only flags that have existed since the DMG was first packaged, so this
+          # works against older tags too.
           scripts/package-macos-app.sh \
             --sign "$CODESIGN_IDENTITY" \
-            --notarize "saffev-ci" \
-            --keychain "$SIGNING_KEYCHAIN"
+            --notarize "saffev-ci"
 
       - name: Verify Gatekeeper accepts the DMG
         if: steps.creds.outputs.have_creds == 'true'
