@@ -1366,13 +1366,17 @@ fn spawn_writer(conn: Connection, mut rx: mpsc::Receiver<WriteOp>) {
 fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
     match op {
         WriteOp::Engine(e) => {
-            // Upsert by engine name so re-detection updates the same row.
+            // Upsert by engine NAME (unique since migration v8) so adopt /
+            // revert / re-detection all update the same row. The previous
+            // `ON CONFLICT(id)` never fired (id inserts as NULL → fresh
+            // autoincrement), so rows accumulated and readers returned the
+            // oldest — including a stale journal to revert.
             conn.execute(
                 "INSERT INTO engines \
                  (id, engine, version, public_port, shadow_port, adoption_state, journal_json, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                   engine=excluded.engine, version=excluded.version, \
+                 ON CONFLICT(engine) DO UPDATE SET \
+                   version=excluded.version, \
                    public_port=excluded.public_port, shadow_port=excluded.shadow_port, \
                    adoption_state=excluded.adoption_state, journal_json=excluded.journal_json, \
                    updated_at=excluded.updated_at",
@@ -2789,6 +2793,47 @@ mod tests {
         assert_eq!(engines[0].engine, "ollama");
         assert_eq!(engines[0].adoption_state, AdoptionState::Cooperative);
         assert_eq!(engines[0].shadow_port, Some(11999));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn engine_writes_upsert_by_name_and_readers_see_the_newest_state() {
+        // Regression: engine writes used to APPEND (the ON CONFLICT target was
+        // `id`, inserted as NULL), so `engines()` returned the OLDEST record —
+        // a revert never became visible, and a stale journal could be replayed.
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        let rec = |state: AdoptionState, journal: &str, at: i64| {
+            WriteOp::Engine(EngineRecord {
+                id: 0,
+                engine: "ollama".into(),
+                version: Some("0.1.0".into()),
+                public_port: 11434,
+                shadow_port: None,
+                adoption_state: state,
+                journal_json: journal.into(),
+                updated_at: at,
+            })
+        };
+        // adopt … then revert — the exact sequence the Studio buttons drive.
+        store.enqueue(rec(
+            AdoptionState::Adopted,
+            r#"[{"DisabledAutostart":{"unit":"ollama.service"}}]"#,
+            1,
+        ));
+        store.enqueue(rec(AdoptionState::Reverted, "[]", 2));
+        store.flush().await.unwrap();
+
+        let engines = store.engines().await.unwrap();
+        assert_eq!(engines.len(), 1, "one row per engine, not an append log");
+        assert_eq!(engines[0].adoption_state, AdoptionState::Reverted);
+        assert_eq!(
+            engines[0].journal_json, "[]",
+            "the journal must be the newest one — a stale journal must never \
+             survive to be replayed"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

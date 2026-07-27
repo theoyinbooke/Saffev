@@ -230,6 +230,20 @@ pub const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_archive_log_session ON archive_log(session_id);
     "#,
+    // --- v8: one row per engine ---
+    //
+    // The engines writer always intended "upsert by engine name" but conflicted
+    // on `id` while inserting NULL ids — so every adopt/revert/detection APPENDED
+    // a row, and readers (`ORDER BY id`, find-first) returned the OLDEST record.
+    // That made a revert invisible (state never changed in any view) and, worse,
+    // could hand revert a STALE journal. Dedupe to the newest row per engine,
+    // then enforce uniqueness so the writer's `ON CONFLICT(engine)` upsert works.
+    r#"
+    DELETE FROM engines WHERE id NOT IN (
+        SELECT MAX(id) FROM engines GROUP BY engine
+    );
+    CREATE UNIQUE INDEX idx_engines_engine ON engines(engine);
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.
