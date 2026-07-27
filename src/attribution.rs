@@ -154,10 +154,13 @@ fn pid_lookup(peer: SocketAddr) -> Option<String> {
     process_name_for_pid(pid)
 }
 
-/// Find the socket inode whose *remote* end matches `peer` in `/proc/net/tcp[6]`.
+/// Find the socket inode of the *client's* socket in `/proc/net/tcp[6]`.
 ///
-/// From the proxy's vantage the client connection appears as a row whose remote
-/// address+port equals the client's `peer`. We match on that.
+/// A loopback connection appears twice in the table: the client's socket
+/// (local = the client's ephemeral port) and our own accepted socket
+/// (remote = that same ephemeral port). Only the client row's inode maps to
+/// the client's PID — matching the remote side would attribute every
+/// long-lived connection to ourselves.
 #[cfg(target_os = "linux")]
 fn socket_inode_for_peer(peer: SocketAddr) -> Option<u64> {
     let want_port = peer.port();
@@ -165,25 +168,35 @@ fn socket_inode_for_peer(peer: SocketAddr) -> Option<u64> {
         let Ok(contents) = std::fs::read_to_string(path) else {
             continue;
         };
-        for line in contents.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            // local_address remote_address st ... inode is field index 9.
-            if fields.len() < 10 {
-                continue;
-            }
-            let remote = fields[2];
-            let Some((_addr_hex, port_hex)) = remote.split_once(':') else {
-                continue;
-            };
-            let Ok(rport) = u16::from_str_radix(port_hex, 16) else {
-                continue;
-            };
-            if rport != want_port {
-                continue;
-            }
-            if let Ok(inode) = fields[9].parse::<u64>() {
-                return Some(inode);
-            }
+        if let Some(inode) = client_socket_inode(&contents, want_port) {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+/// Scan one `/proc/net/tcp[6]` table for the row whose *local* port is the
+/// client's ephemeral port, returning its socket inode. Pure; unit-tested.
+#[cfg(target_os = "linux")]
+fn client_socket_inode(contents: &str, want_port: u16) -> Option<u64> {
+    for line in contents.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // local_address remote_address st ... inode is field index 9.
+        if fields.len() < 10 {
+            continue;
+        }
+        let local = fields[1];
+        let Some((_addr_hex, port_hex)) = local.split_once(':') else {
+            continue;
+        };
+        let Ok(lport) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if lport != want_port {
+            continue;
+        }
+        if let Ok(inode) = fields[9].parse::<u64>() {
+            return Some(inode);
         }
     }
     None
@@ -464,6 +477,28 @@ mod tests {
     fn loopback_peer_is_local() {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         assert!(is_local_peer(peer));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_socket_inode_picks_client_row_not_our_own() {
+        // One loopback connection, both rows: the proxy's accepted socket
+        // (local :8088 = 0x1F98, remote :54321 = 0xD431, inode 111) and the
+        // client's socket (local :54321, remote :8088, inode 222). The client's
+        // ephemeral port is 54321 — we must return the CLIENT's inode (222),
+        // never our own accepted socket's (111).
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 0100007F:1F98 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 111\n\
+             1: 0100007F:D431 0100007F:1F98 01 00000000:00000000 00:00000000 00000000  1000        0 222\n";
+        assert_eq!(client_socket_inode(table, 54321), Some(222));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_socket_inode_none_when_port_absent() {
+        let table = "  sl  local_address rem_address   st ...\n\
+             0: 0100007F:1F98 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 111\n";
+        assert_eq!(client_socket_inode(table, 12345), None);
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
