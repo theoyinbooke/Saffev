@@ -272,6 +272,15 @@
     ver.appendChild(document.createTextNode(' → '));
     ver.appendChild(el('span', { text: 'v' + st.latestVersion }));
     foot.appendChild(ver);
+    if (st.applySupported === false) {
+      // This install can't self-apply (macOS .app from the DMG, or a dev
+      // build) · show how it actually updates instead of a button that
+      // would refuse.
+      if (st.applyNote) foot.appendChild(el('div', { class: 'umsg', text: st.applyNote }));
+      const link = el('a', { class: 'btn', href: st.releaseUrl || '#', target: '_blank', rel: 'noopener', html: ICON.download + '<span>View release</span>' });
+      foot.appendChild(link);
+      return;
+    }
     const btn = el('button', { class: 'btn primary', html: ICON.download + '<span>Update &amp; restart</span>' });
     btn.addEventListener('click', () => applyAndRestart(foot, btn, st));
     foot.appendChild(btn);
@@ -327,6 +336,10 @@
       showBanner('Not authorized · the Studio token is missing or invalid. Run `' + BRAND.command + ' status` for the local URL with a token, or open Settings.', 'danger');
     } else if (e && e.status === 403) {
       showBanner('Blocked by Host allowlist · open the Studio at its loopback address (e.g. 127.0.0.1).', 'danger');
+    } else if (e && e.status && e.code) {
+      // The backend answered with a structured refusal (409/404/400) — its
+      // message says exactly what to do; show it verbatim, not as "unreachable".
+      showBanner(e.message + '.', 'danger');
     } else {
       showBanner('Cannot reach the Studio backend: ' + (e && e.message ? e.message : 'unknown error') + '.', 'danger');
     }
@@ -876,7 +889,6 @@
   const Live = {
     title: 'Live',
     sub: 'What your apps are doing with local models · right now.',
-    stream: null,         // legacy handle (unused; fetch-reader drives the feed)
     _streamCtrl: null,    // AbortController for the in-flight stream fetch
     _streamTimer: null,   // reconnect backoff timer
     _stopStream: false,
@@ -929,7 +941,9 @@
         ]),
       ]);
       view.appendChild(el('section', { class: 'cockpit' }, [streamCard, rail]));
-      view.appendChild(cliBlock());
+      // Filled with live values by refresh(); starts as placeholders, never
+      // fake data.
+      view.appendChild(el('div', { id: 'cliMirror' }, [cliBlock(null)]));
 
       await this.refresh();
       this.connectStream();
@@ -988,9 +1002,11 @@
       // engine + exposure (best-effort, independent of /live)
       try {
         const ev = await api('/engines');
+        this._ev = ev;
         this.renderEngine(ev);
         this.renderExposureHero(ev.exposure);
         setEnginePill(ev);
+        this.renderCliMirror();
       } catch (e) {
         // Don't leave the cards stuck on their loading text · show a small
         // error/retry state instead.
@@ -1007,8 +1023,27 @@
         this.renderMaskingBar();
         // Pick up the real proxy port so onboarding copy-blocks are accurate.
         this.proxyPort = s.proxyPort || this.proxyPort;
+        this._payloadStorage = !!s.payloadStorage;
         if (this._needOnboard) this.renderOnboard(true);
+        this.renderCliMirror();
       } catch (e) { /* leave the bar at its last-known state */ }
+    },
+
+    // Rebuild the status-mirror terminal from the freshest data we hold.
+    renderCliMirror() {
+      const host = $('#cliMirror');
+      if (!host) return;
+      const ev = this._ev;
+      const active = ev && (ev.engines || []).find((e) => e.isActive);
+      host.innerHTML = '';
+      host.appendChild(cliBlock({
+        proxyPort: this.proxyPort,
+        upstreamPort: active ? active.publicPort : null,
+        health: active ? active.health : null,
+        mode: ev ? ev.mode : null,
+        payloadStorage: this._payloadStorage,
+        exposed: ev && ev.exposure ? !!ev.exposure.exposed : null,
+      }));
     },
 
     // Render (or clear) the "no traffic yet" onboarding card. Shows the easiest
@@ -1242,7 +1277,6 @@
       this._stopStream = true;
       if (this._streamTimer) { clearTimeout(this._streamTimer); this._streamTimer = null; }
       if (this._streamCtrl) { try { this._streamCtrl.abort(); } catch (e) {} this._streamCtrl = null; }
-      this.stream = null;
     },
 
     onEvent(msg) {
@@ -1339,13 +1373,34 @@
     return el('section', { class: 'statbar reveal', style: '--cols:' + cols }, cells);
   }
 
-  function cliBlock() {
+  // A mirror of `saffev status` built from LIVE state (never hardcoded ports
+  // or verdicts — a terminal that always says "healthy · not exposed" is a
+  // decoration, not a status). `info`: { proxyPort, upstreamPort, health,
+  // mode, payloadStorage, exposed } — any missing field renders as `·`.
+  function cliBlock(info) {
+    info = info || {};
+    const port = (p) => (p != null ? ':' + p : '·');
+    const healthy = info.health === 'healthy';
+    const healthHtml = info.health
+      ? '<span class="' + (healthy ? 'g' : 'r') + '">' + esc(info.health) + '</span>'
+      : '<span class="m">·</span>';
+    const modeLine = info.mode === 'gateway'
+      ? 'gateway <span class="m">·</span> transparent capture on the engine port'
+      : (info.mode ? 'cooperative <span class="m">·</span> captures traffic sent to the proxy' : '·');
+    const privacyLine = info.payloadStorage
+      ? 'payload capture on <span class="m">·</span> opt-in'
+      : 'metadata-only <span class="m">·</span> raw text never stored';
+    const exposureLine = info.exposed == null
+      ? '<span class="m">·</span>'
+      : (info.exposed
+        ? '<span class="r">⚠ reachable beyond localhost</span>'
+        : 'localhost-only  <span class="g">✓ not exposed</span>');
     const pre =
       '<span class="p">~</span> <span class="v">' + esc(BRAND.command) + ' status</span>\n' +
-      '<span class="g">●</span> proxy      <span class="c">:8088</span> <span class="m">▸</span> engine <span class="c">:11434</span>      <span class="g">healthy</span>\n' +
-      '<span class="g">●</span> mode       cooperative <span class="m">·</span> captures traffic sent to the proxy\n' +
-      '<span class="g">●</span> privacy    metadata-only <span class="m">·</span> encrypted (keyring)\n' +
-      '<span class="g">●</span> exposure   localhost-only  <span class="g">✓ not exposed</span>\n' +
+      '<span class="g">●</span> proxy      <span class="c">' + esc(port(info.proxyPort)) + '</span> <span class="m">▸</span> engine <span class="c">' + esc(port(info.upstreamPort)) + '</span>      ' + healthHtml + '\n' +
+      '<span class="g">●</span> mode       ' + modeLine + '\n' +
+      '<span class="g">●</span> privacy    ' + privacyLine + '\n' +
+      '<span class="g">●</span> exposure   ' + exposureLine + '\n' +
       '<span class="p">~</span> <span class="v">_</span>';
     return el('div', { class: 'cli reveal', style: 'animation-delay:.48s' }, [
       el('div', { class: 'bar' }, [
@@ -1517,11 +1572,11 @@
   /* =========================================================================
      PAGE: PRIVACY
      ========================================================================= */
+  // Rendered as the Analytics "Privacy" tab (never routed directly — bare
+  // #/privacy redirects there). `an` is the Analytics page object, passed so
+  // the tab can add window-scoped charts from /analytics data.
   const Privacy = {
-    title: 'Privacy',
-    sub: 'Deterministic PII detection · observe-only, on this device.',
-
-    async render(view) {
+    async render(view, an) {
       view.innerHTML = '';
       view.appendChild(loadingState('Aggregating findings…'));
       let s;
@@ -1578,6 +1633,21 @@
         ]),
       ]);
       view.appendChild(breakdowns);
+
+      // When rendered as the Analytics Privacy tab, `an` carries the analytics
+      // window data — add the charts only that window can provide (time series
+      // + side/action donuts). The by-type/app/model breakdowns above already
+      // cover the rest, so nothing is duplicated.
+      const d = an && an.data;
+      if (d && (d.piiFindings || 0) > 0) {
+        const C = window.SaffevCharts;
+        const xl = an.xLabels(d);
+        const grid = el('section', { class: 'an-grid', style: 'margin-top:16px' });
+        grid.appendChild(anCard('PII findings over time', 'analytics window', C.lineArea({ series: [{ name: 'PII', values: d.series.map((b) => b.pii), color: 'var(--danger)' }], xLabels: xl }), true));
+        grid.appendChild(anCard('Where it appears', 'into vs out of the model', C.donut({ items: [{ label: 'On request (to model)', value: d.piiRequestSide, color: 'var(--danger)' }, { label: 'On response (from model)', value: d.piiResponseSide, color: 'var(--gold)' }], centerLabel: 'findings' })));
+        grid.appendChild(anCard('Masking action', 'observed / dry-run / masked', C.donut({ items: (d.piiByAction || []).map((a) => ({ label: actionLabel(a.name), value: a.count })), centerLabel: 'findings' })));
+        view.appendChild(grid);
+      }
       updatePiiBadge(s.total);
     },
     teardown() {},
@@ -1814,6 +1884,22 @@
       if (this.tab === 'privacy') this.panelPrivacy(panel, view, s);
       else if (this.tab === 'system') this.panelSystem(panel, view, s);
       else this.panelGeneral(panel, view, s);
+
+      // Deep-link focus (`#/settings/<tab>/<section>`): scroll to the named
+      // card and flash it so the user lands on the exact control they were
+      // sent to (e.g. the Agents "Turn on Preservation" banner). One-shot.
+      if (this._focus) {
+        const target = panel.querySelector('[data-focus="' + this._focus + '"]');
+        this._focus = null;
+        if (target) {
+          // Let the entrance animation place the card before scrolling to it.
+          setTimeout(() => {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.add('focus-flash');
+            setTimeout(() => target.classList.remove('focus-flash'), 2400);
+          }, 80);
+        }
+      }
     },
 
     panelGeneral(panel, view, s) {
@@ -1968,7 +2054,7 @@
       panel.appendChild(maskCard);
 
       // Evaluation (eval pipeline: safety guard + judge). Async, off hot path.
-      const evalCard = el('div', { class: 'card reveal', style: 'animation-delay:.12s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Evaluation' })])]);
+      const evalCard = el('div', { class: 'card reveal', 'data-focus': 'evaluation', style: 'animation-delay:.12s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Evaluation' })])]);
       const evEnable = switchBtn(s.evalEnabled, 'Toggle evaluation');
       evEnable.addEventListener('click', () => this.save(view, { evalEnabled: !evEnable.classList.contains('on') }));
       const evHint = s.evalEnabled
@@ -2003,7 +2089,7 @@
 
       // AI analysis (optional Codex app-server backend). The ONLY feature that
       // sends content off-device — strictly opt-in, and only on an explicit click.
-      const aiCard = el('div', { class: 'card reveal', style: 'animation-delay:.16s' }, [el('div', { class: 'hrow' }, [el('h3', {}, [el('span', { class: 'aiblk-ic', html: ICON.sparkles }), document.createTextNode(' AI analysis')])])]);
+      const aiCard = el('div', { class: 'card reveal', 'data-focus': 'analysis', style: 'animation-delay:.16s' }, [el('div', { class: 'hrow' }, [el('h3', {}, [el('span', { class: 'aiblk-ic', html: ICON.sparkles }), document.createTextNode(' AI analysis')])])]);
       const aiEnable = switchBtn(s.analysisEnabled, 'Toggle AI analysis', { disabled: !s.analysisAvailable });
       aiEnable.addEventListener('click', () => { if (!s.analysisAvailable) return; this.save(view, { analysisEnabled: !aiEnable.classList.contains('on') }); });
       const aiHint = !s.analysisAvailable
@@ -2015,7 +2101,7 @@
       panel.appendChild(aiCard);
 
       // Preservation archive — durable local copy that survives source deletion.
-      const arCard = el('div', { class: 'card reveal', style: 'animation-delay:.2s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Preservation' })])]);
+      const arCard = el('div', { class: 'card reveal', 'data-focus': 'preservation', style: 'animation-delay:.2s' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'Preservation' })])]);
       const arEnable = switchBtn(s.archiveEnabled, 'Toggle preservation archive');
       arEnable.addEventListener('click', () => this.save(view, { archiveEnabled: !arEnable.classList.contains('on') }));
       const arHint = s.archiveEnabled
@@ -2428,7 +2514,7 @@
       // Privacy + Quality are folded in as tabs; they own their own data + empty
       // states (fetched from /privacy and /quality), so they render directly and
       // bypass the analytics-window empty guard below.
-      if (this.tab === 'privacy') { Privacy.render(panel); return; }
+      if (this.tab === 'privacy') { Privacy.render(panel, this); return; }
       if (this.tab === 'quality') { Quality.draw(panel, this.rangeMs); return; }
       if (!this.data) return;
       const d = this.data;
@@ -2534,18 +2620,6 @@
       panel.appendChild(anCard('Slowest exchanges', 'click a row for detail', wrap, true));
     },
 
-    privacy(panel, d) {
-      const C = window.SaffevCharts;
-      const xl = this.xLabels(d);
-      const grid = el('section', { class: 'an-grid' });
-      grid.appendChild(anCard('PII findings over time', 'observe-only', C.lineArea({ series: [{ name: 'PII', values: d.series.map((b) => b.pii), color: 'var(--danger)' }], xLabels: xl }), true));
-      grid.appendChild(anCard('By type', 'request + response', C.hbars({ items: d.piiByKind.map((k) => ({ label: piiLabel(k.kind), value: k.requestCount + k.responseCount, note: k.requestCount + ' req · ' + k.responseCount + ' resp' })), color: 'var(--danger)' })));
-      grid.appendChild(anCard('Where it appears', 'into vs out of the model', C.donut({ items: [{ label: 'On request (to model)', value: d.piiRequestSide, color: 'var(--danger)' }, { label: 'On response (from model)', value: d.piiResponseSide, color: 'var(--gold)' }], centerLabel: 'findings' })));
-      grid.appendChild(anCard('Top sources', 'apps sending PII', C.hbars({ items: d.piiByApp.map((a) => ({ label: a.name, value: a.count })), color: 'var(--danger)' })));
-      grid.appendChild(anCard('Masking action', 'observed / dry-run / masked', C.donut({ items: d.piiByAction.map((a) => ({ label: actionLabel(a.name), value: a.count })), centerLabel: 'findings' })));
-      panel.appendChild(grid);
-    },
-
     explorer(panel, d) {
       panel.appendChild(el('div', { class: 'an-export reveal' }, [
         el('span', { class: 'muted', style: 'font-size:.86rem', text: 'Export the full report for this window:' }),
@@ -2649,26 +2723,13 @@
   /* =========================================================================
      PAGE: QUALITY & SAFETY  (eval pipeline)
      ========================================================================= */
+  // Rendered as the Analytics "Quality" tab (never routed directly — bare
+  // #/quality redirects there); the window comes from the Analytics range
+  // dropdown via draw()'s `rangeMs`.
   const Quality = {
-    title: 'Quality & Safety',
-    sub: 'Sampled safety + quality evaluation of your local model traffic · async, on-device.',
     rangeMs: 24 * 60 * 60 * 1000,
-    RANGES: [
-      { value: 3600000, label: 'Last hour' },
-      { value: 86400000, label: 'Last 24 hours' },
-      { value: 604800000, label: 'Last 7 days' },
-      { value: 2592000000, label: 'Last 30 days' },
-    ],
-    async render(view) {
-      this._view = view;
-      view.innerHTML = '';
-      const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.draw(); }, { ariaLabel: 'Time range', align: 'right' });
-      view.appendChild(el('div', { class: 'an-head reveal' }, [el('div', { class: 'spacer' }), el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
-      view.appendChild(el('div', { id: 'qBody' }));
-      await this.draw();
-    },
     async draw(container, rangeMs) {
-      const body = container || $('#qBody');
+      const body = container;
       const range = rangeMs || this.rangeMs;
       if (!body) return;
       body.innerHTML = '';
@@ -2682,7 +2743,7 @@
         body.appendChild(el('div', { class: 'card reveal' }, [
           aboutSection(ICON.shieldAlert, 'Evaluation is off', 'Turn it on to score traffic for safety'),
           el('p', { class: 'about-p', text: 'The eval pipeline scores sampled exchanges for safety (and, optionally, quality) · asynchronously and on-device, never blocking your model. It is off by default.' }),
-          el('a', { class: 'btn primary', href: '#/settings', html: ICON.check + '<span>Enable in Settings</span>' }),
+          el('a', { class: 'btn primary', href: '#/settings/privacy/evaluation', html: ICON.check + '<span>Enable in Settings</span>' }),
         ]));
         return;
       }
@@ -3090,11 +3151,14 @@
       ]));
       const actions = el('div', { class: 'preserve-actions' });
       if (arch.enabled) {
+        // Integrity status as a compact chip so the banner stays one line —
+        // the full sentence (and head digest) lives in the tooltip.
+        actions.appendChild(el('span', { class: 'integrity-chip', id: 'integrityLine', text: 'verifying…', title: 'Checking the archive integrity chain…' }));
         const btn = el('button', { class: 'btn sm brand', type: 'button', id: 'archiveNowBtn', text: 'Archive now' });
         btn.addEventListener('click', () => this.archiveNow(btn));
         actions.appendChild(btn);
       } else {
-        actions.appendChild(el('a', { class: 'btn sm brand', href: '#/settings', text: 'Turn on Preservation' }));
+        actions.appendChild(el('a', { class: 'btn sm brand', href: '#/settings/privacy/preservation', text: 'Turn on Preservation' }));
       }
       const exp = el('button', { class: 'btn ghost sm', type: 'button', text: 'Export all' });
       exp.addEventListener('click', () => this.exportAll(exp));
@@ -3103,34 +3167,30 @@
         const aud = el('button', { class: 'btn ghost sm', type: 'button', title: 'Write a folder containing the transcripts, the integrity chain, and how to check it', text: 'Audit bundle' });
         aud.addEventListener('click', () => this.auditBundle(aud));
         actions.appendChild(aud);
-      }
-      wrap.appendChild(actions);
-      // Integrity line: proof the copy has not been altered since it was kept.
-      if (arch.enabled) {
-        const line = el('div', { class: 'integrity', id: 'integrityLine', text: 'Checking integrity…' });
-        wrap.appendChild(line);
         this.loadIntegrity();
       }
+      wrap.appendChild(actions);
       return wrap;
     },
 
     async loadIntegrity() {
       let v;
-      try { v = await api('/archive/verify'); } catch { return; }
-      const line = $('#integrityLine');
-      if (!line) return;
-      line.innerHTML = '';
+      try { v = await api('/archive/verify'); } catch { const c = $('#integrityLine'); if (c) c.hidden = true; return; }
+      const chip = $('#integrityLine');
+      if (!chip) return;
       if (!v.entries) {
-        line.appendChild(el('span', { class: 'sm', text: 'Nothing preserved yet, so there is nothing to verify.' }));
-        return;
-      }
-      if (v.intact) {
-        line.className = 'integrity ok';
-        line.appendChild(el('span', { text: '✓ Verified · ' + fmtNum(v.entries) + ' preservation events across ' + fmtNum(v.sessions) + ' sessions, unaltered since they were kept.' }));
-        if (v.headDigest) line.appendChild(el('code', { class: 'digest', title: 'Record this somewhere else to anchor your archive at this point in time', text: v.headDigest.slice(0, 16) }));
+        chip.className = 'integrity-chip';
+        chip.textContent = 'not verified yet';
+        chip.title = 'The integrity chain has no entries yet — sessions preserved by an older version predate it. Archive now writes the first entries.';
+      } else if (v.intact) {
+        chip.className = 'integrity-chip ok';
+        chip.textContent = '✓ verified';
+        chip.title = fmtNum(v.entries) + ' preservation events across ' + fmtNum(v.sessions) + ' sessions, unaltered since they were kept.'
+          + (v.headDigest ? '\nHead digest: ' + v.headDigest.slice(0, 16) + ' — record it elsewhere to anchor the archive at this point in time.' : '');
       } else {
-        line.className = 'integrity bad';
-        line.appendChild(el('span', { text: '⚠ Integrity check failed · ' + (v.brokenAt || 'the archive does not match what was recorded.') }));
+        chip.className = 'integrity-chip bad';
+        chip.textContent = '⚠ integrity failed';
+        chip.title = v.brokenAt || 'The archive does not match what was recorded.';
       }
     },
 
@@ -3329,7 +3389,7 @@
       if (!a.enabled) {
         wrap.appendChild(el('div', { class: 'ai-hint' }, [
           document.createTextNode('Summarize this session using your Codex subscription. This is the one feature that sends your content off this device. '),
-          el('a', { href: '#/settings', text: 'Enable in Settings' }),
+          el('a', { href: '#/settings/privacy/analysis', text: 'Enable in Settings' }),
           document.createTextNode('.'),
         ]));
         return wrap;
@@ -3539,11 +3599,18 @@
     // Consolidated pages redirect to their Analytics tab (deep links still work).
     const REDIRECT = { privacy: 'analytics/privacy', quality: 'analytics/quality' };
     if (!raw.includes('/') && REDIRECT[raw]) raw = REDIRECT[raw];
-    const [seg, sub] = raw.split('/');
+    const [seg, sub, extra] = raw.split('/');
     const route = ROUTES[seg] ? seg : 'live';
     const page = ROUTES[route];
     // A `#/analytics/<tab>` deep link opens Analytics on that tab.
     if (route === 'analytics' && sub && Analytics.TABS.some((t) => t.k === sub)) Analytics.tab = sub;
+    // A `#/settings/<tab>[/<section>]` deep link opens Settings on that tab and
+    // scrolls to + highlights the named section card (e.g. the "Turn on
+    // Preservation" banner lands the user on the exact toggle).
+    if (route === 'settings' && sub) {
+      if (['general', 'privacy', 'system'].includes(sub)) Settings.tab = sub;
+      Settings._focus = extra || null;
+    }
     if (activePage && activePage.teardown) activePage.teardown();
     activePage = page;
     setActiveNav(route);
