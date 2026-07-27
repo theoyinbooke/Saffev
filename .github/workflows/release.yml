@@ -313,9 +313,6 @@ jobs:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
 
-  # Build + notarize the macOS menu-bar app as a drag-install DMG and attach it to
-  # the release. Previously done by hand on the maintainer's Mac, which is why the
-  # DMG went missing for v0.5.0 and v0.6.0 while the README kept linking to it.
   custom-package-macos-dmg:
     needs:
       - plan

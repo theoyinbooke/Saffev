@@ -1,0 +1,43 @@
+# Compile the macOS menu-bar tray on every push.
+#
+# The `tray` feature (src/cli/tray.rs + tao/tray-icon) is otherwise only built
+# inside the tag-time DMG job, so a breaking change to `daemon`/`Config` that
+# touches the tray would surface for the first time while cutting a release —
+# the worst possible moment. This job is a cheap `cargo check`, not a package:
+# no signing, no bundle, no DMG.
+#
+# `--no-default-features` skips the bundled SQLCipher + vendored OpenSSL C
+# builds that dominate CI time; the tray code is feature-independent of the
+# store backend, so the check is just as strong.
+
+name: macOS tray check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-tray:
+    name: cargo check --features tray
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-tray-check-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check the tray feature compiles
+        run: cargo check --no-default-features --features tray --locked
