@@ -1,0 +1,112 @@
+{
+  "command": "cargo test --test pii_bench -- --nocapture",
+  "corpus": {
+    "cases": 68,
+    "file": "tests/fixtures/pii/corpus.jsonl",
+    "scored": 61,
+    "sha256": "97bfe3e229af7d1505a2f534d5c0366650108d8f893d230e4ba6023904034b66",
+    "traps": 24,
+    "xfail": 7
+  },
+  "detector": "saffev::brain::pii::Detector, default set, no custom patterns",
+  "harness": "pii_bench v1 (G1 loop 1 — docs/gauntlets/GAUNTLETS.md)",
+  "kinds": {
+    "api_key": {
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 8
+    },
+    "credit_card": {
+      "fn": 0,
+      "fp": 1,
+      "precision": 0.8888888888888888,
+      "recall": 1.0,
+      "tp": 8
+    },
+    "email": {
+      "fn": 0,
+      "fp": 1,
+      "precision": 0.8888888888888888,
+      "recall": 1.0,
+      "tp": 8
+    },
+    "ip_address": {
+      "fn": 3,
+      "fp": 4,
+      "precision": 0.6666666666666666,
+      "recall": 0.7272727272727273,
+      "tp": 8
+    },
+    "phone": {
+      "fn": 1,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 0.875,
+      "tp": 7
+    }
+  },
+  "known_gaps": [
+    {
+      "fired": [],
+      "id": "xfail-001",
+      "note": "obfuscated email — outside deterministic v0 scope by design",
+      "target_kind": "email"
+    },
+    {
+      "fired": [
+        {
+          "kind": "phone",
+          "matched_len": 11
+        }
+      ],
+      "id": "xfail-002",
+      "note": "US SSN — no detector yet; currently miscaught as phone",
+      "target_kind": "ssn"
+    },
+    {
+      "fired": [],
+      "id": "xfail-003",
+      "note": "canonical DE example IBAN — no detector yet",
+      "target_kind": "iban"
+    },
+    {
+      "fired": [],
+      "id": "xfail-004",
+      "note": "JWT — no detector yet",
+      "target_kind": "jwt"
+    },
+    {
+      "fired": [],
+      "id": "xfail-005",
+      "note": "PEM private key block — no detector yet",
+      "target_kind": "private_key"
+    },
+    {
+      "fired": [
+        {
+          "kind": "email",
+          "matched_len": 19
+        }
+      ],
+      "id": "xfail-006",
+      "note": "credentialed connection string — no detector yet; local-part may miscatch as email",
+      "target_kind": "connection_string"
+    },
+    {
+      "fired": [],
+      "id": "xfail-007",
+      "note": "MAC address — no detector yet",
+      "target_kind": "mac_address"
+    }
+  ],
+  "measurement_boundary": "Detector::scan on corpus text only — no proxy, no store, no masking",
+  "overall": {
+    "fn": 4,
+    "fp": 6,
+    "precision": 0.8666666666666667,
+    "recall": 0.9069767441860465,
+    "tp": 39
+  }
+}

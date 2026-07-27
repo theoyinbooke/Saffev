@@ -1,0 +1,68 @@
+{"id":"email-001","text":"contact me at jane.doe+test@example.co.uk please","expect":[{"kind":"email","value":"jane.doe+test@example.co.uk"}],"note":"plus-tag local part, multi-label TLD"}
+{"id":"email-002","text":"from: ADMIN@CORP.EXAMPLE.COM","expect":[{"kind":"email","value":"ADMIN@CORP.EXAMPLE.COM"}],"note":"uppercase"}
+{"id":"email-003","text":"{\"user\":\"o.hare2@mail.example.org\"}","expect":[{"kind":"email","value":"o.hare2@mail.example.org"}],"note":"inside JSON string"}
+{"id":"email-004","text":"reply to dev-null_01@sub.domain-name.io today","expect":[{"kind":"email","value":"dev-null_01@sub.domain-name.io"}],"note":"hyphen/underscore local, hyphenated domain label"}
+{"id":"email-005","text":"cc bob@example.com.","expect":[{"kind":"email","value":"bob@example.com"}],"note":"sentence-final period must not join the match"}
+{"id":"email-006","text":"email=amaka.o@unn.edu.ng&next=1","expect":[{"kind":"email","value":"amaka.o@unn.edu.ng"}],"note":"query-string boundaries"}
+{"id":"email-t01","text":"that is not@an address","expect":[],"trap":"email","note":"no TLD"}
+{"id":"email-t02","text":"handle @nope.com mentioned","expect":[],"trap":"email","note":"no local part"}
+{"id":"email-t03","text":"pair a@b in notes","expect":[],"trap":"email","note":"single-letter domain, no TLD"}
+{"id":"email-t04","text":"ssh user@localhost now","expect":[],"trap":"email","note":"bare host, no TLD dot"}
+{"id":"email-t05","text":"see file image@2x.png here","expect":[],"trap":"email","note":"retina-asset filename shaped like an email — hard negative"}
+{"id":"phone-001","text":"call +1 (555) 123-4567 today","expect":[{"kind":"phone","value":"+1 (555) 123-4567"}],"note":"NANP with country code and parens"}
+{"id":"phone-002","text":"reach me at 555-123-4567, thanks","expect":[{"kind":"phone","value":"555-123-4567"}],"note":"list comma after"}
+{"id":"phone-003","text":"ring +44 20 7946 0958.","expect":[{"kind":"phone","value":"+44 20 7946 0958"}],"note":"UK, sentence-final period"}
+{"id":"phone-004","text":"office line 020 7946 0958 open","expect":[{"kind":"phone","value":"020 7946 0958"}],"note":"UK national format, leading zero"}
+{"id":"phone-005","text":"+234 803 555 1234 is my number","expect":[{"kind":"phone","value":"+234 803 555 1234"}],"note":"Nigerian mobile with country code"}
+{"id":"phone-006","text":"my number is +1 (555) 987-6543.","expect":[{"kind":"phone","value":"+1 (555) 987-6543"}],"note":"sentence-final period regression case"}
+{"id":"phone-t01","text":"logged at 2026-06-06T13:32:50 and again 2026-06-06","expect":[],"trap":"phone","note":"ISO timestamps"}
+{"id":"phone-t02","text":"scheduled for 06.06.2026 / 31-12-2025","expect":[],"trap":"phone","note":"dotted and dashed dates"}
+{"id":"phone-t03","text":"{\"total_duration\":32980116750,\"eval_count\":1759,\"eval_duration\":30678908000}","expect":[],"trap":"phone","note":"ollama-style JSON numerics"}
+{"id":"phone-t04","text":"pi is 3.14159 and the ratio was 1234.5678 exactly","expect":[],"trap":"phone","note":"decimals"}
+{"id":"phone-t05","text":"prices 1999.00, 2499.00 and coords 12.34, 56.78","expect":[],"trap":"phone","note":"price/coordinate lists"}
+{"id":"phone-t06","text":"invoice 12345678 dated 2026","expect":[],"trap":"phone","note":"bare digit run, no separators"}
+{"id":"card-001","text":"pay with 4111 1111 1111 1111 now","expect":[{"kind":"credit_card","value":"4111 1111 1111 1111"}],"note":"Visa test number, spaced"}
+{"id":"card-002","text":"card=4111111111111111;","expect":[{"kind":"credit_card","value":"4111111111111111"}],"note":"run-together, kv boundaries"}
+{"id":"card-003","text":"use 5500-0055-5555-5559 for testing","expect":[{"kind":"credit_card","value":"5500-0055-5555-5559"}],"note":"Mastercard test number, hyphenated"}
+{"id":"card-004","text":"amex 3400 000000 00009 ok","expect":[{"kind":"credit_card","value":"3400 000000 00009"}],"note":"Amex 15-digit, 4-6-5 grouping"}
+{"id":"card-005","text":"discover 6011000000000004 works","expect":[{"kind":"credit_card","value":"6011000000000004"}],"note":"Discover test number"}
+{"id":"card-t01","text":"ref 1234 5678 9012 3456 done","expect":[],"trap":"credit_card","note":"16 digits, Luhn-invalid"}
+{"id":"card-t02","text":"id 4111111111111112 nope","expect":[],"trap":"credit_card","note":"valid Visa off by one digit"}
+{"id":"card-t03","text":"tracking 123456789012 pkg","expect":[],"trap":"credit_card","note":"12 digits, below card minimum"}
+{"id":"card-t04","text":"big number 12345678901234567890 here","expect":[],"trap":"credit_card","note":"20-digit run, above card maximum"}
+{"id":"key-001","text":"token: sk-proj-Zk3Qx9Pa7Lm2Vb8Nc4Rt6Yh1Wd5Sf0aBcDeFgHi","expect":[{"kind":"api_key","value":"sk-proj-Zk3Qx9Pa7Lm2Vb8Nc4Rt6Yh1Wd5Sf0aBcDeFgHi"}],"note":"OpenAI project key shape"}
+{"id":"key-002","text":"ghp_16C7e42F292c6912E7710c838347Ae178B4a pushed","expect":[{"kind":"api_key","value":"ghp_16C7e42F292c6912E7710c838347Ae178B4a"}],"note":"GitHub PAT"}
+{"id":"key-003","text":"creds AKIAIOSFODNN7EXAMPLE in env","expect":[{"kind":"api_key","value":"AKIAIOSFODNN7EXAMPLE"}],"note":"canonical AWS example access key id"}
+{"id":"key-004","text":"slack xoxb-2345678901-2345678901234-AbCdEfGhIjKlMnOpQrStUvWx bot","expect":[{"kind":"api_key","value":"xoxb-2345678901-2345678901234-AbCdEfGhIjKlMnOpQrStUvWx"}],"note":"Slack bot token"}
+{"id":"key-005","text":"stripe sk_live_4eC39HqLyjWDarjtT1zdp7dcABCDEF key","expect":[{"kind":"api_key","value":"sk_live_4eC39HqLyjWDarjtT1zdp7dcABCDEF"}],"note":"Stripe live secret shape"}
+{"id":"key-006","text":"gitlab glpat-XyZ9aBcD3fGh1JkLmN0p token","expect":[{"kind":"api_key","value":"glpat-XyZ9aBcD3fGh1JkLmN0p"}],"note":"GitLab PAT"}
+{"id":"key-007","text":"google AIzaSyD8kQw3xY7pL2mN9vR4tE6uH1jF5gK0aBc here","expect":[{"kind":"api_key","value":"AIzaSyD8kQw3xY7pL2mN9vR4tE6uH1jF5gK0aBc"}],"note":"Google API key shape"}
+{"id":"key-t01","text":"sk-xxxxxxxxxxxxxxxxxxxxxxxx placeholder","expect":[],"trap":"api_key","note":"prefixed but zero-entropy placeholder"}
+{"id":"key-t02","text":"try sk-ab12 short","expect":[],"trap":"api_key","note":"body far below minimum length"}
+{"id":"key-t03","text":"random aF9zQ2mP7vK1xR4tBn8Lc3Wd6Yh0Sg5 string","expect":[],"trap":"api_key","note":"high entropy but no known prefix"}
+{"id":"key-t04","text":"ghp_short1234 nope","expect":[],"trap":"api_key","note":"GitHub prefix, body too short"}
+{"id":"key-t05","text":"sk-1111111111111111 test","expect":[],"trap":"api_key","note":"minimum length but single-symbol body"}
+{"id":"ip-001","text":"server at 192.168.1.100 responded","expect":[{"kind":"ip_address","value":"192.168.1.100"}],"note":"private v4"}
+{"id":"ip-002","text":"ping 8.8.8.8 fast","expect":[{"kind":"ip_address","value":"8.8.8.8"}],"note":"public v4, single digits"}
+{"id":"ip-003","text":"limit 255.255.255.255 broadcast","expect":[{"kind":"ip_address","value":"255.255.255.255"}],"note":"max octets"}
+{"id":"ip-004","text":"addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 end","expect":[{"kind":"ip_address","value":"2001:0db8:85a3:0000:0000:8a2e:0370:7334"}],"note":"full v6"}
+{"id":"ip-005","text":"compressed 2001:db8::8a2e:370:7334 form","expect":[{"kind":"ip_address","value":"2001:db8::8a2e:370:7334"}],"note":"compressed v6"}
+{"id":"ip-006","text":"local ::1 loopback","expect":[{"kind":"ip_address","value":"::1"}],"note":"v6 loopback"}
+{"id":"ip-007","text":"link fe80::1ff:fe23:4567:890a iface","expect":[{"kind":"ip_address","value":"fe80::1ff:fe23:4567:890a"}],"note":"link-local v6"}
+{"id":"ip-008","text":"mapped ::ffff:192.0.2.128 tail","expect":[{"kind":"ip_address","value":"::ffff:192.0.2.128"}],"note":"v4-mapped v6"}
+{"id":"ip-t01","text":"not an ip 999.999.999.999 here","expect":[],"trap":"ip_address","note":"octets out of range"}
+{"id":"ip-t02","text":"version 256.300.1.2 invalid","expect":[],"trap":"ip_address","note":"leading octets out of range"}
+{"id":"ip-t03","text":"time 12:30:45 logged","expect":[],"trap":"ip_address","note":"clock time is not v6"}
+{"id":"ip-t04","text":"build 1.2.3.4 shipped to 4 regions","expect":[],"trap":"ip_address","note":"version string indistinguishable from dotted quad — hard negative"}
+{"id":"cross-001","text":"mail a@b.com from 10.0.0.1 using card 4111 1111 1111 1111","expect":[{"kind":"email","value":"a@b.com"},{"kind":"ip_address","value":"10.0.0.1"},{"kind":"credit_card","value":"4111 1111 1111 1111"}],"note":"three kinds in one line"}
+{"id":"cross-002","text":"{\"api_key\":\"sk-proj-Tr8Kp2Mn9Qw4Xz7Vb3Ny6Ls1Df5Gh0jRt2Uw\",\"host\":\"192.168.0.42\"}","expect":[{"kind":"api_key","value":"sk-proj-Tr8Kp2Mn9Qw4Xz7Vb3Ny6Ls1Df5Gh0jRt2Uw"},{"kind":"ip_address","value":"192.168.0.42"}],"note":"key and host in a JSON body"}
+{"id":"cross-003","text":"on 2026-06-06 call +1 (555) 123-4567 re: invoice 1234.56","expect":[{"kind":"phone","value":"+1 (555) 123-4567"}],"note":"real phone amid date and decimal noise"}
+{"id":"cross-004","text":"fax +1 555 010 2299 or card 5500 0055 5555 5559","expect":[{"kind":"phone","value":"+1 555 010 2299"},{"kind":"credit_card","value":"5500 0055 5555 5559"}],"note":"card must not be double-read as phone"}
+{"id":"cross-005","text":"admin@site.example.net at 172.16.254.3 logged 4111111111111111","expect":[{"kind":"email","value":"admin@site.example.net"},{"kind":"ip_address","value":"172.16.254.3"},{"kind":"credit_card","value":"4111111111111111"}],"note":"mixed kinds, tight spacing"}
+{"id":"xfail-001","text":"write to jane at example dot com","expect":[],"xfail":"email","note":"obfuscated email — outside deterministic v0 scope by design"}
+{"id":"xfail-002","text":"applicant SSN 078-05-1120 on file","expect":[],"xfail":"ssn","note":"US SSN — no detector yet; currently miscaught as phone"}
+{"id":"xfail-003","text":"wire to DE89 3704 0044 0532 0130 00 ref 7","expect":[],"xfail":"iban","note":"canonical DE example IBAN — no detector yet"}
+{"id":"xfail-004","text":"bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U sent","expect":[],"xfail":"jwt","note":"JWT — no detector yet"}
+{"id":"xfail-005","text":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----","expect":[],"xfail":"private_key","note":"PEM private key block — no detector yet"}
+{"id":"xfail-006","text":"export DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod","expect":[],"xfail":"connection_string","note":"credentialed connection string — no detector yet; local-part may miscatch as email"}
+{"id":"xfail-007","text":"mac 00:1a:2b:3c:4d:5e on nic0","expect":[],"xfail":"mac_address","note":"MAC address — no detector yet"}
