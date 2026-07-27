@@ -92,6 +92,11 @@ pub enum UpdateError {
     #[error("{0}")]
     NoReceipt(String),
 
+    /// This install can't self-update by design (macOS `.app` bundle from the
+    /// DMG — see [`APP_BUNDLE_MESSAGE`]). Not a failure; carries the guidance.
+    #[error("{0}")]
+    UnsupportedInstall(String),
+
     /// Any other failure while applying the update (download, installer exit,
     /// network). The message is safe to show the operator.
     #[error("{0}")]
@@ -104,6 +109,59 @@ pub const NO_RECEIPT_MESSAGE: &str =
     "in-app updates are available for installs done via the installer; \
 this looks like a dev or `cargo install` build — reinstall with the installer \
 (see the README) to enable one-click updates";
+
+/// The user-facing guidance when this binary runs from the macOS app bundle
+/// (installed by dragging the DMG). Self-update MUST refuse here even when an
+/// install receipt exists: the receipt belongs to a shell-installer copy (e.g.
+/// `~/.cargo/bin/saffev`), so axoupdater would update THAT binary while the
+/// running `.app` keeps relaunching its own, old one — the version never
+/// changes and the user gets no explanation. Single source of truth for CLI +
+/// Studio + tray.
+pub const APP_BUNDLE_MESSAGE: &str =
+    "this Saffev runs from the macOS app (installed via the DMG), which \
+updates by replacing the app: download the new DMG from the latest GitHub \
+release and drag it to /Applications, then relaunch";
+
+/// This repo's releases page — where DMG installs go to update by hand.
+pub const RELEASES_URL: &str = "https://github.com/theoyinbooke/Saffev/releases/latest";
+
+/// Is `path` inside a macOS `.app` bundle (`…/<Name>.app/Contents/MacOS/…`)?
+/// Pure so it is testable; [`running_from_app_bundle`] feeds it `current_exe`.
+fn path_is_app_bundle(path: &std::path::Path) -> bool {
+    let comps: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    comps
+        .windows(3)
+        .any(|w| w[0].ends_with(".app") && w[1].eq_ignore_ascii_case("Contents") && w[2] == "MacOS")
+}
+
+/// Whether THIS process was launched from inside a `.app` bundle.
+pub fn running_from_app_bundle() -> bool {
+    std::env::current_exe()
+        .map(|p| path_is_app_bundle(&p))
+        .unwrap_or(false)
+}
+
+/// Can this install self-apply an update? `Ok(())` when yes; otherwise the
+/// error carries the exact guidance to show. Checked by [`apply`] before doing
+/// anything, and by the Studio's `GET /api/update` so the UI can offer the
+/// right affordance (button vs. guidance + release link) up front.
+pub fn apply_capability() -> Result<(), UpdateError> {
+    // Order matters: the app-bundle refusal must win even when a receipt
+    // exists (the mixed-install case described on APP_BUNDLE_MESSAGE).
+    if running_from_app_bundle() {
+        return Err(UpdateError::UnsupportedInstall(
+            APP_BUNDLE_MESSAGE.to_string(),
+        ));
+    }
+    let (_updater, has_receipt) = build_updater();
+    if !has_receipt {
+        return Err(UpdateError::NoReceipt(NO_RECEIPT_MESSAGE.to_string()));
+    }
+    Ok(())
+}
 
 /// Compare two semver-ish version strings: is `latest` strictly newer than
 /// `current`? Falls back to a lexical compare if either fails to parse as
@@ -190,11 +248,12 @@ pub async fn check() -> UpdateStatus {
 /// [`UpdateError::NoReceipt`] so callers can show the friendly guidance. On
 /// success returns the installed version; if already current, `updated = false`.
 pub async fn apply() -> Result<ApplyOutcome, UpdateError> {
-    let (mut updater, has_receipt) = build_updater();
+    // Refuse up front when this install can't self-apply (no receipt, or a
+    // DMG .app whose receipt would update the WRONG binary) — before any
+    // network call.
+    apply_capability()?;
 
-    if !has_receipt {
-        return Err(UpdateError::NoReceipt(NO_RECEIPT_MESSAGE.to_string()));
-    }
+    let (mut updater, _has_receipt) = build_updater();
 
     match updater.run().await {
         // An update was installed.
@@ -294,6 +353,34 @@ mod tests {
             NO_RECEIPT_MESSAGE.contains("installer"),
             "no-receipt guidance must mention the installer"
         );
+    }
+
+    #[test]
+    fn app_bundle_paths_are_detected() {
+        use std::path::Path;
+        // The shipped bundle layout.
+        assert!(path_is_app_bundle(Path::new(
+            "/Applications/Saffev.app/Contents/MacOS/saffev"
+        )));
+        // A user-relocated copy still counts.
+        assert!(path_is_app_bundle(Path::new(
+            "/Users/o/Desktop/Saffev.app/Contents/MacOS/saffev"
+        )));
+        // Non-bundle installs do not.
+        assert!(!path_is_app_bundle(Path::new("/Users/o/.cargo/bin/saffev")));
+        assert!(!path_is_app_bundle(Path::new(
+            "/Users/o/code/AlaFAI/target/debug/saffev"
+        )));
+        // ".app" in a plain directory name is not a bundle.
+        assert!(!path_is_app_bundle(Path::new("/tmp/my.app/saffev")));
+    }
+
+    #[test]
+    fn app_bundle_message_says_how_to_update() {
+        // The guidance must point at the DMG/release page, and the URL must
+        // stay on this repo.
+        assert!(APP_BUNDLE_MESSAGE.contains("DMG"));
+        assert!(RELEASES_URL.contains("theoyinbooke/Saffev/releases"));
     }
 
     #[test]

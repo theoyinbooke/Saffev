@@ -517,6 +517,16 @@ pub struct UpdateStatus {
     /// Whether a newer release than `currentVersion` is available. Always false
     /// when `latestVersion` is null (never claim an update we can't confirm).
     pub update_available: bool,
+    /// Whether `POST /api/update` can actually self-apply on this install.
+    /// False for dev/`cargo install` builds (no receipt) and for the macOS
+    /// `.app` (DMG) install, where self-update would touch the wrong binary.
+    pub apply_supported: bool,
+    /// When `applySupported` is false: the guidance to show instead of the
+    /// update button (how this install updates).
+    pub apply_note: Option<String>,
+    /// When `applySupported` is false: where to get the update by hand (the
+    /// releases page).
+    pub release_url: Option<String>,
 }
 
 /// `POST /api/update` — result of applying an update.

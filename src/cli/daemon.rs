@@ -276,6 +276,33 @@ pub fn daemon_state(path: &Path) -> Result<Option<bool>> {
 /// `--foreground`, which never opens a browser regardless, so this is belt-and-
 /// braces (the parent is the one that opens the Studio).
 pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: bool) -> Result<u32> {
+    spawn_background_child(config_path, no_color, no_open, None).map(|c| c.id())
+}
+
+/// Where a background daemon's diagnostic output (its tracing stderr) lands.
+///
+/// Without this, a detached daemon's stderr went to /dev/null and the
+/// "diagnostic log" the crate invariants promise did not exist for background
+/// runs — a daemon that died at startup left nothing to diagnose. The tray's
+/// "Open Logs" opens this file.
+pub fn log_path(cfg: &Config) -> PathBuf {
+    cfg.data_dir.join("daemon.log")
+}
+
+/// Like [`spawn_background`], but returns the [`std::process::Child`] handle so
+/// a long-lived parent (the menu-bar tray) can `try_wait()` it — otherwise the
+/// exited daemon lingers as a zombie for the parent's lifetime — and optionally
+/// routes the child's stdout+stderr to `log_to` instead of /dev/null.
+///
+/// When `log_to` is set, any existing log is rotated to `<name>.old` first, so
+/// the file holds exactly the current run (plus the previous one for
+/// comparison) and stays bounded across restarts.
+pub fn spawn_background_child(
+    config_path: Option<&Path>,
+    no_color: bool,
+    no_open: bool,
+    log_to: Option<&Path>,
+) -> Result<std::process::Child> {
     let exe = std::env::current_exe()
         .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
 
@@ -292,9 +319,16 @@ pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: boo
     }
 
     // Fully detach: no inherited stdio, no controlling terminal coupling.
+    // Diagnostic output goes to the log file when the caller provides one;
+    // opening the log is best-effort (fail-open) — a failure falls back to null
+    // rather than blocking the daemon from starting.
+    let (out, err) = match log_to.and_then(|p| open_rotated_log(p)) {
+        Some((out, err)) => (out, err),
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(out)
+        .stderr(err);
 
     // On Windows there is no `setsid`-style detach via stdio alone: a child of a
     // console process stays attached to the parent's console and dies when the
@@ -314,7 +348,24 @@ pub fn spawn_background(config_path: Option<&Path>, no_color: bool, no_open: boo
         .spawn()
         .map_err(|e| Error::Other(anyhow::anyhow!("failed to spawn background daemon: {e}")))?;
 
-    Ok(child.id())
+    Ok(child)
+}
+
+/// Rotate `path` to `<path>.old` and open a fresh log, returning stdio handles
+/// for stdout + stderr. Best-effort: any failure returns `None` (caller falls
+/// back to /dev/null).
+fn open_rotated_log(path: &Path) -> Option<(std::process::Stdio, std::process::Stdio)> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if path.exists() {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(path, PathBuf::from(old));
+    }
+    let file = std::fs::File::create(path).ok()?;
+    let clone = file.try_clone().ok()?;
+    Some((file.into(), clone.into()))
 }
 
 /// Spawn a fully-detached helper that **stops this daemon and starts a fresh

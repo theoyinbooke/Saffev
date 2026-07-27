@@ -948,8 +948,17 @@ async fn start_background(
     // we already persisted the first-run config above, the child sees a
     // present-and-valid file (no longer a first run for it). We carry `--no-open`
     // for completeness, though the detached child never opens a browser anyway.
-    let pid = match daemon::spawn_background(cli.config.as_deref(), cli.no_color, no_open) {
-        Ok(pid) => pid,
+    // Background daemons log their tracing stderr to `daemon.log` in the data
+    // dir (rotated per start) — otherwise a detached daemon that dies leaves
+    // nothing to diagnose.
+    let log_path = daemon::log_path(&cfg);
+    let pid = match daemon::spawn_background_child(
+        cli.config.as_deref(),
+        cli.no_color,
+        no_open,
+        Some(&log_path),
+    ) {
+        Ok(child) => child.id(),
         Err(e) => {
             tracing::debug!("daemonize failed: {e}");
             println!(
@@ -1275,6 +1284,68 @@ async fn run_servers(cfg: &Config) -> Result<()> {
                             crate::agents::archive::run_snapshot(&store, redaction).await
                         {
                             tracing::warn!(target: "saffev::archive", "auto snapshot failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Background maintenance: retention pruning + periodic archive snapshots.
+    //
+    // Both are promised by the Settings copy ("how long exchanges are kept
+    // before pruning"; "snapshot on start and periodically") and both are
+    // live-reloadable: every tick re-reads the config handle, so changing
+    // retention or archive.auto applies without a restart. Fail-open: a failed
+    // pass is logged to the diagnostic log and the next tick tries again;
+    // nothing here can touch the request hot path.
+    {
+        let store = proxy_state.store.clone();
+        let config = proxy_state.config.clone();
+        tokio::spawn(async move {
+            // First retention pass shortly after start — the DB may already be
+            // over policy from a long downtime. Snapshots skip this early pass:
+            // the cache-warm task above already takes one when auto is on.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let cfg = config.load();
+            let (prune, _) = maintenance_plan(&cfg);
+            if prune {
+                if let Err(e) = store.enforce_retention(cfg.retention).await {
+                    tracing::warn!(target: "saffev::store", "retention pass failed: {e}");
+                }
+            }
+
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(MAINTENANCE_TICK_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick completes immediately — drop it
+            loop {
+                tick.tick().await;
+                let cfg = config.load();
+                let (prune, snapshot) = maintenance_plan(&cfg);
+                if prune {
+                    if let Err(e) = store.enforce_retention(cfg.retention).await {
+                        tracing::warn!(target: "saffev::store", "retention pass failed: {e}");
+                    }
+                }
+                if snapshot {
+                    match crate::agents::archive::Redaction::from_config(&cfg) {
+                        // Redaction is on but will not compile: refuse to archive
+                        // raw text under a "redact" setting (same stance as the
+                        // startup snapshot).
+                        Err(e) => tracing::warn!(
+                            target: "saffev::archive",
+                            "periodic snapshot skipped — redaction failed to build: {e}"
+                        ),
+                        Ok(redaction) => {
+                            if let Err(e) =
+                                crate::agents::archive::run_snapshot(&store, redaction).await
+                            {
+                                tracing::warn!(
+                                    target: "saffev::archive",
+                                    "periodic snapshot failed: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -2287,13 +2358,20 @@ async fn apply_update(p: &Painter, current: &str) {
                 p.success(&format!("already on v{}", outcome.new_version)),
             );
         }
-        // Dev / cargo-install build: no receipt. Friendly guidance, never a crash.
-        Err(crate::update::UpdateError::NoReceipt(msg)) => {
+        // Dev / cargo-install build (no receipt) or the macOS DMG .app (which
+        // updates by replacing the app): friendly guidance, never a crash.
+        Err(crate::update::UpdateError::NoReceipt(msg))
+        | Err(crate::update::UpdateError::UnsupportedInstall(msg)) => {
             println!(
                 "{} {} {}",
                 p.dot(Level::Warn),
                 p.label("update"),
                 p.warn(&msg),
+            );
+            println!(
+                "{} releases: {}",
+                p.muted("·"),
+                p.value(crate::update::RELEASES_URL),
             );
         }
         // A genuine apply failure — surface it (the operator asked to update).
@@ -2316,6 +2394,23 @@ async fn apply_update(p: &Painter, current: &str) {
 /// Linux-only in v0; everywhere else we run Cooperative.
 fn controller_can_adopt(cfg: &Config) -> bool {
     cfg.mode == Mode::Gateway && cfg!(target_os = "linux")
+}
+
+/// Cadence of the background maintenance loop (retention + auto-snapshots).
+/// Hourly: retention policies are day/size-grained and a snapshot pass over a
+/// warm cache is ~ms, so finer ticks buy nothing.
+const MAINTENANCE_TICK_SECS: u64 = 60 * 60;
+
+/// What a maintenance tick should do under `cfg`: `(prune, snapshot)`.
+///
+/// Pure gate logic, split out so it is testable without running the loop:
+/// - prune unless retention is `Unlimited` (skipping avoids opening a writer
+///   connection just to no-op);
+/// - snapshot only when Preservation is on AND auto-snapshots are on.
+fn maintenance_plan(cfg: &Config) -> (bool, bool) {
+    let prune = !matches!(cfg.retention, crate::config::Retention::Unlimited);
+    let snapshot = cfg.archive.enabled && cfg.archive.auto;
+    (prune, snapshot)
 }
 
 /// Does a detected engine match the requested [`EngineArg`]?
@@ -2351,6 +2446,36 @@ fn default_setup_snippet(proxy_url: &str) -> String {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn maintenance_plan_gates_prune_and_snapshot() {
+        use crate::config::Retention;
+
+        let mut cfg = Config::default();
+
+        // Defaults: 30-day retention prunes; archive off → no snapshot.
+        cfg.retention = Retention::default();
+        cfg.archive.enabled = false;
+        cfg.archive.auto = true;
+        assert_eq!(maintenance_plan(&cfg), (true, false));
+
+        // Unlimited retention must not open a writer just to no-op.
+        cfg.retention = Retention::Unlimited;
+        assert_eq!(maintenance_plan(&cfg), (false, false));
+
+        // Preservation on + auto on → snapshot.
+        cfg.archive.enabled = true;
+        cfg.archive.auto = true;
+        assert_eq!(maintenance_plan(&cfg), (false, true));
+
+        // Preservation on but auto off → manual-only, no periodic snapshot.
+        cfg.archive.auto = false;
+        assert_eq!(maintenance_plan(&cfg), (false, false));
+
+        // Size-based retention prunes too.
+        cfg.retention = Retention::Size { mb: 512 };
+        assert_eq!(maintenance_plan(&cfg), (true, false));
+    }
 
     #[test]
     fn holder_is_saffev_matches_only_our_binary() {

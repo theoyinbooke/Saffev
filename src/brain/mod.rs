@@ -5,11 +5,12 @@
 //! the same input produces the same findings whether routed through the gateway
 //! or called via the embedded library.
 //!
-//! v0 ships:
-//! - [`pii`] deterministic detectors (signatures only here; impl later).
-//! - A [`Judge`] trait (the pluggable judgment socket) wired to [`NoopJudge`].
-//!   No model-based judge ships in v0, and judges are *never* called inline —
-//!   only via the async sampler.
+//! Ships:
+//! - [`pii`] deterministic detectors.
+//! - The pluggable judgment sockets: [`guard::SafetyGuard`] (deterministic
+//!   floor + optional model guard) and [`judge::RubricJudge`] over an injected
+//!   [`judge::LlmBackend`]. Judges/guards are *never* called inline — only via
+//!   the async eval sampler.
 
 pub mod guard;
 pub mod judge;
@@ -103,30 +104,14 @@ pub struct JudgeRecord {
     pub context: Option<String>,
 }
 
-/// The pluggable judgment interface (04 §6.2). v0 wires this to [`NoopJudge`].
-///
-/// Implementations are invoked **only via the async sampler**, never inline.
-#[async_trait::async_trait]
-pub trait Judge: Send + Sync {
-    /// Deterministic / cheap screen of a single side's text.
-    fn screen(&self, side: Side, text: &str) -> Vec<Finding>;
-
-    /// Model-based evaluation of a full record (async, sampled, off hot path).
-    async fn evaluate(&self, record: &JudgeRecord) -> Vec<Score>;
-}
-
-/// The default, shipped judge: does nothing. Keeps the storage schema and the
-/// Studio panels ready without shipping unreliable signal.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopJudge;
-
-#[async_trait::async_trait]
-impl Judge for NoopJudge {
-    fn screen(&self, _side: Side, _text: &str) -> Vec<Finding> {
-        Vec::new()
-    }
-
-    async fn evaluate(&self, _record: &JudgeRecord) -> Vec<Score> {
-        Vec::new()
-    }
-}
+// NOTE on pluggability: an earlier design had a `Judge` trait here "wired to a
+// NoopJudge". That trait was never consumed — the real, wired sockets are:
+//
+// - **Safety**: the [`guard::SafetyGuard`] trait ([`guard::DeterministicGuard`]
+//   floor + optional [`guard::ModelGuard`] selected by `[eval] guard_model`);
+// - **Quality**: [`judge::RubricJudge`] running through an injected
+//   [`judge::LlmBackend`] (the proxy supplies the engine-backed impl), enabled
+//   by `[eval] quality` + `judge_model`.
+//
+// Both are invoked **only via the async eval sampler**, never inline. A
+// purpose-trained local judge plugs in through those two seams, not a third.

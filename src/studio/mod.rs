@@ -22,7 +22,6 @@
 //! | GET    | `/api/engines`      | —                        | [`dto::EnginesView`]          |
 //! | POST   | `/api/engines/adopt`| [`dto::AdoptRequest`]    | [`dto::EngineView`]           |
 //! | POST   | `/api/engines/revert`| [`dto::RevertRequest`]  | [`dto::EngineView`]           |
-//! | GET    | `/api/exposure`     | —                        | [`crate::exposure::ExposureReport`] |
 //! | GET    | `/api/settings`     | —                        | [`dto::SettingsView`]         |
 //! | PUT    | `/api/settings`     | [`dto::SettingsUpdate`]  | [`dto::SettingsView`]         |
 //! | GET    | `/api/update`       | —                        | [`dto::UpdateStatus`]         |
@@ -105,7 +104,6 @@ impl StudioServer {
             .route("/engines", get(api::engines))
             .route("/engines/adopt", post(api::engines_adopt))
             .route("/engines/revert", post(api::engines_revert))
-            .route("/exposure", get(api::exposure))
             .route("/settings", get(api::settings_get).put(api::settings_put))
             // In-app auto-update. GET is fail-soft (contacts GitHub release
             // metadata only — no user/content data leaves the device). POST

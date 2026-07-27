@@ -1356,12 +1356,37 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
     }))
 }
 
+/// Canonical lowercase engine name for request matching + messages. Mirrors the
+/// `engines` table convention (`ollama` / `lmstudio`).
+fn engine_kind_name(kind: crate::engine::EngineKind) -> &'static str {
+    match kind {
+        crate::engine::EngineKind::Ollama => "ollama",
+        crate::engine::EngineKind::LmStudio => "lmstudio",
+        crate::engine::EngineKind::Unknown => "unknown",
+    }
+}
+
 /// `POST /api/engines/adopt`
+///
+/// Actually drives the engine controller (the same path as `saffev adopt`):
+/// - `cooperative: true` records the engine as cooperatively managed — no
+///   system changes, ever (the CooperativeController's adopt is a documented
+///   no-op that yields an empty journal).
+/// - `cooperative: false` (Gateway) is gated **before** touching anything:
+///   LM Studio has no systemd unit to rebind, Gateway requires `mode =
+///   "gateway"` (restart-required, set in Settings), and only the Linux
+///   systemd controller can adopt. Each gate returns a 409 explaining exactly
+///   what to do instead — never a silent no-op or a silent downgrade.
+///
+/// Failures from the controller surface as errors; fail-open governs model
+/// TRAFFIC, not control-plane honesty (same stance as the CLI's non-zero
+/// exits).
 pub async fn engines_adopt(
     State(state): State<StudioState>,
     Json(body): Json<dto::AdoptRequest>,
 ) -> Result<Json<dto::EngineView>, Response> {
-    if body.engine.trim().is_empty() {
+    let requested = body.engine.trim().to_ascii_lowercase();
+    if requested.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "validation",
@@ -1369,41 +1394,156 @@ pub async fn engines_adopt(
         ));
     }
 
-    // Return the current view of the named engine after the (engine-module
-    // owned) adoption runs. We surface whatever the store reflects; the actual
-    // controller wiring lives in the engine/cli modules. If the engine is not
-    // yet known, report a 404 so the UI can prompt detection.
-    current_engine_view(&state, &body.engine).await.map(Json)
+    let cfg = state.config.load();
+
+    // Gate the Gateway path up front, before any detection or system work, so
+    // the user gets the *real* blocker as the error — not a downgrade.
+    if !body.cooperative {
+        if requested == "lmstudio" {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "gateway_unsupported",
+                "Gateway adoption isn't supported for LM Studio (no systemd unit \
+                 to rebind). Use Cooperative mode: point the app at the proxy or \
+                 wrap it with `saffev run`.",
+            ));
+        }
+        if cfg.mode != crate::config::Mode::Gateway {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "gateway_requires_mode",
+                "Gateway adoption requires mode = \"gateway\". Set the mode in \
+                 Settings, restart Saffev, then adopt.",
+            ));
+        }
+        if !crate::engine::default_controller(&cfg).can_adopt() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "gateway_unavailable",
+                "Gateway adoption is Linux/systemd-only. On this host Saffev \
+                 runs cooperatively: point apps at the proxy or use `saffev run`.",
+            ));
+        }
+    }
+
+    // Find the running engine we were asked to adopt.
+    let detected = crate::engine::detect::detect_all()
+        .await
+        .map_err(internal)?;
+    let info = detected
+        .into_iter()
+        .find(|i| engine_kind_name(i.engine) == requested)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("no running {requested} engine detected — start it and try again"),
+            )
+        })?;
+
+    // Cooperative requests must use the cooperative controller even on a
+    // Linux/Gateway host — clicking "Cooperative" must never touch systemd.
+    let controller: Box<dyn crate::engine::EngineController> = if body.cooperative {
+        Box::new(crate::engine::cooperative::CooperativeController)
+    } else {
+        crate::engine::default_controller(&cfg)
+    };
+
+    crate::engine::adopt::run_adoption(controller.as_ref(), &info, &state.store)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "adopt_failed",
+                &format!("adoption failed — the host was not changed: {e}"),
+            )
+        })?;
+
+    // The journal is recorded via the async write queue; flush so the view we
+    // return (and the UI's immediate refresh) reflects the new state.
+    let _ = state.store.flush().await;
+    current_engine_view(&state, &requested).await.map(Json)
 }
 
 /// `POST /api/engines/revert`
+///
+/// Replays the stored adoption journal in reverse (same path as `saffev
+/// revert`) and records the engine as reverted. A Gateway journal can only be
+/// undone by the systemd controller — if the current mode/host can't provide
+/// one, this refuses loudly rather than recording "reverted" while the machine
+/// is still adopted.
 pub async fn engines_revert(
     State(state): State<StudioState>,
     Json(body): Json<dto::RevertRequest>,
 ) -> Result<Json<dto::EngineView>, Response> {
-    if body.engine.trim().is_empty() {
+    let requested = body.engine.trim().to_ascii_lowercase();
+    if requested.is_empty() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "validation",
             "engine name is required",
         ));
     }
-    current_engine_view(&state, &body.engine).await.map(Json)
-}
 
-/// `GET /api/exposure`
-pub async fn exposure(
-    State(state): State<StudioState>,
-) -> Result<Json<crate::exposure::ExposureReport>, Response> {
-    let report = crate::exposure::check(state.config.load().ports.upstream)
+    let records = state.store.engines().await.map_err(internal)?;
+    let rec = records
+        .into_iter()
+        .find(|r| r.engine.eq_ignore_ascii_case(&requested))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("no adoption record for {requested} — nothing to revert"),
+            )
+        })?;
+
+    let journal: Vec<crate::engine::JournalEntry> =
+        serde_json::from_str(&rec.journal_json).unwrap_or_default();
+
+    let cfg = state.config.load();
+    let controller: Box<dyn crate::engine::EngineController> = if journal.is_empty() {
+        // Cooperative record: nothing was changed on the system; reverting just
+        // clears the managed state.
+        Box::new(crate::engine::cooperative::CooperativeController)
+    } else {
+        let c = crate::engine::default_controller(&cfg);
+        if !c.can_adopt() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "gateway_required_for_revert",
+                "this engine was adopted in Gateway mode — set mode = \"gateway\" \
+                 (Linux) and restart, or run `saffev revert` on this host, so the \
+                 system changes can actually be undone",
+            ));
+        }
+        c
+    };
+
+    let kind = match rec.engine.as_str() {
+        "ollama" => crate::engine::EngineKind::Ollama,
+        "lmstudio" => crate::engine::EngineKind::LmStudio,
+        _ => crate::engine::EngineKind::Unknown,
+    };
+    let info = crate::engine::EngineInfo {
+        engine: kind,
+        version: rec.version.clone(),
+        port: rec.public_port,
+        how_it_starts: crate::engine::StartMode::Unknown,
+        adoption_state: rec.adoption_state,
+    };
+
+    crate::engine::adopt::run_revert(controller.as_ref(), &info, &journal, &state.store)
         .await
-        .unwrap_or_else(|_| crate::exposure::ExposureReport {
-            exposed: false,
-            bound_to: None,
-            token_protected: false,
-            detail: "exposure check unavailable".to_string(),
-        });
-    Ok(Json(report))
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revert_failed",
+                &format!("revert failed — the host may still be adopted: {e}"),
+            )
+        })?;
+
+    let _ = state.store.flush().await;
+    current_engine_view(&state, &requested).await.map(Json)
 }
 
 /// `GET /api/update`
@@ -1420,10 +1560,24 @@ pub async fn exposure(
 /// handler signature + future auth context.
 pub async fn update_get(State(_state): State<StudioState>) -> Json<dto::UpdateStatus> {
     let status = crate::update::check().await;
+    // Report up front whether POST /api/update can self-apply here, so the SPA
+    // offers the right affordance: the one-click button, or honest guidance +
+    // a release link (DMG .app installs, dev builds).
+    let (apply_supported, apply_note, release_url) = match crate::update::apply_capability() {
+        Ok(()) => (true, None, None),
+        Err(e) => (
+            false,
+            Some(e.to_string()),
+            Some(crate::update::RELEASES_URL.to_string()),
+        ),
+    };
     Json(dto::UpdateStatus {
         current_version: status.current_version,
         latest_version: status.latest_version,
         update_available: status.available,
+        apply_supported,
+        apply_note,
+        release_url,
     })
 }
 
@@ -1455,9 +1609,11 @@ pub async fn update_post(
                 message,
             }))
         }
-        // No install receipt (dev build): a 200 with guidance, NOT an error —
-        // the UI shows "use the installer" rather than a failure toast.
-        Err(crate::update::UpdateError::NoReceipt(msg)) => Ok(Json(dto::UpdateResult {
+        // No install receipt (dev build) or a DMG .app install: a 200 with
+        // guidance, NOT an error — the UI shows how this install updates
+        // rather than a failure toast.
+        Err(crate::update::UpdateError::NoReceipt(msg))
+        | Err(crate::update::UpdateError::UnsupportedInstall(msg)) => Ok(Json(dto::UpdateResult {
             updated: false,
             new_version: crate::update::CURRENT_VERSION.to_string(),
             message: msg,
