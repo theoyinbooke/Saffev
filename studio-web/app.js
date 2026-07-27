@@ -364,15 +364,19 @@
     return b;
   }
 
+  // Width floors are sized to the header label / typical mono cell content —
+  // their sum (plus gaps + row padding) must stay under the Live stream card's
+  // track at common window widths, or the whole table scrolls sideways. Cells
+  // ellipsize, and the `auto` maxes still grow for outlier values.
   const REQ_COLS = {
-    app:      { label: 'Source',   w: 'minmax(96px,1fr)',    r: false },
-    model:    { label: 'Model',    w: 'minmax(74px,1fr)',    r: false },
-    endpoint: { label: 'Endpoint', w: 'minmax(82px,1.1fr)',  r: false },
-    status:   { label: 'Status',   w: 'minmax(72px,auto)',   r: false },
-    pii:      { label: 'PII',      w: 'minmax(64px,auto)',   r: false },
-    lat:      { label: 'Latency',  w: '68px',                r: true },
-    tokens:   { label: 'Tokens',   w: 'minmax(86px,auto)',   r: true },
-    time:     { label: 'Time',     w: '92px',                r: true },
+    app:      { label: 'Source',   w: 'minmax(78px,1fr)',    r: false },
+    model:    { label: 'Model',    w: 'minmax(68px,1fr)',    r: false },
+    endpoint: { label: 'Endpoint', w: 'minmax(78px,1.1fr)',  r: false },
+    status:   { label: 'Status',   w: 'minmax(52px,auto)',   r: false },
+    pii:      { label: 'PII',      w: 'minmax(36px,auto)',   r: false },
+    lat:      { label: 'Latency',  w: '64px',                r: true },
+    tokens:   { label: 'Tokens',   w: 'minmax(70px,auto)',   r: true },
+    time:     { label: 'Time',     w: '74px',                r: true },
   };
   const LIVE_COLS = ['app', 'model', 'endpoint', 'status', 'pii', 'lat', 'tokens', 'time'];
   const HIST_COLS = ['app', 'model', 'endpoint', 'status', 'pii', 'lat', 'tokens', 'time'];

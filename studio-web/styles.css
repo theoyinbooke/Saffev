@@ -129,19 +129,24 @@ a{color:inherit}
 .stat-spark .spark{display:block}
 .stat .delta{margin-top:1px}
 .stat .meta{font-size:.72rem;color:var(--text-2);margin-top:1px}
-/* The stream is the hero — it fills the height and scrolls internally; the slim
-   rail beside it carries "now" context (exposure, engine, privacy). */
-.cockpit{display:grid;grid-template-columns:1.75fr .92fr;gap:16px;align-items:start}
+/* The stream is the hero and scrolls internally; the slim rail beside it
+   carries "now" context (exposure, engine, privacy) and SETS the row height:
+   `contain:size` keeps the table's content out of the grid's row sizing, so
+   the stretched stream card lands exactly as tall as the rail — compact, no
+   page-length card — and longer traffic scrolls inside #stream instead. */
+.cockpit{display:grid;grid-template-columns:1.75fr .92fr;gap:16px;align-items:stretch}
 /* Grid items default to min-width:auto, so the traffic table's column minimums
    inflated the stream track and left the rail short of the right edge (the
    tracks stopped filling the row). min-width:0 lets the fr math own the split;
    the table scrolls inside its card instead of distorting the page grid. */
 .cockpit>*{min-width:0}
-.streamcard{display:flex;flex-direction:column;min-height:calc(100vh - 288px)}
+.streamcard{display:flex;flex-direction:column;contain:size;min-height:340px}
 .streamcard .ttable{flex:1;min-height:0;display:flex;flex-direction:column;overflow-x:auto}
 .streamcard #stream{flex:1;min-height:0;overflow-y:auto}
 .rail{display:flex;flex-direction:column;gap:16px}
-@media(max-width:1050px){.cockpit{grid-template-columns:1fr}.streamcard{min-height:0}.streamcard #stream{max-height:60vh}}
+/* Single column: no rail beside the card to size against — contain:size would
+   collapse it, so lift it and cap the body instead. */
+@media(max-width:1050px){.cockpit{grid-template-columns:1fr}.streamcard{contain:none;min-height:0}.streamcard #stream{max-height:60vh}}
 
 /* ---------- two-column body ---------- */
 .body{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;align-items:start}
