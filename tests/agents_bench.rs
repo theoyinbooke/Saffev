@@ -32,6 +32,7 @@ use saffev::agents::cursor::CursorReader;
 use saffev::agents::gemini::GeminiReader;
 use saffev::agents::goose::GooseReader;
 use saffev::agents::opencode::OpenCodeReader;
+use saffev::agents::roo::RooReader;
 use saffev::agents::vscode::VsCodeReader;
 use saffev::agents::{AgentReader, AgentSession, MessageKind, Role};
 
@@ -87,6 +88,10 @@ struct Coverage {
     title: bool,
     project: bool,
     model: bool,
+    /// The same honesty rule as tokens, for the model field: Roo Code does
+    /// not persist the model id per task (only a mutable profile name in
+    /// VS Code secrets) — recorded as absent, never guessed.
+    model_absent_in_format: bool,
     timestamps: bool,
     roles: bool,
     token_counts: TokenCoverage,
@@ -102,7 +107,11 @@ impl Coverage {
                 "session_id": self.session_id,
                 "title": self.title,
                 "project": self.project,
-                "model": self.model,
+                "model": if self.model_absent_in_format {
+                    serde_json::json!("absent_in_format")
+                } else {
+                    serde_json::json!(self.model)
+                },
                 "timestamps": self.timestamps,
                 "per_message_roles": self.roles,
                 "token_counts": match self.token_counts {
@@ -125,7 +134,7 @@ impl Coverage {
         self.session_id
             && self.title
             && self.project
-            && self.model
+            && (self.model || self.model_absent_in_format)
             && self.timestamps
             && self.roles
             && !matches!(
@@ -578,6 +587,47 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Roo Code (round 11 — twelfth tool; strict reading now ≥ 10) -------
+    {
+        let reader = RooReader::with_roots(vec![fixture("roo")]);
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("1748899000000"))
+            .expect("roo: good task listed");
+        check_common(&mut cov, &reader, good, "roo");
+        // Roo does NOT persist the model per task (only a mutable profile
+        // name in VS Code secrets) — honestly absent, never guessed.
+        cov.model_absent_in_format = true;
+        cov.notes
+            .push("model id not persisted per task (profile name only) — absent, not guessed".into());
+        // Roo convention: tokensIn INCLUDES cache — non-cached = 5230 − 5000.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == 230
+                && good.output_tokens == 812
+                && good.cache_tokens == 4100 + 900,
+        );
+        assert_eq!(good.title.as_deref(), Some("Fix the login bug"));
+        assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
+        // The tasks/_index.json cache is not a task dir.
+        assert!(sessions.iter().all(|s| !s.id.contains("_index")));
+        // Corrupted transcript: lists from history_item.json, turns honestly 0.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("1748899100000"))
+            .expect("roo: corrupted task still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 0
+            && hurt.input_tokens == 500
+            && hurt.cache_tokens == 200
+            && hurt.title.as_deref() == Some("Corrupted transcript task");
+        table.insert("roo".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -629,7 +679,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 11,
-        "adapter coverage regressed: {complete} of 11 complete"
+        complete >= 12,
+        "adapter coverage regressed: {complete} of 12 complete"
     );
 }

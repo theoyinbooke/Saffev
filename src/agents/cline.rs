@@ -127,8 +127,9 @@ impl ClineReader {
     }
 
     /// Fallbacks from `ui_messages.json`: title (first `say:"task"`), token
-    /// sums (`api_req_started` JSON payloads), and last activity ts.
-    fn ui_fallback(task_dir: &Path) -> (Option<String>, u64, u64, u64, i64) {
+    /// sums (`api_req_started` JSON payloads), and last activity ts. Shared
+    /// with the Roo Code reader (same file heritage).
+    pub(super) fn ui_fallback(task_dir: &Path) -> (Option<String>, u64, u64, u64, i64) {
         let (mut title, mut inp, mut outp, mut cache, mut last_ts) = (None, 0u64, 0u64, 0u64, 0i64);
         let Ok(text) = fs::read_to_string(task_dir.join("ui_messages.json")) else {
             return (title, inp, outp, cache, last_ts);
@@ -159,8 +160,9 @@ impl ClineReader {
     }
 
     /// Parse the transcript. Returns `(messages, msg_count, tool_count,
-    /// last_model, last_ts)` — empty on a corrupt file (non-fatal).
-    fn transcript(task_dir: &Path, with_messages: bool) -> (Vec<AgentMessage>, u32, u32, Option<String>, i64) {
+    /// last_model, last_ts)` — empty on a corrupt file (non-fatal). Shared
+    /// with the Roo Code reader (same file heritage).
+    pub(super) fn transcript(task_dir: &Path, with_messages: bool) -> (Vec<AgentMessage>, u32, u32, Option<String>, i64) {
         let mut messages = Vec::new();
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
         let mut model = None;

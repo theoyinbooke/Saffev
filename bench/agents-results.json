@@ -152,6 +152,22 @@
       "notes": [],
       "sessions_found": 2
     },
+    "roo": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": "absent_in_format",
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [
+        "model id not persisted per task (profile name only) — absent, not guessed"
+      ],
+      "sessions_found": 2
+    },
     "vscode": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -169,5 +185,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 11
+  "tools_covered": 12
 }

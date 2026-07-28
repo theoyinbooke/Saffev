@@ -34,6 +34,7 @@ pub mod goose;
 pub mod opencode;
 pub mod privacy;
 pub mod retention;
+pub mod roo;
 pub mod vscode;
 
 /// A supported coding agent (the *source* of a session). The `#[serde]` repr is
@@ -63,6 +64,8 @@ pub enum AgentTool {
     Goose,
     /// Amp / Sourcegraph (`~/.local/share/amp/threads/T-*.json`).
     Amp,
+    /// Roo Code (VS Code globalStorage `rooveterinaryinc.roo-cline/tasks/`).
+    Roo,
 }
 
 impl AgentTool {
@@ -80,6 +83,7 @@ impl AgentTool {
             AgentTool::Aider => "aider",
             AgentTool::Goose => "goose",
             AgentTool::Amp => "amp",
+            AgentTool::Roo => "roo",
         }
     }
     /// Human label for the UI.
@@ -96,6 +100,7 @@ impl AgentTool {
             AgentTool::Aider => "Aider",
             AgentTool::Goose => "Goose",
             AgentTool::Amp => "Amp",
+            AgentTool::Roo => "Roo Code",
         }
     }
 }
@@ -202,6 +207,7 @@ pub fn split_id(id: &str) -> Option<(AgentTool, &str)> {
         "aider" => AgentTool::Aider,
         "goose" => AgentTool::Goose,
         "amp" => AgentTool::Amp,
+        "roo" => AgentTool::Roo,
         _ => return None,
     };
     Some((tool, raw))
@@ -388,6 +394,7 @@ pub fn readers() -> Vec<Box<dyn AgentReader>> {
         Box::new(aider::AiderReader::new()),
         Box::new(goose::GooseReader::new()),
         Box::new(amp::AmpReader::new()),
+        Box::new(roo::RooReader::new()),
     ]
 }
 

@@ -1,0 +1,1 @@
+{"id":"1748899100000","number":2,"ts":1748899200000,"task":"Corrupted transcript task","tokensIn":700,"tokensOut":90,"cacheWrites":150,"cacheReads":50,"totalCost":0.005,"workspace":"/home/dev/fixture-proj","mode":"code","apiConfigName":"default"}
