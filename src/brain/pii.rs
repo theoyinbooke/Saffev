@@ -120,8 +120,9 @@ static RE_JWT: Lazy<Regex> = Lazy::new(|| {
 static RE_CONN_STRING: Lazy<Regex> = Lazy::new(|| {
     // The user part is `*`, not `+`: `redis://:p4ssw0rd@cache:6379/0` — the
     // standard Redis AUTH form — has an EMPTY user before the password
-    // (G1 round-10 critic's FN). The password stays `+`.
-    Regex::new(r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:@/]*:[^\s@/]+@[^\s"']+"#)
+    // (G1 round-10 critic's FN). The password (capture 1) stays `+` and is
+    // gated by [`conn_password_is_real`] before a finding is emitted.
+    Regex::new(r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:@/]*:([^\s@/]+)@[^\s"']+"#)
         .expect("connection string regex")
 });
 
@@ -259,8 +260,9 @@ static RE_TOML_SECRET: Lazy<Regex> = Lazy::new(|| {
 /// sibling pairs is not a connection string — the env-assignment detector
 /// owns that shape.
 static RE_CONN_KV: Lazy<Regex> = Lazy::new(|| {
+    // The password value (capture 1) is gated by [`conn_password_is_real`].
     Regex::new(
-        r"(?i)\b(?:[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};\s*){1,10}(?:password|pwd) ?= ?[^;\r\n]{1,128};?(?: ?[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};?){0,10}",
+        r"(?i)\b(?:[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};\s*){1,10}(?:password|pwd) ?= ?([^;\r\n]{1,128});?(?: ?[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};?){0,10}",
     )
     .expect("kv connection string regex")
 });
@@ -377,35 +379,59 @@ impl Detector {
         // 2. Credentialed connection strings — before email, or the
         //    `user:pass@host` section reads as an address. URL form first,
         //    then the `Key=Value;` property form (ODBC / ADO.NET / JDBC).
-        for m in RE_CONN_STRING.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+        for caps in RE_CONN_STRING.captures_iter(text) {
+            let (Some(whole), Some(password)) = (caps.get(0), caps.get(1)) else {
+                continue;
+            };
+            // Placeholder credentials aren't credentials — docs and READMEs
+            // are full of `<user>:<password>@` and `$DB_USER:$DB_PASS@`
+            // (G1 closing critic). Same philosophy as the env value gate.
+            if !conn_password_is_real(password.as_str()) {
+                continue;
+            }
+            // The greedy tail swallows sentence punctuation
+            // (`…:6379/0.` — masking would eat the period); trim it.
+            let end = whole.end()
+                - whole
+                    .as_str()
+                    .bytes()
+                    .rev()
+                    .take_while(|b| matches!(b, b'.' | b',' | b';' | b'!' | b'?' | b')'))
+                    .count();
+            if overlaps(&claimed, whole.start(), end) {
                 continue;
             }
             out.push(make_finding(
                 PiiKind::ConnectionString,
                 None,
                 side,
-                m.start(),
-                m.end(),
+                whole.start(),
+                end,
                 Confidence::High,
-                m.as_str(),
+                &text[whole.start()..end],
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.push((whole.start(), end));
         }
-        for m in RE_CONN_KV.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+        for caps in RE_CONN_KV.captures_iter(text) {
+            let (Some(whole), Some(password)) = (caps.get(0), caps.get(1)) else {
+                continue;
+            };
+            if !conn_password_is_real(password.as_str()) {
+                continue;
+            }
+            if overlaps(&claimed, whole.start(), whole.end()) {
                 continue;
             }
             out.push(make_finding(
                 PiiKind::ConnectionString,
                 None,
                 side,
-                m.start(),
-                m.end(),
+                whole.start(),
+                whole.end(),
                 Confidence::High,
-                m.as_str(),
+                whole.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.push((whole.start(), whole.end()));
         }
 
         // 2b. Config-file credential assignments — shell/.env, JSON, YAML and
@@ -840,12 +866,40 @@ impl Detector {
 fn mac_boundaries_clean(text: &str, m: &regex::Match) -> bool {
     let after = text[m.end()..].as_bytes();
     let before = text[..m.start()].as_bytes();
+    // TWO hex digits after the separator, so `de:ad:be:ef:00:01-eth0` (an
+    // interface suffix — 'e' is hex but 't' is not) keeps its MAC while
+    // `…:55:66` and `…:8080` (a further group / port digits) read as a
+    // longer run (G1 closing critic's guard-edge probes).
     let glued_after = matches!(after.first(), Some(b':') | Some(b'-'))
-        && after.get(1).is_some_and(u8::is_ascii_hexdigit);
+        && after.get(1).is_some_and(u8::is_ascii_hexdigit)
+        && after.get(2).is_some_and(u8::is_ascii_hexdigit);
     let glued_before = matches!(before.last(), Some(b':') | Some(b'-'))
-        && before.len() >= 2
-        && before[before.len() - 2].is_ascii_hexdigit();
+        && before.len() >= 3
+        && before[before.len() - 2].is_ascii_hexdigit()
+        && before[before.len() - 3].is_ascii_hexdigit();
     !glued_after && !glued_before
+}
+
+/// Is a connection string's password segment real credential material?
+/// Narrower than the env value gate on purpose: a URL carries live host
+/// coordinates, so a dictionary-weak password (`:changeme@`, `:secret@`) is
+/// a live system with a bad password — a leak worth flagging. Only values
+/// that PROVE templating disqualify: structural markers (`<password>`,
+/// `$DB_PASS`, `%VAR%`, `{{tpl}}`) and self-naming fillers (`:password@`,
+/// `:your-password@` — the canonical README string). G1 closing critic's
+/// FP class.
+fn conn_password_is_real(pw: &str) -> bool {
+    if pw.starts_with('<') || pw.starts_with('$') || pw.starts_with('%') || pw.starts_with("{{") {
+        return false;
+    }
+    let normalized: String = pw
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    !matches!(
+        normalized.as_str(),
+        "password" | "passwd" | "pwd" | "your-password" | "yourpassword" | "example"
+            | "placeholder"
+    )
 }
 
 /// Would the API-key detector claim this exact token? Shared by the scan
@@ -2753,6 +2807,54 @@ mod tests {
         // Non-secret keys don't fire regardless of block style.
         let f = d.scan(Side::Request, "description: |\n  a long paragraph of text\n");
         assert!(!has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn placeholder_url_credentials_are_not_connection_strings() {
+        // Closing critic's FP class: docs/READMEs are full of these shapes.
+        let d = det();
+        for benign in [
+            "postgres://<user>:<password>@db.internal:5432/app",
+            "redis://:<password>@cache.internal:6379",
+            "mysql://$DB_USER:$DB_PASS@db/app",
+            "Server=db.internal;Database=app;Password=<your-password>;",
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(
+                !has_kind(&f, PiiKind::ConnectionString),
+                "must reject {benign:?}"
+            );
+        }
+        // A weak-but-real password is still a leak — no entropy gate here.
+        let f = d.scan(Side::Request, "db at mysql://root:p4ss@10.1.2.3:3306/app up");
+        assert!(has_kind(&f, PiiKind::ConnectionString));
+    }
+
+    #[test]
+    fn conn_string_span_sheds_sentence_punctuation() {
+        let d = det();
+        let text = "cache is redis://:p4ssw0rd@cache.internal:6379/0.";
+        let f = d.scan(Side::Request, text);
+        let c = f
+            .iter()
+            .find(|f| f.kind == PiiKind::ConnectionString)
+            .expect("conn string");
+        assert_eq!(
+            &text[c.start..c.end],
+            "redis://:p4ssw0rd@cache.internal:6379/0",
+            "sentence period must not be masked away with the URL"
+        );
+    }
+
+    #[test]
+    fn mac_guard_edges_iface_fires_port_reads_as_run() {
+        let d = det();
+        // Interface suffix: 'e' is hex but 't' is not — the MAC stays.
+        let f = d.scan(Side::Request, "link de:ad:be:ef:00:01-eth0 up");
+        assert!(has_kind(&f, PiiKind::MacAddress), "iface-suffixed MAC lost");
+        // Port digits after the separator read as a longer run — decided.
+        let f = d.scan(Side::Request, "device at 00:1a:2b:3c:4d:5e:8080 seen");
+        assert!(!has_kind(&f, PiiKind::MacAddress));
     }
 
     #[test]

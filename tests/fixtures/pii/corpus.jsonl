@@ -177,3 +177,9 @@
 {"id":"iban-010","text":"konto CH9300762011623852957 gutgeschrieben","expect":[{"kind":"iban","value":"CH9300762011623852957"}],"note":"Swiss IBAN"}
 {"id":"iban-011","text":"przelew PL61109010140000071219812874 wykonany","expect":[{"kind":"iban","value":"PL61109010140000071219812874"}],"note":"Polish IBAN — long form"}
 {"id":"mac-004","text":"nic 11-22-33-44-55-66 registered","expect":[{"kind":"mac_address","value":"11-22-33-44-55-66"}],"note":"all-decimal dashed pairs are syntactically valid MACs — deliberate judgment (round-10 critic), over-claiming is the safe side for a privacy lens"}
+{"id":"conn-t04","text":"connect with postgres://<user>:<password>@db.internal:5432/app first","expect":[],"trap":"connection_string","note":"closing critic FP — README placeholder credentials are documentation, not a leak"}
+{"id":"conn-t05","text":"mysql://$DB_USER:$DB_PASS@db/app from the env","expect":[],"trap":"connection_string","note":"closing critic FP — interpolated credentials"}
+{"id":"conn-t06","text":"Server=db.internal;Database=app;Password=<your-password>;","expect":[],"trap":"connection_string","note":"closing critic FP — property-form placeholder"}
+{"id":"conn-007","text":"cache is redis://:p4ssw0rd@cache.internal:6379/0.","expect":[{"kind":"connection_string","value":"redis://:p4ssw0rd@cache.internal:6379/0"}],"note":"closing critic span hygiene — sentence period must not be masked with the URL"}
+{"id":"mac-005","text":"link de:ad:be:ef:00:01-eth0 up","expect":[{"kind":"mac_address","value":"de:ad:be:ef:00:01"}],"note":"closing critic guard edge — interface suffix must not suppress the MAC"}
+{"id":"mac-t03","text":"device at 00:1a:2b:3c:4d:5e:8080 seen","expect":[],"trap":"mac_address","note":"closing critic guard edge — decided: two hex after the separator reads as a longer run"}
