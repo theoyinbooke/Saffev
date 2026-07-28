@@ -1,0 +1,21 @@
+# G2 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G2).
+#
+# Mirrors pii-bench.yml: the bench test enforces the per-adapter coverage
+# checklist and the completeness floor (coverage can only regress loudly),
+# and the git-diff step proves the committed bench/agents-results.json
+# artifact matches what the code at this commit actually produces.
+name: agents-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove adapter coverage from committed fixtures (floors enforced)
+        run: cargo test --test agents_bench -- --nocapture
+      - name: Committed coverage table must match the code (no stale artifact)
+        run: git diff --exit-code bench/agents-results.json
