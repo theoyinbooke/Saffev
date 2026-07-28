@@ -50,7 +50,7 @@ Generated 2026-07-29 04:40 UTC · saffev v0.7.1 · **generated offline — produ
 
 ## Network exposure
 
-- engine reachable from loopback only (127.0.0.1) — not exposed to the network
+- Engine is bound to localhost only, not reachable from the network.
 
 > **Boundary:** the verdict inspects the OS socket table at generation time; it says nothing about past bindings.
 

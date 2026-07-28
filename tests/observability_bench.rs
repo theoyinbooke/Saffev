@@ -205,7 +205,7 @@ fn sample_report_regenerates_deterministically() {
         history,
         findings,
         config: Config::default(),
-        exposure_line: "engine reachable from loopback only (127.0.0.1) — not exposed to the network".into(),
+        exposure_line: "Engine is bound to localhost only, not reachable from the network.".into(),
         exposure_known: true,
         archive: Some(ArchiveIntegrity {
             entries: 42,
