@@ -1,0 +1,1 @@
+[{"ts":1753600000000,"type":"say","say":"task","text":"Add a retry to the fetch helper"},{"ts":1753600001000,"type":"say","say":"api_req_started","text":"{\"request\":\"...\",\"tokensIn\":12480,\"tokensOut\":312,\"cacheWrites\":11200,\"cacheReads\":0,\"cost\":0.0421}"},{"ts":1753600015000,"type":"say","say":"completion_result","text":"Added exponential-backoff retry to get()."}]

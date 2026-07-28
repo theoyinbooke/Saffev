@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use saffev::agents::claude_code::ClaudeCodeReader;
+use saffev::agents::cline::ClineReader;
 use saffev::agents::codex::CodexReader;
 use saffev::agents::copilot::CopilotReader;
 use saffev::agents::cursor::CursorReader;
@@ -407,6 +408,49 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Cline (round 6 — verified against the shipped v3.89.2 tag) --------
+    {
+        let reader = ClineReader::with_roots(vec![fixture("cline")]);
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("1753600000000"))
+            .expect("cline: good task listed");
+        check_common(&mut cov, &reader, good, "cline");
+        // Anthropic convention: tokensIn already excludes cache.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == 12480
+                && good.output_tokens == 312
+                && good.cache_tokens == 11200,
+        );
+        assert_eq!(good.title.as_deref(), Some("Add a retry to the fetch helper"));
+        assert_eq!(good.started_ts, 1753600000000, "task id IS the start time");
+        let detail = reader.session_detail("1753600000000").expect("detail");
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        // Corrupted transcript: the task still lists from its taskHistory
+        // row — title, tokens, project intact; turns honestly 0.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("1753600100000"))
+            .expect("cline: corrupted task still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 0
+            && hurt.input_tokens == 500
+            && hurt.title.as_deref() == Some("Corrupted transcript task");
+        table.insert("cline".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -454,7 +498,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 7,
-        "adapter coverage regressed: {complete} of 7 complete"
+        complete >= 8,
+        "adapter coverage regressed: {complete} of 8 complete"
     );
 }

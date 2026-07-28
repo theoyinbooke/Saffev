@@ -18,6 +18,20 @@
       "notes": [],
       "sessions_found": 2
     },
+    "cline": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 2
+    },
     "codex": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -107,5 +121,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 7
+  "tools_covered": 8
 }

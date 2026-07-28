@@ -2839,7 +2839,7 @@
   const AGENT_ICON = {
     claude_code: ICON.pulse, codex: ICON.bolt, opencode: ICON.server, cursor: ICON.eye,
     vscode: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M13 7l-2 10"/></svg>',
-    gemini: ICON.sparkles, copilot: ICON.terminal,
+    gemini: ICON.sparkles, copilot: ICON.terminal, cline: ICON.bolt,
   };
   function toolBadge(tool, label) {
     return el('span', { class: 'toolbadge tb-' + tool, text: label });
