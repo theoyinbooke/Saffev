@@ -54,9 +54,9 @@
   "pricing_table_as_of": "2026-07-28",
   "reference": "ccusage 20.0.19 (npx, --offline bundled pricing, --timezone UTC)",
   "saffev_totals": {
-    "cache_read": 162000,
-    "cache_write": 17000,
-    "cost_usd": 0.84785,
+    "cacheRead": 162000,
+    "cacheWrite": 17000,
+    "costUsd": 0.84785,
     "entries": 6,
     "input": 9000,
     "output": 4800

@@ -37,6 +37,7 @@ pub const BLOCK_MS: i64 = 5 * 60 * 60 * 1000;
 
 /// One priced API request (an assistant record with usage).
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageEvent {
     /// Unix millis.
     pub ts: i64,
@@ -139,6 +140,7 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
 
 /// Token + cost sums (one aggregation cell).
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Tally {
     pub input: u64,
     pub output: u64,
@@ -164,6 +166,7 @@ impl Tally {
 
 /// One day's usage (UTC date), with per-model breakdown.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DailyRow {
     /// `YYYY-MM-DD` (UTC).
     pub date: String,
@@ -196,6 +199,7 @@ pub fn daily(events: &[UsageEvent], pricing: &PricingConfig) -> Vec<DailyRow> {
 
 /// Live-burn figures for the active block.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BurnRate {
     /// Tokens per minute over the block so far.
     pub tokens_per_minute: f64,
@@ -209,6 +213,7 @@ pub struct BurnRate {
 
 /// One 5-hour billing block (or a synthetic gap between blocks).
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Block {
     /// Block start (unix millis; entry ts floored to the UTC hour).
     pub start_ts: i64,
@@ -307,6 +312,15 @@ pub fn blocks(events: &[UsageEvent], pricing: &PricingConfig, now_ms: i64) -> Ve
         }
     }
     out
+}
+
+/// Claude Code's projects dir (`$CLAUDE_CONFIG_DIR` else `~/.claude`, plus
+/// `/projects`) — the same resolution the Claude Code reader uses.
+pub fn default_claude_projects_dir() -> std::path::PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| super::home().join(".claude"))
+        .join("projects")
 }
 
 /// Overall totals across events.

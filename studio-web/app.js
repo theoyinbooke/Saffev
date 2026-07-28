@@ -3106,6 +3106,74 @@
 
       panel.appendChild(table('By tool', d.byTool.filter((t) => t.present), (r) => toolBadge(r.tool, r.label)));
       panel.appendChild(table('By model', d.byModel.slice(0, 20), (r) => el('span', { class: 'cell-model', text: r.model })));
+
+      /* G3: per-request usage — 5-hour billing blocks with live burn, plan
+         progress, and recent days. Claude Code data; UTC grouping; the
+         pricing table's as-of date is always shown so estimates are dated. */
+      const u = d.usage;
+      if (u) {
+        const money = (v) => '$' + (v || 0).toFixed(v >= 10 ? 2 : 3);
+        const active = (u.blocks || []).find((b) => b.isActive);
+        const cells = [];
+        if (active) {
+          const burn = active.burn || {};
+          const mins = Math.max(0, Math.round((u.plan ? u.plan.resetsInMs : 0) / 60000));
+          cells.push(statCell('Current block', money(active.totals.costUsd), 'of 5h window'));
+          cells.push(statCell('Burn', money(burn.costPerHour || 0) + '/h', fmtNum(Math.round(burn.tokensPerMinute || 0)) + ' tok/min'));
+          cells.push(statCell('Projected', money(burn.projectedCostUsd || 0), 'if this pace holds'));
+          cells.push(statCell('Resets in', Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm', 'block ends'));
+        } else {
+          cells.push(statCell('Billing block', '—', 'no active 5h block'));
+          cells.push(statCell('Blocks tracked', fmtNum((u.blocks || []).filter((b) => !b.isGap).length), 'recent windows'));
+          cells.push(statCell('All-time est.', money(u.totals.costUsd), 'per-request data'));
+          cells.push(statCell('Requests', fmtNum(u.totals.entries), 'usage records'));
+        }
+        panel.appendChild(el('div', { class: 'sechead reveal', text: 'Billing blocks (5-hour windows)' }));
+        panel.appendChild(statStrip(4, cells));
+        if (u.plan && u.plan.blockCostAllowanceUsd > 0 && active) {
+          const frac = Math.min(1, u.plan.usedFraction || 0);
+          const over = (u.plan.usedFraction || 0) > 1;
+          panel.appendChild(el('div', { class: 'card reveal', style: 'padding:12px 16px;margin-bottom:16px' }, [
+            el('div', { style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px' }, [
+              el('span', { text: 'Plan (' + u.plan.plan + '): ' + money(u.plan.spentUsd) + ' of ~' + money(u.plan.blockCostAllowanceUsd) + ' this block' }),
+              el('span', { class: over ? 'warn' : '', text: Math.round((u.plan.usedFraction || 0) * 100) + '%' }),
+            ]),
+            el('div', { style: 'height:6px;border-radius:3px;background:var(--line,#333);overflow:hidden' }, [
+              el('div', { style: 'height:100%;width:' + (frac * 100) + '%;background:' + (over ? 'var(--danger,#e5534b)' : 'var(--brand,#4a9eff)') }),
+            ]),
+            el('div', { class: 'searchnote', style: 'margin-top:6px', text:
+              u.plan.plan === 'observed-max'
+                ? 'Baseline is your highest observed block — set pricing.plan_block_allowance_usd to compare against your plan instead.'
+                : 'Allowance is your configured estimate — plans are not published as exact grants.' }),
+          ]));
+        }
+        const days = (u.daily || []).slice(-7).reverse();
+        if (days.length) {
+          const COLS = [
+            { label: 'Day (UTC)', w: 'minmax(120px,1fr)' },
+            { label: 'Requests', w: 'minmax(80px,.7fr)', r: true },
+            { label: 'In', w: 'minmax(90px,.9fr)', r: true },
+            { label: 'Out', w: 'minmax(90px,.9fr)', r: true },
+            { label: 'Cache r/w', w: 'minmax(120px,1.1fr)', r: true },
+            { label: 'Est. cost', w: 'minmax(90px,.8fr)', r: true },
+          ];
+          const head = el('div', { class: 'thead' }, COLS.map((c) => el('div', { class: 'th' + (c.r ? ' r' : ''), text: c.label })));
+          const list = el('div', { class: 'list' });
+          days.forEach((r) => list.appendChild(el('div', { class: 'trow static' }, [
+            el('div', { class: 'tcell', text: r.date }),
+            el('div', { class: 'tcell r num', text: fmtNum(r.totals.entries) }),
+            el('div', { class: 'tcell r num', text: fmtNum(r.totals.input) }),
+            el('div', { class: 'tcell r num', text: fmtNum(r.totals.output) }),
+            el('div', { class: 'tcell r num', text: fmtNum(r.totals.cacheRead) + ' / ' + fmtNum(r.totals.cacheWrite) }),
+            el('div', { class: 'tcell r num', text: money(r.totals.costUsd) }),
+          ])));
+          panel.appendChild(el('div', { class: 'card reveal', style: 'padding:0;overflow:hidden;margin-bottom:8px' }, [
+            el('div', { class: 'ttable', style: '--gtc:' + COLS.map((c) => c.w).join(' ') }, [head, list]),
+          ]));
+        }
+        panel.appendChild(el('div', { class: 'searchnote reveal', text:
+          'Per-request usage from Claude Code transcripts, priced with the on-device table (verified ' + u.pricingAsOf + '; cache reads and writes priced separately). Nothing is fetched.' }));
+      }
     },
 
     // Per-tool overview as a compact table (one row per tool) — scales cleanly to

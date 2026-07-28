@@ -755,6 +755,46 @@ pub struct AgentAnalytics {
     pub total_tool_calls: u64,
     pub by_tool: Vec<AgentToolStat>,
     pub by_model: Vec<AgentModelStat>,
+    /// ccusage-parity usage engine (G3): per-request events from Claude Code
+    /// JSONL — daily rows, 5-hour billing blocks, live burn, plan progress.
+    /// `None` when no per-request usage data exists on this machine.
+    pub usage: Option<UsageReport>,
+}
+
+/// The G3 usage report (Claude Code per-request data; UTC grouping).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    /// The pricing table's verification date — surfaced so pricing drift is
+    /// documented, never silent.
+    pub pricing_as_of: String,
+    /// Recent UTC days (capped), newest last.
+    pub daily: Vec<crate::agents::usage::DailyRow>,
+    /// Recent 5-hour billing blocks (capped), gaps included, newest last.
+    pub blocks: Vec<crate::agents::usage::Block>,
+    /// Overall totals across all events.
+    pub totals: crate::agents::usage::Tally,
+    /// Progress within the ACTIVE billing block against the configured plan
+    /// (None when no block is active or no plan is configured).
+    pub plan: Option<PlanProgress>,
+}
+
+/// Locally-computed plan usage for the active 5-hour block. The allowances
+/// are configured estimates (plans are not published as exact token grants);
+/// the label always says what the number is compared to.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanProgress {
+    /// Plan name ("pro", "max5x", "max20x", or custom).
+    pub plan: String,
+    /// Estimated cost allowance per 5-hour block (USD, configured).
+    pub block_cost_allowance_usd: f64,
+    /// Cost spent in the active block so far.
+    pub spent_usd: f64,
+    /// spent / allowance, clamped to [0, 1+].
+    pub used_fraction: f64,
+    /// Millis until the active block resets.
+    pub resets_in_ms: i64,
 }
 
 // ===========================================================================

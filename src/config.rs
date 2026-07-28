@@ -426,6 +426,17 @@ pub struct PricingConfig {
     /// invariant) — updating this table is a release or a user edit.
     #[serde(default = "default_pricing_as_of")]
     pub as_of: String,
+    /// Subscription plan label for block-progress display ("pro", "max5x",
+    /// "max20x", …). Empty = unlabeled; progress then baselines against the
+    /// highest OBSERVED block, which needs no invented allowance.
+    #[serde(default)]
+    pub plan: String,
+    /// Estimated cost allowance per 5-hour billing block (USD) for the plan
+    /// bar. `0` = auto: the highest observed block's cost is the baseline
+    /// (plans are not published as exact grants — a configured number is the
+    /// user's estimate, and the UI labels it as one).
+    #[serde(default)]
+    pub plan_block_allowance_usd: f64,
 }
 
 fn default_pricing_as_of() -> String {
@@ -450,6 +461,8 @@ impl Default for PricingConfig {
             cloud_output_per_m: default_cloud_out(),
             cloud_label: default_cloud_label(),
             as_of: default_pricing_as_of(),
+            plan: String::new(),
+            plan_block_allowance_usd: 0.0,
         }
     }
 }

@@ -2915,7 +2915,7 @@ pub async fn agents_privacy(
     })
 }
 
-pub async fn agents_analytics(State(_state): State<StudioState>) -> Json<dto::AgentAnalytics> {
+pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::AgentAnalytics> {
     let sessions = crate::agents::all_sessions();
     let by_tool = crate::agents::detected();
     let total_sessions = sessions.len() as u32;
@@ -2952,6 +2952,66 @@ pub async fn agents_analytics(State(_state): State<StudioState>) -> Json<dto::Ag
         .collect();
     by_model.sort_by(|a, b| b.tokens.cmp(&a.tokens));
 
+    // G3 usage report: per-request events (Claude Code JSONL) -> daily rows,
+    // 5-hour billing blocks with live burn, plan progress. Pure local reads.
+    let usage = {
+        let pricing = &state.config.load().pricing;
+        let events =
+            crate::agents::usage::claude_code_events(&crate::agents::usage::default_claude_projects_dir());
+        if events.is_empty() {
+            None
+        } else {
+            let now = crate::agents::now_ms();
+            let mut daily = crate::agents::usage::daily(&events, pricing);
+            if daily.len() > 30 {
+                daily.drain(..daily.len() - 30);
+            }
+            let mut blocks = crate::agents::usage::blocks(&events, pricing, now);
+            let plan = blocks
+                .iter()
+                .find(|b| b.is_active)
+                .map(|active| {
+                    // Allowance: the user's configured estimate, else the
+                    // highest OBSERVED block (needs no invented number).
+                    let observed_max = blocks
+                        .iter()
+                        .filter(|b| !b.is_gap)
+                        .map(|b| b.totals.cost_usd)
+                        .fold(0.0f64, f64::max);
+                    let allowance = if pricing.plan_block_allowance_usd > 0.0 {
+                        pricing.plan_block_allowance_usd
+                    } else {
+                        observed_max
+                    };
+                    dto::PlanProgress {
+                        plan: if pricing.plan.is_empty() {
+                            "observed-max".to_string()
+                        } else {
+                            pricing.plan.clone()
+                        },
+                        block_cost_allowance_usd: allowance,
+                        spent_usd: active.totals.cost_usd,
+                        used_fraction: if allowance > 0.0 {
+                            active.totals.cost_usd / allowance
+                        } else {
+                            0.0
+                        },
+                        resets_in_ms: (active.end_ts - now).max(0),
+                    }
+                });
+            if blocks.len() > 20 {
+                blocks.drain(..blocks.len() - 20);
+            }
+            Some(dto::UsageReport {
+                pricing_as_of: pricing.as_of.clone(),
+                daily,
+                blocks,
+                totals: crate::agents::usage::totals(&events, pricing),
+                plan,
+            })
+        }
+    };
+
     Json(dto::AgentAnalytics {
         total_sessions,
         total_tokens,
@@ -2959,6 +3019,7 @@ pub async fn agents_analytics(State(_state): State<StudioState>) -> Json<dto::Ag
         total_tool_calls,
         by_tool: by_tool.iter().map(tool_stat_view).collect(),
         by_model,
+        usage,
     })
 }
 
