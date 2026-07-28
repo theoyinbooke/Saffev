@@ -548,6 +548,20 @@ pub enum StreamEvent {
         /// Banded verdict (e.g. `flagged`).
         verdict: String,
     },
+    /// A local monitor rule fired (G6 signals). The SPA's event switch ignores
+    /// unknown types, so this is additive — current UI treatment is the desktop
+    /// notification + log line; a Studio surface can adopt this event later.
+    Signal {
+        /// Rule class (`pii_spike`, `new_source_app`, `exposure_change`,
+        /// `latency_p95`, `spend_per_day`).
+        kind: String,
+        /// Short human headline.
+        title: String,
+        /// One-line detail with the tripping numbers.
+        detail: String,
+        /// When it fired (unix millis).
+        ts: i64,
+    },
 }
 
 /// `GET /api/update` — in-app update availability.

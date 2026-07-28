@@ -1,0 +1,22 @@
+# G6 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G6).
+#
+# Mirrors costs-bench.yml: the bench enforces the rubric floors — all five
+# monitor rule classes fire AND deduplicate, the notifier is a local
+# subprocess (zero outbound network), and the rules live in the same
+# `[monitors]` TOML plane — and the git-diff step proves the committed
+# artifact matches what the code at this commit actually produces.
+name: signals-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove all five rules fire + dedupe (floors enforced)
+        run: cargo test --test signals_bench -- --nocapture
+      - name: Committed artifact must match the code
+        run: git diff --exit-code bench/signals-results.json

@@ -258,7 +258,11 @@ pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Resu
     Ok(())
 }
 
-pub async fn status(cli: &Cli) -> Result<()> {
+/// `saffev status [--check]`. With `--check`, the monitor rules (G6) are
+/// evaluated once after the human-readable status and the process exits `2`
+/// when any signal fired — the scripting hook (cron / CI / shell prompt) that
+/// needs no daemon and no cloud.
+pub async fn status(cli: &Cli, check: bool) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
 
@@ -344,6 +348,9 @@ pub async fn status(cli: &Cli) -> Result<()> {
         crate::exposure::check(upstream_port).await
     })
     .await;
+    // Kept for the --check path below: the monitor rules take the same verdict
+    // this display used, so the two can never disagree in one invocation.
+    let exposed_flag = report.as_ref().map(|r| r.exposed);
 
     let bound_local = bind.is_loopback();
     let (exp_dot, exp_left, exp_right) = match report {
@@ -412,7 +419,73 @@ pub async fn status(cli: &Cli) -> Result<()> {
         }
     }
 
+    if check {
+        return status_check(cli, &cfg, exposed_flag).await;
+    }
+
     Ok(())
+}
+
+/// The `--check` tail of [`status`]: evaluate the monitor rules once against
+/// real inputs and exit `2` when anything fired.
+///
+/// Runs regardless of `monitors.enabled` — the flag gates the *background*
+/// loop; an explicit `--check` is the user asking right now. Thresholds still
+/// come from `[monitors]` in the TOML, and the persisted dedup state is shared
+/// with the background loop, so a signal the Studio already announced is not
+/// re-announced by a cron probe (and vice versa).
+async fn status_check(
+    cli: &Cli,
+    cfg: &Config,
+    exposed: Option<bool>,
+) -> Result<()> {
+    let p = painter(cli);
+
+    let db_path = cfg.db_path();
+    let store = guard("store open", async move {
+        crate::store::Store::open(&db_path).await
+    })
+    .await;
+    let Some(store) = store else {
+        // No store = nothing to evaluate; an unreadable DB must not page anyone.
+        println!("{} {}", p.prompt("~"), p.muted("check: store unavailable · no signals"));
+        return Ok(());
+    };
+
+    // Today's spend (G3 figures) — local JSONL only, off the async runtime.
+    let pricing = cfg.pricing.clone();
+    let spend = tokio::task::spawn_blocking(move || {
+        crate::signals::spend_today(
+            &pricing,
+            &crate::agents::usage::default_claude_projects_dir(),
+            current_millis(),
+        )
+    })
+    .await
+    .unwrap_or(None);
+
+    let mut state = crate::signals::MonitorState::load(&store).await;
+    let signals =
+        crate::signals::evaluate(&store, cfg, current_millis(), exposed, spend, &mut state).await;
+    state.save(&store);
+    // Make the state write durable before the process exits (enqueue alone
+    // races process teardown, which would break cross-run dedup).
+    let _ = store.flush().await;
+
+    if signals.is_empty() {
+        println!("{} {}", p.prompt("~"), p.success("check: no signals"));
+        return Ok(());
+    }
+    for s in &signals {
+        println!(
+            "{} {} {}",
+            p.dot(Level::Err),
+            p.error(&format!("[{}] {}", s.kind.as_str(), s.title)),
+            p.muted(&s.detail),
+        );
+    }
+    // Non-zero for scripting: `saffev status --check || notify-my-way`.
+    std::process::exit(2);
 }
 
 /// Aggregate counters for the status footer line. Best-effort: returns `None`
@@ -2597,7 +2670,7 @@ mod tests {
         let cli = Cli {
             config: Some(path),
             no_color: true,
-            command: crate::cli::Command::Status,
+            command: crate::cli::Command::Status { check: false },
         };
         let cfg = load_config(&cli).await;
         assert_eq!(cfg.ports.proxy, crate::config::DEFAULT_PROXY_PORT);
@@ -2626,7 +2699,7 @@ mod tests {
         let cli = Cli {
             config: Some(path),
             no_color: true,
-            command: crate::cli::Command::Status,
+            command: crate::cli::Command::Status { check: false },
         };
         let cfg = load_config(&cli).await;
         assert_eq!(cfg.ports.proxy, 8188);

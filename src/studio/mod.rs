@@ -195,11 +195,15 @@ impl StudioServer {
         // Studio server (it only makes sense while the control plane is up) and
         // dies with it, so a stopped Studio never leaves a stray archiver.
         let scheduler = spawn_archive_scheduler(self.state.clone());
+        // Signals (G6): the monitor loop is a sibling of the archiver for the
+        // same reason — alive exactly as long as the control plane.
+        let monitors = spawn_monitor_scheduler(self.state.clone());
 
         let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await;
         scheduler.abort();
+        monitors.abort();
         served.map_err(|e| Error::Studio(format!("Studio server error: {e}")))?;
         Ok(())
     }
@@ -266,6 +270,101 @@ fn spawn_archive_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Whether a monitor-scheduler tick should evaluate rules under `cfg`.
+///
+/// Pure gate logic, split out like [`should_run`] so it is testable without a
+/// server: monitors must be ON (`monitors.enabled`). Evaluated against the LIVE
+/// config on every tick, so flipping the switch applies without a restart.
+pub fn monitors_should_run(cfg: &crate::config::Config) -> bool {
+    cfg.monitors.enabled
+}
+
+/// How often the monitor loop evaluates its rules (seconds). One minute keeps
+/// "something needs attention" within a coffee-sip of when it happened, while
+/// each tick is one bounded store read + local arithmetic — negligible.
+const MONITOR_INTERVAL_SECS: u64 = 60;
+
+/// Spawn the local-monitor loop (G6 signals): every 60s, when
+/// `monitors.enabled`, evaluate the five rule classes and surface each hit as
+/// a log line, a desktop notification (when `monitors.notify`), and an SSE
+/// [`dto::StreamEvent::Signal`].
+///
+/// Mirrors [`spawn_archive_scheduler`]'s shape: live config gate per tick
+/// (enable/disable applies without a restart), `Delay` on missed ticks, and
+/// hard fail-soft — no rule error may take the Studio down. Zero network:
+/// exposure reads the local socket table, spend reads local JSONL, and
+/// notifications are OS-local subprocesses.
+fn spawn_monitor_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(MONITOR_INTERVAL_SECS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let cfg = state.config.load();
+            if !monitors_should_run(&cfg) {
+                continue;
+            }
+            let now_ms = crate::agents::now_ms();
+
+            // Mode-aware engine port — the same resolution `status`/`report`
+            // use: the engine really listens on the shadow port under Gateway
+            // and on the upstream port under Cooperative.
+            let engine_port = match cfg.mode {
+                crate::config::Mode::Gateway => cfg.ports.shadow,
+                crate::config::Mode::Cooperative => cfg.ports.upstream,
+            };
+            let exposed = crate::exposure::check(engine_port)
+                .await
+                .ok()
+                .map(|r| r.exposed);
+
+            // Today's spend (G3): blocking JSONL reads, kept off the reactor.
+            let pricing = cfg.pricing.clone();
+            let spend = tokio::task::spawn_blocking(move || {
+                crate::signals::spend_today(
+                    &pricing,
+                    &crate::agents::usage::default_claude_projects_dir(),
+                    crate::agents::now_ms(),
+                )
+            })
+            .await
+            .unwrap_or(None);
+
+            let mut mon_state = crate::signals::MonitorState::load(&state.store).await;
+            let signals = crate::signals::evaluate(
+                &state.store,
+                &cfg,
+                now_ms,
+                exposed,
+                spend,
+                &mut mon_state,
+            )
+            .await;
+            // Persist the dedup memory even when nothing fired (first-run
+            // seeding and exposure baselines are state changes too).
+            mon_state.save(&state.store);
+
+            for s in signals {
+                tracing::info!(
+                    target: "saffev::signals",
+                    "signal [{}] {} — {}", s.kind.as_str(), s.title, s.detail
+                );
+                if cfg.monitors.notify {
+                    crate::notify::send(&s.title, &s.detail);
+                }
+                // Best-effort: an SSE channel with no subscribers errors; fine.
+                let _ = state.events.send(dto::StreamEvent::Signal {
+                    kind: s.kind.as_str().to_string(),
+                    title: s.title,
+                    detail: s.detail,
+                    ts: s.ts,
+                });
+            }
+        }
+    })
+}
+
 /// Default broadcast capacity for the live SSE event channel.
 pub const STREAM_CHANNEL_CAPACITY: usize = 1024;
 
@@ -292,5 +391,17 @@ mod tests {
         // stay cheaply cloneable (Arc/handle fields only).
         fn assert_clone<T: Clone>() {}
         assert_clone::<StudioState>();
+    }
+
+    #[test]
+    fn monitor_gate_follows_the_live_config() {
+        // Off by default (observe-only ethos); flipping the one switch changes
+        // the very next tick's decision — same contract as `should_run`.
+        let mut cfg = crate::config::Config::default();
+        assert!(!monitors_should_run(&cfg), "monitors must be off by default");
+        cfg.monitors.enabled = true;
+        assert!(monitors_should_run(&cfg));
+        cfg.monitors.enabled = false;
+        assert!(!monitors_should_run(&cfg), "disabling stops the next tick");
     }
 }

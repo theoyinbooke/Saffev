@@ -63,7 +63,13 @@ pub enum Command {
         cooperative: bool,
     },
     /// Show engines, ports, mode, health, exposure result.
-    Status,
+    Status {
+        /// Evaluate the local monitor rules (G6 signals) and exit non-zero
+        /// (2) when any fires — the scriptable hook: `saffev status --check
+        /// || alert-me`. Prints each fired signal before exiting.
+        #[arg(long)]
+        check: bool,
+    },
     /// Run the proxy + Studio + supervisor.
     Start {
         /// Run in the foreground (do not daemonize).
@@ -170,7 +176,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             engine,
             cooperative,
         } => commands::adopt(&cli, engine, cooperative).await,
-        Command::Status => commands::status(&cli).await,
+        Command::Status { check } => commands::status(&cli, check).await,
         Command::Start {
             foreground,
             no_open,

@@ -1,0 +1,29 @@
+{
+  "command": "cargo test --test signals_bench -- --nocapture",
+  "config_plane": "toml [monitors] (saffev.toml — same plane as every other setting)",
+  "dedup": "threshold rules once per hour/day bucket; new-app once ever; exposure once per verdict flip; state persisted in the store settings table",
+  "gauntlet": "G6 signals — local monitors & notifications",
+  "rules": {
+    "exposure_change": {
+      "deduped": true,
+      "fired": true
+    },
+    "latency_p95": {
+      "deduped": true,
+      "fired": true
+    },
+    "new_source_app": {
+      "deduped": true,
+      "fired": true
+    },
+    "pii_spike": {
+      "deduped": true,
+      "fired": true
+    },
+    "spend_per_day": {
+      "deduped": true,
+      "fired": true
+    }
+  },
+  "zero_network": "all rule inputs are local store reads or caller-supplied observations; notifications are local subprocesses (notify-send / osascript), never webhooks; no rule path constructs a URL or opens a socket"
+}

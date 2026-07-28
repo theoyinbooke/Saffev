@@ -392,6 +392,64 @@ fn default_archive_interval_minutes() -> u32 {
     5
 }
 
+/// Local monitor rules — signals when something needs attention (G6).
+///
+/// **Off by default** (observe-only ethos: nothing pings the user until they
+/// ask). When enabled, the Studio's 60-second monitor loop evaluates five rule
+/// classes — PII spike, first-seen source app, exposure verdict change, latency
+/// p95, spend-per-day — entirely on-device, and surfaces hits as a log line, a
+/// desktop notification (when `notify` is on), and an SSE event. Everything
+/// here is a plain TOML field so the rules live in the same config plane as
+/// every other knob (`[monitors]` in `saffev.toml`). Zero network, ever:
+/// notifications are OS-local (`notify-send` / `osascript`), never webhooks.
+///
+/// Hot-reloadable like [`ArchiveConfig`]: the monitor loop re-loads the live
+/// config every tick, so flipping `enabled` applies without a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorsConfig {
+    /// Master switch. `false` (default) = the monitor loop does nothing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fire when more than this many PII findings land within one hour.
+    #[serde(default = "default_pii_spike_per_hour")]
+    pub pii_spike_per_hour: u32,
+    /// Fire when the p95 of request latency over the last hour exceeds this
+    /// (milliseconds). Needs ≥ 20 samples — small-n p95 is noise, not signal.
+    #[serde(default = "default_latency_p95_ms")]
+    pub latency_p95_ms: u32,
+    /// Fire when today's (UTC) coding-agent spend exceeds this many USD
+    /// (estimated with [`PricingConfig`], same figures as the analytics page).
+    #[serde(default = "default_spend_per_day_usd")]
+    pub spend_per_day_usd: f64,
+    /// Send a desktop notification for each signal (in addition to the log
+    /// line + SSE event). Fail-soft: a missing notifier is a debug log, never
+    /// an error.
+    #[serde(default = "default_true")]
+    pub notify: bool,
+}
+
+fn default_pii_spike_per_hour() -> u32 {
+    20
+}
+fn default_latency_p95_ms() -> u32 {
+    30_000
+}
+fn default_spend_per_day_usd() -> f64 {
+    10.0
+}
+
+impl Default for MonitorsConfig {
+    fn default() -> Self {
+        MonitorsConfig {
+            enabled: false,
+            pii_spike_per_hour: default_pii_spike_per_hour(),
+            latency_p95_ms: default_latency_p95_ms(),
+            spend_per_day_usd: default_spend_per_day_usd(),
+            notify: true,
+        }
+    }
+}
+
 /// One entry in the model price table. USD per 1,000,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPrice {
@@ -613,6 +671,10 @@ pub struct Config {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// Opt-in local monitor rules + desktop notifications (G6). Off by default.
+    #[serde(default)]
+    pub monitors: MonitorsConfig,
+
     /// Prices used for the cost estimates. Editable so a published price change
     /// does not silently make the figures wrong.
     #[serde(default)]
@@ -648,6 +710,7 @@ impl Default for Config {
             pricing: PricingConfig::default(),
             policy_file: None,
             archive: ArchiveConfig::default(),
+            monitors: MonitorsConfig::default(),
         }
     }
 }
