@@ -154,6 +154,13 @@ pub fn process_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
+    // No real process can have pid 0 or a pid above i32::MAX, and `kill`
+    // reinterprets both as group targets (procps parses 4294967295 as pid -1 —
+    // "every process we may signal" — and 0 as our own process group), so a
+    // probe would report a false "alive" or worse. They are never alive.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     #[cfg(unix)]
     {
         std::process::Command::new("kill")
@@ -214,6 +221,14 @@ pub fn process_alive(pid: u32) -> bool {
 ///   daemon gets the chance to exit cleanly; `wait_for_exit` then reports whether
 ///   it actually went, and the caller can re-run `stop` to retry.
 pub fn send_terminate(pid: u32) -> Result<()> {
+    // Never forward an impossible pid to the OS kill tool: procps `kill`
+    // parses 4294967295 as pid -1, which SIGTERMs every process the user can
+    // signal (it takes down their entire desktop session), and 0 targets our
+    // own process group. Such a pid can't name a live daemon, so the caller's
+    // goal — "it's not running" — is already satisfied.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         let status = std::process::Command::new("kill")
@@ -555,13 +570,13 @@ mod tests {
 
     #[test]
     fn unused_pid_is_not_alive() {
-        // A very high pid that is effectively never allocated. `kill -0` against
-        // it fails (ESRCH), so it must read as not-alive. (NB: pid 0 is *not* a
-        // valid probe — on Unix it targets the caller's process group, which
-        // exists, so `kill -0 0` succeeds. We never write pid 0 anyway:
-        // parse_pid_file rejects it.)
+        // Pids above i32::MAX can't exist and must never reach `kill` (procps
+        // would reinterpret them as negative group targets); the guard reports
+        // them not-alive without probing. Same for pid 0 (our own process
+        // group — `kill -0 0` would falsely succeed).
         assert!(!process_alive(u32::MAX));
         assert!(!process_alive(u32::MAX - 1));
+        assert!(!process_alive(0));
     }
 
     #[test]
@@ -636,7 +651,10 @@ mod tests {
     #[test]
     fn send_sigterm_to_dead_pid_is_ok() {
         // Signalling a non-existent process is not an error for our purposes
-        // (the goal — "it's not running" — is already satisfied).
+        // (the goal — "it's not running" — is already satisfied). u32::MAX
+        // additionally exercises the impossible-pid guard: without it, procps
+        // `kill` parses 4294967295 as pid -1 and SIGTERMs the whole session.
         assert!(send_sigterm(u32::MAX).is_ok());
+        assert!(send_sigterm(0).is_ok());
     }
 }
