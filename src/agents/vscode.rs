@@ -33,6 +33,12 @@ pub struct VsCodeReader {
 }
 
 impl VsCodeReader {
+    /// Fixture seam: read explicit `workspaceStorage` roots. See
+    /// `tests/agents_bench.rs`.
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
+
     pub fn new() -> Self {
         let flavors = ["Code", "Code - Insiders", "VSCodium"];
         let bases: Vec<PathBuf> = if cfg!(target_os = "macos") {

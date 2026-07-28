@@ -1,0 +1,83 @@
+{
+  "bar": "ccusage parses 15 agent CLIs; rubric wants >= 10 tools with fields proven",
+  "command": "cargo test --test agents_bench -- --nocapture",
+  "fixtures": "tests/fixtures/agents/<tool>/ (committed, sanitized; SQLite tools as reviewable .sql)",
+  "harness": "agents_bench v1 (G2 loop 1 — docs/gauntlets/GAUNTLETS.md)",
+  "tools": {
+    "claude_code": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 2
+    },
+    "codex": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 2
+    },
+    "cursor": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": "absent_in_format"
+      },
+      "notes": [
+        "format carries no token usage"
+      ],
+      "sessions_found": 1
+    },
+    "opencode": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 2
+    },
+    "vscode": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": "absent_in_format"
+      },
+      "notes": [
+        "format carries no token usage"
+      ],
+      "sessions_found": 2
+    }
+  },
+  "tools_covered": 5
+}

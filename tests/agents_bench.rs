@@ -1,0 +1,300 @@
+//! G2 gauntlet harness — the fixture corpus that makes adapter claims
+//! testable (docs/gauntlets/GAUNTLETS.md §G2, loop 1).
+//!
+//! One command, reproducible:
+//!
+//! ```text
+//! cargo test --test agents_bench -- --nocapture
+//! ```
+//!
+//! For every adapter this proves, from COMMITTED sanitized fixtures
+//! (`tests/fixtures/agents/<tool>/`), extraction of the rubric fields —
+//! session id, title, project, model, timestamps, per-message roles, token
+//! counts — plus a corrupted-fixture case proving non-fatal degradation.
+//! It emits `bench/agents-results.json`, the coverage-table artifact
+//! (tool → fields), and enforces floors so coverage can only regress loudly.
+//!
+//! Honesty rule: a field the tool's on-disk format does not carry (Cursor
+//! and VS Code store no token usage locally) is recorded as
+//! `"absent_in_format"` — never claimed, never silently skipped.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use saffev::agents::claude_code::ClaudeCodeReader;
+use saffev::agents::codex::CodexReader;
+use saffev::agents::cursor::CursorReader;
+use saffev::agents::opencode::OpenCodeReader;
+use saffev::agents::vscode::VsCodeReader;
+use saffev::agents::{AgentReader, AgentSession, MessageKind, Role};
+
+fn fixture(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/agents")
+        .join(rel)
+}
+
+/// Materialize a committed `.sql` fixture into a real SQLite file (SQL text
+/// is the committed, reviewable form; a binary DB would be unauditable).
+fn build_db(sql_rel: &str, name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("saffev-g2-{}", uuid_ish()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join(name);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let sql = std::fs::read_to_string(fixture(sql_rel)).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    db
+}
+
+/// Unique-enough temp suffix without Date::now (nanos of PID + counter).
+fn uuid_ish() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+}
+
+fn raw_id(session: &AgentSession) -> &str {
+    session.id.split_once(':').map(|(_, r)| r).unwrap_or(&session.id)
+}
+
+/// The rubric-field checklist for one tool, serialized into the artifact.
+#[derive(Default)]
+struct Coverage {
+    sessions_found: usize,
+    session_id: bool,
+    title: bool,
+    project: bool,
+    model: bool,
+    timestamps: bool,
+    roles: bool,
+    token_counts: Option<bool>, // None = absent_in_format
+    corrupted_nonfatal: bool,
+    notes: Vec<String>,
+}
+
+impl Coverage {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sessions_found": self.sessions_found,
+            "fields": {
+                "session_id": self.session_id,
+                "title": self.title,
+                "project": self.project,
+                "model": self.model,
+                "timestamps": self.timestamps,
+                "per_message_roles": self.roles,
+                "token_counts": match self.token_counts {
+                    Some(b) => serde_json::json!(b),
+                    None => serde_json::json!("absent_in_format"),
+                },
+            },
+            "corrupted_nonfatal": self.corrupted_nonfatal,
+            "notes": self.notes,
+        })
+    }
+
+    /// Every rubric field proven (token counts may be honestly absent).
+    fn complete(&self) -> bool {
+        self.session_id
+            && self.title
+            && self.project
+            && self.model
+            && self.timestamps
+            && self.roles
+            && self.token_counts != Some(false)
+            && self.corrupted_nonfatal
+    }
+}
+
+/// Shared field checks on a (session, detail-messages) pair.
+fn check_common(
+    cov: &mut Coverage,
+    reader: &dyn AgentReader,
+    good: &AgentSession,
+    tool_key: &str,
+) {
+    cov.session_id = good.id.starts_with(&format!("{tool_key}:"));
+    cov.title = good.title.as_deref().is_some_and(|t| !t.is_empty());
+    cov.project = good.project.as_deref().is_some_and(|p| !p.is_empty());
+    cov.model = good.model.as_deref().is_some_and(|m| !m.is_empty());
+    cov.timestamps = good.started_ts > 0 && good.updated_ts >= good.started_ts;
+    let detail = reader
+        .session_detail(raw_id(good))
+        .unwrap_or_else(|| panic!("{tool_key}: detail for {}", good.id));
+    let has_user = detail.messages.iter().any(|m| matches!(m.role, Role::User));
+    let has_assistant = detail
+        .messages
+        .iter()
+        .any(|m| matches!(m.role, Role::Assistant));
+    cov.roles = has_user && has_assistant;
+    assert!(
+        detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::ToolUse)),
+        "{tool_key}: tool use missing from detail"
+    );
+}
+
+#[test]
+fn agents_fixture_coverage() {
+    let mut table: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut complete = 0usize;
+
+    // ---- Claude Code -------------------------------------------------------
+    {
+        let reader = ClaudeCodeReader::with_root(fixture("claude_code"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000001"))
+            .expect("claude_code: good session listed");
+        check_common(&mut cov, &reader, good, "claude_code");
+        cov.token_counts = Some(
+            good.input_tokens == 1200 && good.output_tokens == 340 && good.cache_tokens == 100,
+        );
+        assert_eq!(good.git_branch.as_deref(), Some("main"));
+        // Corrupted fixture: garbage lines skipped, the one valid record
+        // survives, nothing is fatal.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000002"))
+            .expect("claude_code: corrupted session still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 1;
+        table.insert("claude_code".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
+    // ---- Codex CLI ---------------------------------------------------------
+    {
+        let reader = CodexReader::with_root(fixture("codex"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000003"))
+            .expect("codex: good session listed");
+        check_common(&mut cov, &reader, good, "codex");
+        assert_eq!(good.title.as_deref(), Some("Wire healthcheck"), "title from session_index");
+        assert_eq!(good.git_branch.as_deref(), Some("feature/g2"));
+        // OpenAI convention: input_tokens is TOTAL; adapter must subtract cache.
+        cov.token_counts = Some(
+            good.input_tokens == 1100 && good.output_tokens == 260 && good.cache_tokens == 400,
+        );
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000004"))
+            .expect("codex: corrupted rollout still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 1;
+        table.insert("codex".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
+    // ---- OpenCode ----------------------------------------------------------
+    {
+        let reader = OpenCodeReader::with_db(build_db("opencode/opencode.sql", "opencode.db"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("ses_good"))
+            .expect("opencode: good session listed");
+        check_common(&mut cov, &reader, good, "opencode");
+        assert_eq!(good.model.as_deref(), Some("anthropic/claude-opus-4-8"));
+        cov.token_counts = Some(
+            good.input_tokens == 900 && good.output_tokens == 150 && good.cache_tokens == 150,
+        );
+        // Corrupted data blob: json_extract degrades to NULL, session still
+        // listed with zeroed aggregates — non-fatal.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("ses_bad"))
+            .expect("opencode: corrupted-blob session still listed");
+        cov.corrupted_nonfatal = hurt.input_tokens == 0 && hurt.message_count == 1;
+        table.insert("opencode".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
+    // ---- Cursor ------------------------------------------------------------
+    {
+        let reader = CursorReader::with_db(build_db("cursor/state.sql", "state.vscdb"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("comp-0001"))
+            .expect("cursor: good session listed");
+        check_common(&mut cov, &reader, good, "cursor");
+        // Cursor stores no token usage locally — recorded, not claimed.
+        cov.token_counts = None;
+        cov.notes.push("format carries no token usage".into());
+        // Corrupted composer blob: skipped in list, nothing fatal, the good
+        // session is unaffected.
+        cov.corrupted_nonfatal = sessions.iter().all(|s| !s.id.contains("comp-broken"));
+        table.insert("cursor".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
+    // ---- VS Code / Copilot Chat -------------------------------------------
+    {
+        let reader = VsCodeReader::with_roots(vec![fixture("vscode/workspaceStorage")]);
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000005"))
+            .expect("vscode: good session listed");
+        check_common(&mut cov, &reader, good, "vscode");
+        assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
+        cov.token_counts = None;
+        cov.notes.push("format carries no token usage".into());
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000006"))
+            .expect("vscode: corrupted session still listed");
+        cov.corrupted_nonfatal = hurt.message_count >= 1;
+        table.insert("vscode".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
+    // ---- Artifact ----------------------------------------------------------
+    let out = serde_json::json!({
+        "command": "cargo test --test agents_bench -- --nocapture",
+        "harness": "agents_bench v1 (G2 loop 1 — docs/gauntlets/GAUNTLETS.md)",
+        "fixtures": "tests/fixtures/agents/<tool>/ (committed, sanitized; SQLite tools as reviewable .sql)",
+        "bar": "ccusage parses 15 agent CLIs; rubric wants >= 10 tools with fields proven",
+        "tools": table,
+        "tools_covered": complete,
+    });
+    let pretty = serde_json::to_string_pretty(&out).unwrap();
+    println!("{pretty}");
+    let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/bench");
+    std::fs::create_dir_all(out_dir).expect("create bench dir");
+    std::fs::write(format!("{out_dir}/agents-results.json"), pretty + "\n")
+        .expect("write bench/agents-results.json");
+
+    // ---- Floors ------------------------------------------------------------
+    // Every currently-shipped adapter must prove the full rubric checklist.
+    // Raising this floor is progress (new adapters); lowering it is a
+    // regression the harness refuses.
+    assert!(
+        complete >= 5,
+        "adapter coverage regressed: {complete} of 5 complete"
+    );
+}

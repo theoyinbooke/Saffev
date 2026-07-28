@@ -28,6 +28,14 @@ pub struct CodexReader {
 }
 
 impl CodexReader {
+    /// Fixture seam: read from an explicit Codex home (containing `sessions/`
+    /// and optionally `session_index.jsonl`). See `tests/agents_bench.rs`.
+    pub fn with_root(codex_home: PathBuf) -> Self {
+        Self {
+            base: codex_home.join("sessions"),
+        }
+    }
+
     /// `$CODEX_HOME/sessions` else `~/.codex/sessions`.
     pub fn new() -> Self {
         let home_dir = std::env::var_os("CODEX_HOME")

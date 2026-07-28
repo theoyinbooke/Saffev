@@ -22,6 +22,13 @@ pub struct ClaudeCodeReader {
 }
 
 impl ClaudeCodeReader {
+    /// Fixture seam: read from an explicit projects dir instead of the
+    /// platform location. The G2 harness (`tests/agents_bench.rs`)
+    /// materializes committed fixtures into a temp dir and points here.
+    pub fn with_root(projects_dir: PathBuf) -> Self {
+        Self { base: projects_dir }
+    }
+
     /// `~/.claude/projects` (honors `CLAUDE_CONFIG_DIR` if set).
     pub fn new() -> Self {
         let base = std::env::var_os("CLAUDE_CONFIG_DIR")

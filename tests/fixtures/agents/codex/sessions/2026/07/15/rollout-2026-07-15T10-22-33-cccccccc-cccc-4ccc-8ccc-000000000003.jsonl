@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-07-15T10:22:33.000Z","payload":{"id":"cccccccc-cccc-4ccc-8ccc-000000000003","timestamp":"2026-07-15T10:22:33.000Z","cwd":"/home/dev/fixture-proj","git":{"branch":"feature/g2"}}}
+{"type":"turn_context","timestamp":"2026-07-15T10:22:34.000Z","payload":{"model":"gpt-5.2-codex"}}
+{"type":"response_item","timestamp":"2026-07-15T10:22:35.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"wire up the healthcheck"}]}}
+{"type":"response_item","timestamp":"2026-07-15T10:22:40.000Z","payload":{"type":"reasoning","summary":[{"text":"plan: add route, return 200"}]}}
+{"type":"response_item","timestamp":"2026-07-15T10:22:41.000Z","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"cargo\",\"check\"]}"}}
+{"type":"response_item","timestamp":"2026-07-15T10:22:50.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Healthcheck wired at /healthz."}]}}
+{"type":"event_msg","timestamp":"2026-07-15T10:22:51.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":400,"output_tokens":260}}}}

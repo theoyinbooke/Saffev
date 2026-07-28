@@ -22,6 +22,12 @@ pub struct OpenCodeReader {
 }
 
 impl OpenCodeReader {
+    /// Fixture seam: read an explicit database file. See
+    /// `tests/agents_bench.rs`.
+    pub fn with_db(db: PathBuf) -> Self {
+        Self { db }
+    }
+
     /// `$XDG_DATA_HOME/opencode/opencode.db` else `~/.local/share/opencode/opencode.db`.
     pub fn new() -> Self {
         let base = std::env::var_os("XDG_DATA_HOME")

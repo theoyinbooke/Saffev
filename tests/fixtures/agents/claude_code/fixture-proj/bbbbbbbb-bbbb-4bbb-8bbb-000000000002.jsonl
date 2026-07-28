@@ -1,0 +1,4 @@
+this line is not JSON at all {{{
+{"type":"user","timestamp":"2026-07-15T10:00:00.000Z","cwd":"/home/dev/fixture-proj","sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-000000000002","message":{"role":"user","content":"still parses around garbage"}}
+{"type":"assistant","timestamp":
+�binary�garbage�

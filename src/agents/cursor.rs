@@ -26,6 +26,12 @@ pub struct CursorReader {
 }
 
 impl CursorReader {
+    /// Fixture seam: read an explicit `state.vscdb`. See
+    /// `tests/agents_bench.rs`.
+    pub fn with_db(db: PathBuf) -> Self {
+        Self { db }
+    }
+
     /// Platform state.vscdb path (macOS / Linux / Windows).
     pub fn new() -> Self {
         let user_dir = if cfg!(target_os = "macos") {

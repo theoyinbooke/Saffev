@@ -1,0 +1,4 @@
+NOT JSON {{{{
+{"kind":0,"v":{"sessionId":"ffffffff-ffff-4fff-8fff-000000000006","creationDate":1784900100000}}
+{"kind":2,"v":[{"requestId":"r1","timestamp":1784900101000,"message":{"text":"garbage-tolerant session"},"response":[{"kind":"markdownContent","value":"ok"}]}]}
+{"kind":2,"v":
