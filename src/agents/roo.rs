@@ -112,7 +112,7 @@ impl RooReader {
 
     fn build(root: &Path, task_id: &str, with_messages: bool) -> Option<AgentSessionDetail> {
         let task_dir = root.join("tasks").join(task_id);
-        let (messages, msg_count, tool_count, _tmodel, tlast) =
+        let (messages, msg_count, tool_count, _tmodel, tlast, tfirst) =
             ClineReader::transcript(&task_dir, with_messages);
         let (ui_title, ui_in_total, ui_out, ui_cache, ui_last) =
             ClineReader::ui_fallback(&task_dir);
@@ -132,7 +132,10 @@ impl RooReader {
                 ui_cache,
             )
         };
-        let started_ts = task_id.parse::<i64>().unwrap_or(0);
+        // Roo task dirs are uuidv7 in current versions (epoch-ms names are
+        // Cline heritage) — the id carries no start time, so the first
+        // turn's timestamp is the honest start (G2 closing critic).
+        let started_ts = task_id.parse::<i64>().unwrap_or(tfirst);
         let updated_ts = hist_ts.max(tlast).max(ui_last).max(started_ts);
         let title = hist_task
             .or(ui_title)

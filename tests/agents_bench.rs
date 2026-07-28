@@ -597,9 +597,12 @@ fn agents_fixture_coverage() {
         };
         let good = sessions
             .iter()
-            .find(|s| s.id.ends_with("1748899000000"))
+            .find(|s| s.id.ends_with("2b9c1e5d7a80"))
             .expect("roo: good task listed");
         check_common(&mut cov, &reader, good, "roo");
+        // Real Roo task dirs are uuidv7 (closing critic) — no epoch in the
+        // name, so the start time is the first turn's timestamp.
+        assert_eq!(good.started_ts, 1748899000100);
         // Roo does NOT persist the model per task (only a mutable profile
         // name in VS Code secrets) — honestly absent, never guessed.
         cov.model_absent_in_format = true;

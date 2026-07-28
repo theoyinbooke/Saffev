@@ -1,0 +1,1 @@
+{"id":"0198a3f2-71b2-7cde-8f4a-2b9c1e5d7a80","number":1,"ts":1748899123456,"task":"Fix the login bug","tokensIn":5230,"tokensOut":812,"cacheWrites":4100,"cacheReads":900,"totalCost":0.0342,"size":18432,"workspace":"/home/dev/fixture-proj","mode":"code","apiConfigName":"default","status":"completed"}

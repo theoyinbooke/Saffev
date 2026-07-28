@@ -162,16 +162,20 @@ impl ClineReader {
     /// Parse the transcript. Returns `(messages, msg_count, tool_count,
     /// last_model, last_ts)` — empty on a corrupt file (non-fatal). Shared
     /// with the Roo Code reader (same file heritage).
-    pub(super) fn transcript(task_dir: &Path, with_messages: bool) -> (Vec<AgentMessage>, u32, u32, Option<String>, i64) {
+    pub(super) fn transcript(
+        task_dir: &Path,
+        with_messages: bool,
+    ) -> (Vec<AgentMessage>, u32, u32, Option<String>, i64, i64) {
         let mut messages = Vec::new();
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
         let mut model = None;
         let mut last_ts = 0i64;
+        let mut first_ts = 0i64;
         let Ok(text) = fs::read_to_string(task_dir.join("api_conversation_history.json")) else {
-            return (messages, msg_count, tool_count, model, last_ts);
+            return (messages, msg_count, tool_count, model, last_ts, first_ts);
         };
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            return (messages, msg_count, tool_count, model, last_ts);
+            return (messages, msg_count, tool_count, model, last_ts, first_ts);
         };
         for m in v.as_array().map(|a| a.as_slice()).unwrap_or_default() {
             let role_s = m.get("role").and_then(Value::as_str).unwrap_or("");
@@ -184,6 +188,9 @@ impl ClineReader {
             let ts = m.get("ts").and_then(Value::as_i64).filter(|t| *t > 0);
             if let Some(t) = ts {
                 last_ts = last_ts.max(t);
+                if first_ts == 0 {
+                    first_ts = t;
+                }
             }
             if let Some(mi) = m
                 .get("modelInfo")
@@ -281,7 +288,7 @@ impl ClineReader {
                 _ => {}
             }
         }
-        (messages, msg_count, tool_count, model, last_ts)
+        (messages, msg_count, tool_count, model, last_ts, first_ts)
     }
 
     /// Build one task's session (summary or full detail).
@@ -292,7 +299,7 @@ impl ClineReader {
         with_messages: bool,
     ) -> Option<AgentSessionDetail> {
         let task_dir = root.join("tasks").join(task_id);
-        let (messages, msg_count, tool_count, tmodel, tlast) =
+        let (messages, msg_count, tool_count, tmodel, tlast, tfirst) =
             Self::transcript(&task_dir, with_messages);
         let (ui_title, ui_in, ui_out, ui_cache, ui_last) = Self::ui_fallback(&task_dir);
         // A task with a corrupt transcript still lists via its history row /
@@ -300,8 +307,9 @@ impl ClineReader {
         if msg_count == 0 && row.is_none() && ui_title.is_none() {
             return None;
         }
-        // The task id IS the start time (millisecond epoch).
-        let started_ts = task_id.parse::<i64>().unwrap_or(0);
+        // The task id IS the start time (millisecond epoch) for Cline; fall
+        // back to the first turn's timestamp for non-numeric ids.
+        let started_ts = task_id.parse::<i64>().unwrap_or(tfirst);
         let row_default = HistoryRow::default();
         let row = row.unwrap_or(&row_default);
         let (inp, outp, cache) = if row.tokens_in + row.tokens_out + row.cache > 0 {

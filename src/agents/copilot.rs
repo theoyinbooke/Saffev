@@ -102,7 +102,21 @@ impl CopilotReader {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
             };
-            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            let trimmed = value.trim();
+            // Single-quoted YAML scalars escape embedded quotes by doubling
+            // them ('' -> '); unescape after stripping (G2 closing critic).
+            let single_quoted = trimmed.len() >= 2
+                && trimmed.starts_with('\'')
+                && trimmed.ends_with('\'');
+            let value = trimmed
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
+            let value = if single_quoted {
+                value.replace("''", "'")
+            } else {
+                value
+            };
+            let value = value.as_str();
             if value.is_empty() {
                 continue;
             }
@@ -658,7 +672,7 @@ mod tests {
         std::fs::create_dir_all(&sdir).unwrap();
         std::fs::write(
             sdir.join("workspace.yaml"),
-            "id: 3d9f5c2b-6a74-4e0d-9f4b-000000000098\ncwd: '/home/dev/spec chars'\nname: 'Quoted title'\ncreated_at: 2026-07-02T10:00:00.000Z\nupdated_at: 2026-07-02T10:01:00.000Z\n",
+            "id: 3d9f5c2b-6a74-4e0d-9f4b-000000000098\ncwd: '/home/dev/spec chars'\nname: 'It''s quoted'\ncreated_at: 2026-07-02T10:00:00.000Z\nupdated_at: 2026-07-02T10:01:00.000Z\n",
         )
         .unwrap();
         std::fs::write(
@@ -669,7 +683,7 @@ mod tests {
         let reader = CopilotReader::with_root(dir.clone());
         let sessions = reader.list_sessions();
         assert_eq!(sessions[0].project.as_deref(), Some("/home/dev/spec chars"));
-        assert_eq!(sessions[0].title.as_deref(), Some("Quoted title"));
+        assert_eq!(sessions[0].title.as_deref(), Some("It's quoted"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
