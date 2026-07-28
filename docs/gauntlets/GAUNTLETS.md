@@ -40,8 +40,11 @@ pinned commit.
 
 **Critic rubric.** (a) On the corpus: recall ≥ Presidio's deterministic
 recognizers for every overlapping kind, at FP rate ≤ current shipped detectors.
-(b) ≥ 8 new kinds landed with per-kind scores. (c) Same scores reproduced from a
-clean checkout with one command. Name the weakest detector as the next gap.
+(b) ≥ 8 new kinds landed with per-kind scores — *new* means not shipped when
+the gauntlet opened; the build list above deliberately includes
+Presidio-overlapping kinds (SSN, IBAN, MAC), so new-vs-Presidio is NOT the
+reading. (c) Same scores reproduced from a clean checkout with one command.
+Name the weakest detector as the next gap.
 
 ---
 

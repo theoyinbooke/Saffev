@@ -138,3 +138,8 @@
 {"id":"env-t13","text":"params: {\"password\"=>\"[FILTERED]\"}","expect":[],"trap":"env_assignment","note":"round-5 critic FP — Rails log-scrubbing marker is not a secret"}
 {"id":"env-t14","text":"password: incorrect","expect":[],"trap":"env_assignment","note":"round-5 critic — single-token status word, prose not material"}
 {"id":"env-011","text":"{\"user\"=>\"svc\", \"password\"=>\"hunter2secret99\"}","expect":[{"kind":"env_assignment","value":"\"password\"=>\"hunter2secret99\""}],"note":"round-5 critic miss — Ruby hash-rocket member"}
+{"id":"env-t15","text":"password: ***MASKED***","expect":[],"trap":"env_assignment","note":"round-6 critic FP — asterisk scrub decoration must normalize to the marker word"}
+{"id":"env-t16","text":"password: (REDACTED)","expect":[],"trap":"env_assignment","note":"round-6 critic FP — parenthesized marker escapes exact-match lists"}
+{"id":"env-t17","text":"token: invalid_token","expect":[],"trap":"env_assignment","note":"round-6 critic FP — OAuth2 error code; all-vocabulary compound is protocol noise"}
+{"id":"env-012","text":"{:password=>\"hunter2secret99\", :role=>\"admin\"}","expect":[{"kind":"env_assignment","value":":password=>\"hunter2secret99\""}],"note":"round-6 critic miss — symbol-key Ruby hash rocket"}
+{"id":"env-013","text":"export PASSWORD='[k9!fQ2xW8z'","expect":[{"kind":"env_assignment","value":"PASSWORD='[k9!fQ2xW8z'"}],"note":"round-6 critic over-kill — quoted real secret starting with [ is literal, not a marker"}

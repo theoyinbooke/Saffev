@@ -164,9 +164,18 @@ static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
 
 /// Ruby hash-rocket member candidate (`"password"=>"hunter2"` — every Rails
 /// console/log paste; G1 round-5 critic's missed grammar). Same gates as the
-/// JSON form. Capture 1 = key, 2 = value.
+/// JSON form. Capture 1 = key, 2 = value (single or double quotes).
 static RE_RUBY_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*=>\s*"([^"\r\n]{4,})""#).expect("ruby secret regex")
+    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*=>\s*['"]([^'"\r\n]{4,})['"]"#)
+        .expect("ruby secret regex")
+});
+
+/// Ruby SYMBOL-key hash-rocket candidate (`:password=>"hunter2"` — the older,
+/// very common form; G1 round-6 critic's miss: the quoted-key grammar above
+/// doesn't reach it). Capture 1 = key, 2 = value.
+static RE_RUBY_SYM_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#":([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*['"]([^'"\r\n]{4,})['"]"#)
+        .expect("ruby symbol secret regex")
 });
 
 /// YAML mapping candidate (`password: hunter2` at line start, any indent).
@@ -255,6 +264,7 @@ impl Detector {
         Lazy::force(&RE_ENV_ASSIGN);
         Lazy::force(&RE_JSON_SECRET);
         Lazy::force(&RE_RUBY_SECRET);
+        Lazy::force(&RE_RUBY_SYM_SECRET);
         Lazy::force(&RE_YAML_SECRET);
         Lazy::force(&RE_TOML_SECRET);
         Lazy::force(&RE_CONN_KV);
@@ -354,13 +364,18 @@ impl Detector {
                 config_candidates.push((m.start(), m.end(), key.to_string(), value.to_string()));
             }
         }
-        // JSON spans start at the whole match (the key's opening quote);
-        // YAML/TOML spans start at the key so line indent stays unmasked.
-        for (re, from_key, prose_gate) in [
-            (&RE_JSON_SECRET, false, false),
-            (&RE_RUBY_SECRET, false, false),
-            (&RE_YAML_SECRET, true, true),
-            (&RE_TOML_SECRET, true, false),
+        // JSON/rocket spans start at the whole match (the key's opening quote
+        // or `:`); YAML/TOML spans start at the key so line indent stays
+        // unmasked. `quote_wrap`: those grammars capture the value INSIDE its
+        // mandatory quotes, so the quoting is restored before the value gate —
+        // a quoted real secret starting with `[` must survive the marker kill
+        // in every form, not just shell (G1 round-6 critic's over-kill).
+        for (re, from_key, prose_gate, quote_wrap) in [
+            (&RE_JSON_SECRET, false, false, true),
+            (&RE_RUBY_SECRET, false, false, true),
+            (&RE_RUBY_SYM_SECRET, false, false, true),
+            (&RE_YAML_SECRET, true, true, false),
+            (&RE_TOML_SECRET, true, false, true),
         ] {
             for caps in re.captures_iter(text) {
                 let (Some(whole), Some(key), Some(value)) = (caps.get(0), caps.get(1), caps.get(2))
@@ -382,12 +397,12 @@ impl Detector {
                     continue;
                 }
                 let start = if from_key { key.start() } else { whole.start() };
-                config_candidates.push((
-                    start,
-                    whole.end(),
-                    key.as_str().to_string(),
-                    val.to_string(),
-                ));
+                let carried = if quote_wrap {
+                    format!("\"{val}\"")
+                } else {
+                    val.to_string()
+                };
+                config_candidates.push((start, whole.end(), key.as_str().to_string(), carried));
             }
         }
         config_candidates.sort_by_key(|c| (c.0, c.1));
@@ -826,53 +841,93 @@ fn env_key_is_secret(key: &str) -> bool {
 }
 
 /// Is an assignment VALUE real secret material rather than a placeholder?
-/// Rejects interpolations (`$VAR`, `${VAR}`, `{{tpl}}`, `%VAR%`), angle-bracket
-/// placeholders, well-known placeholder words, and low-entropy runs
-/// (`xxxxxxxx`) that a template would use where a secret goes.
+///
+/// The marker checks run on a NORMALIZED view — quotes stripped, then
+/// surrounding decoration trimmed and lowercased — so a scrub convention
+/// can't escape by dressing up (`[FILTERED]`, `***MASKED***`, `(REDACTED)`
+/// all normalize to a known marker word; G1 round-6 critic showed the
+/// exact-match list regrew the FP family one decoration away). Interpolation
+/// prefixes (`$`, `{{`, `%`) reject in any quoting — tools interpolate inside
+/// quotes too — but the `[`/`<` marker-prefix kills apply to UNQUOTED values
+/// only, so a quoted real secret that happens to start with `[` survives
+/// (the same critic's over-kill finding). `_`/`-`-joined compounds reject
+/// only when EVERY segment is known non-material vocabulary
+/// (`invalid_token`, `access_denied`), so `secret_dragon` stays material.
 fn env_value_is_real(value: &str) -> bool {
-    let v = value
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim();
+    let trimmed = value.trim();
+    let quoted = trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')));
+    let v = if quoted {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
     if v.len() < 4 {
         return false;
     }
-    // `[` covers bracketed redaction markers (`[FILTERED]`, `[REDACTED]` —
-    // the Rails/Rack log-scrubbing convention; G1 round-5 critic's FP).
-    if v.starts_with('$')
-        || v.starts_with('<')
-        || v.starts_with("{{")
-        || v.starts_with('%')
-        || v.starts_with('[')
-    {
+    if v.starts_with('$') || v.starts_with("{{") || v.starts_with('%') {
         return false;
     }
-    // Status words make the single-token prose boundary a decision rather
-    // than an entropy accident (`password: incorrect` cleared the 2.0
-    // threshold while `password: reset` didn't — same class, opposite
-    // outcomes; G1 round-5 critic).
-    const PLACEHOLDERS: &[&str] = &[
+    if !quoted && (v.starts_with('[') || v.starts_with('<')) {
+        return false;
+    }
+    // Markers (scrub conventions), status vocabulary, protocol nouns, and
+    // classic template fillers. Nouns like "token" are here for the compound
+    // rule — a value that is literally protocol vocabulary is not material.
+    const NON_MATERIAL: &[&str] = &[
+        // template fillers
         "changeme",
         "change_me",
         "change-me",
         "placeholder",
         "example",
         "your-key-here",
-        "redacted",
-        "filtered",
         "true",
         "false",
         "none",
         "null",
+        // scrub markers
+        "redacted",
+        "filtered",
+        "masked",
+        "scrubbed",
+        "removed",
+        "hidden",
+        // status vocabulary
         "incorrect",
         "expired",
         "invalid",
         "missing",
         "required",
-        "hidden",
         "unknown",
         "unset",
+        "denied",
+        "error",
+        "failed",
+        // protocol nouns (compound segments)
+        "token",
+        "password",
+        "secret",
+        "key",
+        "access",
+        "auth",
+        "credentials",
+        "grant",
+        "request",
     ];
-    if PLACEHOLDERS.contains(&v.to_ascii_lowercase().as_str()) {
+    let normalized: String = v
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    if NON_MATERIAL.contains(&normalized.as_str()) {
+        return false;
+    }
+    if !normalized.is_empty()
+        && normalized
+            .split(['_', '-', ' '])
+            .filter(|s| !s.is_empty())
+            .all(|s| NON_MATERIAL.contains(&s))
+    {
         return false;
     }
     shannon_entropy(v) >= 2.0
@@ -2251,6 +2306,51 @@ mod tests {
             let f = d.scan(Side::Request, benign);
             assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
         }
+    }
+
+    #[test]
+    fn decorated_markers_and_status_compounds_are_not_secrets() {
+        // Round-6 critic: the denylist must not regrow one decoration away.
+        // Markers are matched on a normalized view (decoration stripped,
+        // lowercased) and `_`-joined all-vocabulary compounds are protocol
+        // noise, not material.
+        let d = det();
+        for benign in [
+            "password: ***MASKED***",
+            "password: (REDACTED)",
+            "token: invalid_token",
+            "auth_token: token_expired",
+            "password: access_denied",
+            "{\"password\": \"[FILTERED]\"}", // marker check reaches quoted grammars
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_bracket_secrets_and_symbol_rockets_fire() {
+        let d = det();
+        // Round-6 critic's over-kill: a QUOTED real secret starting with '['
+        // is literal, not a marker.
+        let text = "export PASSWORD='[k9!fQ2xW8z'";
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("quoted bracket secret");
+        assert_eq!(&text[m.start..m.end], "PASSWORD='[k9!fQ2xW8z'");
+        // Round-6 critic's missed grammar: symbol-key Ruby rockets.
+        let text = r#"{:password=>"hunter2secret99", :role=>"admin"}"#;
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("symbol rocket secret");
+        assert_eq!(&text[m.start..m.end], r#":password=>"hunter2secret99""#);
+        // Status-word SUBSTRINGS must not kill real secrets.
+        let f = d.scan(Side::Request, "password: hidden2secret");
+        assert!(has_kind(&f, PiiKind::EnvAssignment));
     }
 
     #[test]
