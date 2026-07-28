@@ -155,7 +155,7 @@
     api_key: 'API key / token', ip_address: 'IP address', custom: 'Custom pattern',
     private_key: 'Private key block', jwt: 'JWT', connection_string: 'Connection string',
     ssn: 'SSN', iban: 'IBAN', mac_address: 'MAC address',
-    env_assignment: 'Env credential', crypto_wallet: 'Crypto wallet',
+    env_assignment: 'Config credential', crypto_wallet: 'Crypto wallet',
   };
   // Credential-bearing kinds — badge gold like api_key.
   const PII_SECRET_KINDS = ['api_key', 'private_key', 'jwt', 'connection_string', 'env_assignment'];

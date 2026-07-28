@@ -122,7 +122,7 @@ fn kind_name(kind: PiiKind, label: Option<&str>) -> String {
         PiiKind::Ssn => "SSN",
         PiiKind::Iban => "IBAN",
         PiiKind::MacAddress => "MAC address",
-        PiiKind::EnvAssignment => "Env credential",
+        PiiKind::EnvAssignment => "Config credential",
         PiiKind::CryptoWallet => "Crypto wallet",
         PiiKind::Custom => "Custom",
     }

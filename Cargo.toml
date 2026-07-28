@@ -101,6 +101,10 @@ tiktoken-rs = "0.11.0"
 # non-cryptographic FNV digest used elsewhere (cache keys, request fingerprints)
 # is trivially forgeable — fine for dedup, useless for that claim.
 sha2 = "0.10"
+# Keccak-256 for EIP-55 checksum validation of mixed-case EVM wallet addresses
+# (G1 privacy lens). Keccak is NOT SHA-3-the-standard (different padding), so
+# sha2 can't stand in for it.
+sha3 = "0.10"
 
 [profile.release]
 strip = true

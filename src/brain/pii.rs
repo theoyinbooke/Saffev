@@ -155,6 +155,30 @@ static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
         .expect("env assignment regex")
 });
 
+/// JSON member candidate (`"password": "hunter2"`). Same key/value gates as
+/// the shell form (G1 round 4 — the round-3 critic's named gap: config-file
+/// secrets outside shell syntax were invisible). Capture 1 = key, 2 = value.
+static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*:\s*"([^"\r\n]{4,})""#).expect("json secret regex")
+});
+
+/// YAML mapping candidate (`password: hunter2` at line start, any indent).
+/// The `[ \t]+` after the colon is load-bearing: `12:30` and `https://…`
+/// never qualify. Capture 1 = key, 2 = value (to end of line, `#` comments
+/// excluded).
+static RE_YAML_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^[ \t]*([A-Za-z0-9_.\-]+):[ \t]+([^\s#][^\r\n#]{2,}[^\s#])")
+        .expect("yaml secret regex")
+});
+
+/// TOML/INI candidate with spaces around `=` and a quoted value
+/// (`password = "hunter2"`). The space-less shell form is [`RE_ENV_ASSIGN`]'s.
+/// Capture 1 = key, 2 = value.
+static RE_TOML_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*"([^"\r\n]{4,})""#)
+        .expect("toml secret regex")
+});
+
 /// `Key=Value;`-style connection string (ODBC / ADO.NET / JDBC properties)
 /// carrying a `Password=`/`Pwd=` pair among other pairs. Mirrors the URL form:
 /// the whole property run is the finding, so the credential AND the
@@ -169,12 +193,11 @@ static RE_CONN_KV: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// Cryptocurrency wallet candidates: legacy base58 BTC (`1…`/`3…`), bech32
-/// (`bc1…`), EVM `0x` + 40 hex. Base58 candidates are verified with the real
-/// base58check double-SHA-256 checksum and bech32 with the BIP-173/350
-/// polymod, so lookalike alphanumeric tokens die at validation, not in the
-/// regex. An EVM address is accepted on shape alone (EIP-55 needs keccak,
-/// which we don't ship) — the mandatory `0x` prefix and exact 40-hex length
-/// already exclude bare git SHAs and 64-hex tx hashes.
+/// (`bc1…`), EVM `0x` + 40 hex. Every branch is checksum-verified: base58check
+/// double-SHA-256, BIP-173/350 polymod, and EIP-55 Keccak casing for
+/// mixed-case EVM addresses ([`evm_valid`]) — lookalike tokens die at
+/// validation, not in the regex. The mandatory `0x` prefix and exact 40-hex
+/// length already exclude bare git SHAs and 64-hex tx hashes.
 static RE_WALLET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"\b(?:[13][1-9A-HJ-NP-Za-km-z]{25,34}|bc1[02-9ac-hj-np-z]{11,87}|0x[0-9a-fA-F]{40})\b",
@@ -222,6 +245,9 @@ impl Detector {
         Lazy::force(&RE_IPV4);
         Lazy::force(&RE_IPV6);
         Lazy::force(&RE_ENV_ASSIGN);
+        Lazy::force(&RE_JSON_SECRET);
+        Lazy::force(&RE_YAML_SECRET);
+        Lazy::force(&RE_TOML_SECRET);
         Lazy::force(&RE_CONN_KV);
         Lazy::force(&RE_WALLET);
         Lazy::force(&RE_SSN_LOOSE);
@@ -305,23 +331,56 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 2b. `.env`-style credential assignments — before email so an
+        // 2b. Config-file credential assignments — shell/.env, JSON, YAML and
+        //     TOML forms share the same key/value gates. Before email so an
         //     address-shaped value (`SMTP_PASSWORD=p@ss.example`) is claimed
         //     whole, and after connection strings so a `DATABASE_URL=…` value
-        //     stays a connection string, not two halves.
+        //     stays a connection string, not two halves. Candidates from all
+        //     forms are pooled and offset-sorted first: where two grammars
+        //     propose the same text (`KEY="v"` is both shell and TOML), the
+        //     first claim wins and the duplicate dies on the overlap check.
+        let mut config_candidates: Vec<(usize, usize, String, String)> = Vec::new();
         for m in RE_ENV_ASSIGN.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if let Some((key, value)) = m.as_str().split_once('=') {
+                config_candidates.push((m.start(), m.end(), key.to_string(), value.to_string()));
+            }
+        }
+        // JSON spans start at the whole match (the key's opening quote);
+        // YAML/TOML spans start at the key so line indent stays unmasked.
+        for (re, from_key) in [
+            (&RE_JSON_SECRET, false),
+            (&RE_YAML_SECRET, true),
+            (&RE_TOML_SECRET, true),
+        ] {
+            for caps in re.captures_iter(text) {
+                let (Some(whole), Some(key), Some(value)) = (caps.get(0), caps.get(1), caps.get(2))
+                else {
+                    continue;
+                };
+                let start = if from_key { key.start() } else { whole.start() };
+                config_candidates.push((
+                    start,
+                    whole.end(),
+                    key.as_str().to_string(),
+                    value.as_str().to_string(),
+                ));
+            }
+        }
+        config_candidates.sort_by_key(|c| (c.0, c.1));
+        for (start, end, key, value) in config_candidates {
+            if overlaps(&claimed, start, end) {
                 continue;
             }
-            let (key, value) = m.as_str().split_once('=').unwrap_or(("", ""));
-            if !env_key_is_secret(key) || !env_value_is_real(value) {
+            if !env_key_is_secret(&key) || !env_value_is_real(&value) {
                 continue;
             }
             // Defer to the more specific secret detectors: a value that is
             // itself a known-prefix API key or a JWT gets claimed by those
             // steps instead — their kind label carries more signal than
-            // "env credential".
-            let v = value.trim_matches(|c| c == '"' || c == '\'');
+            // "config credential".
+            let v = value
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
             if v.starts_with("eyJ") || RE_API_KEY.is_match(v) {
                 continue;
             }
@@ -329,12 +388,12 @@ impl Detector {
                 PiiKind::EnvAssignment,
                 None,
                 side,
-                m.start(),
-                m.end(),
+                start,
+                end,
                 Confidence::High,
-                m.as_str(),
+                &text[start..end],
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.push((start, end));
         }
 
         // 3. Email (high-precision structure; filename guard for `img@2x.png`).
@@ -714,7 +773,12 @@ fn version_context(text: &str, start: usize) -> bool {
 /// and `CACHE_KEY` stay out while `API_KEY` / `SIGNING_KEY` are in).
 fn env_key_is_secret(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    let segments: Vec<&str> = upper.split('_').filter(|s| !s.is_empty()).collect();
+    // '.', '-' — JSON/YAML keys segment on those too (`db.password`,
+    // `api-token`).
+    let segments: Vec<&str> = upper
+        .split(['_', '.', '-'])
+        .filter(|s| !s.is_empty())
+        .collect();
     const SECRET_WORDS: &[&str] = &[
         "SECRET",
         "PASSWORD",
@@ -770,16 +834,43 @@ fn env_value_is_real(value: &str) -> bool {
 }
 
 /// Wallet candidate dispatch: base58check for legacy BTC, BIP-173/350 polymod
-/// for bech32, shape-only for EVM `0x` hex (already fully constrained by the
-/// regex).
+/// for bech32, EIP-55 for EVM `0x` hex.
 fn wallet_valid(s: &str) -> bool {
     if s.starts_with("0x") {
-        true
+        evm_valid(s)
     } else if s.starts_with("bc1") {
         bech32_valid(s)
     } else {
         base58check_valid(s)
     }
+}
+
+/// EIP-55 checksum validation for an EVM address candidate. A mixed-case
+/// address must match the Keccak-256-derived casing exactly (each hex letter
+/// is uppercase iff the corresponding digest nibble ≥ 8). Single-case
+/// addresses carry no checksum information and are accepted on shape — the
+/// round-3 critic's finding was that case-corrupted MIXED addresses slipped
+/// through, and this closes exactly that.
+fn evm_valid(s: &str) -> bool {
+    let hex = &s[2..];
+    let has_lower = hex.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = hex.bytes().any(|b| b.is_ascii_uppercase());
+    if !(has_lower && has_upper) {
+        return true;
+    }
+    use sha3::{Digest, Keccak256};
+    let digest = Keccak256::digest(hex.to_ascii_lowercase().as_bytes());
+    hex.bytes().enumerate().all(|(i, b)| {
+        if !b.is_ascii_alphabetic() {
+            return true;
+        }
+        let nibble = (digest[i / 2] >> (if i % 2 == 0 { 4 } else { 0 })) & 0xf;
+        if nibble >= 8 {
+            b.is_ascii_uppercase()
+        } else {
+            b.is_ascii_lowercase()
+        }
+    })
 }
 
 /// Real base58check validation: decode, require the 25-byte
@@ -2005,5 +2096,73 @@ mod tests {
             let f = d.scan(Side::Request, benign);
             assert!(!has_kind(&f, PiiKind::CryptoWallet), "must reject {benign}");
         }
+    }
+
+    // --- EIP-55 (G1 round 4) ------------------------------------------------
+
+    #[test]
+    fn evm_mixed_case_enforces_eip55() {
+        let d = det();
+        // EIP-55 spec examples — valid casings must fire.
+        for valid in [
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+        ] {
+            let f = d.scan(Side::Request, valid);
+            assert!(has_kind(&f, PiiKind::CryptoWallet), "missed {valid}");
+        }
+        // One flipped letter breaks the Keccak casing — must not fire.
+        let f = d.scan(Side::Request, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD");
+        assert!(!has_kind(&f, PiiKind::CryptoWallet), "case-corrupted EIP-55 accepted");
+        // Single-case addresses carry no checksum info — accepted on shape.
+        let f = d.scan(Side::Request, "0xde709f2102306220921060314715629080e2fb77");
+        assert!(has_kind(&f, PiiKind::CryptoWallet));
+    }
+
+    // --- structured-config secrets (G1 round 4) -----------------------------
+
+    #[test]
+    fn detects_json_yaml_toml_config_secrets() {
+        let d = det();
+        let cases = [
+            (r#"{"password": "hunter2secret99", "user": "svc"}"#, r#""password": "hunter2secret99""#),
+            ("db:\n  host: localhost\n  db_password: hunter2secret99\n", "db_password: hunter2secret99"),
+            ("[database]\napi_token = \"tok_9f8e7d6c5b4a\"\n", "api_token = \"tok_9f8e7d6c5b4a\""),
+        ];
+        for (text, want) in cases {
+            let f = d.scan(Side::Request, text);
+            let m = f
+                .iter()
+                .find(|f| f.kind == PiiKind::EnvAssignment)
+                .unwrap_or_else(|| panic!("missed config secret in {text:?}"));
+            assert_eq!(&text[m.start..m.end], want, "span in {text:?}");
+        }
+    }
+
+    #[test]
+    fn config_secret_rejects_benign_structured_pairs() {
+        let d = det();
+        for benign in [
+            r#"{"username": "admin", "role": "editor"}"#, // no credential key
+            r#"{"password": "changeme"}"#,                // placeholder value
+            "server:\n  port: 8080\n  log_level: verbose\n", // plain config
+            "password: ${SECRET_REF} # injected\n",       // interpolation
+            "[build]\nversion = \"1.2.3-beta.4\"\n",      // not a credential key
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
+    }
+
+    #[test]
+    fn yaml_secret_value_stops_before_comment() {
+        let d = det();
+        let text = "smtp_password: hunter2secret99 # rotate quarterly\n";
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("yaml secret");
+        assert_eq!(&text[m.start..m.end], "smtp_password: hunter2secret99");
     }
 }

@@ -117,3 +117,14 @@
 {"id":"pkey-004","text":"-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIIrYSSNQFaA2Hwf1duRSxKtLYX5CB04fSeQ6tF1aY/PuoAoGCCqGSM49\n-----END EC PRIVATE KEY-----","expect":[{"kind":"private_key","value":"-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIIrYSSNQFaA2Hwf1duRSxKtLYX5CB04fSeQ6tF1aY/PuoAoGCCqGSM49\n-----END EC PRIVATE KEY-----"}],"note":"EC key variant"}
 {"id":"mac-003","text":"eth0 HWaddr AA-BB-CC-DD-EE-FF up","expect":[{"kind":"mac_address","value":"AA-BB-CC-DD-EE-FF"}],"note":"hyphen form, uppercase"}
 {"id":"iban-004","text":"transfer to NL91 ABNA 0417 1643 00 pending","expect":[{"kind":"iban","value":"NL91 ABNA 0417 1643 00"}],"note":"spaced Dutch IBAN, mod-97 valid"}
+{"id":"env-005","text":"{\"db\": {\"host\": \"pg.internal\", \"password\": \"hunter2secret99\"}}","expect":[{"kind":"env_assignment","value":"\"password\": \"hunter2secret99\""}],"note":"JSON member secret — round-3 critic's named gap"}
+{"id":"env-006","text":"smtp:\n  smtp_password: hunter2secret99 # rotate quarterly","expect":[{"kind":"env_assignment","value":"smtp_password: hunter2secret99"}],"note":"YAML mapping secret — value stops before the comment"}
+{"id":"env-007","text":"[auth]\nclient_secret = \"cs_4f9a2b7c1d\"","expect":[{"kind":"env_assignment","value":"client_secret = \"cs_4f9a2b7c1d\""}],"note":"TOML spaced assignment with quoted value"}
+{"id":"env-t06","text":"{\"username\": \"admin\", \"role\": \"editor\"}","expect":[],"trap":"env_assignment","note":"JSON pair without a credential-naming key"}
+{"id":"env-t07","text":"server:\n  port: 8080\n  log_level: verbose","expect":[],"trap":"env_assignment","note":"plain YAML config"}
+{"id":"env-t08","text":"{\"password\": \"changeme\"}","expect":[],"trap":"env_assignment","note":"JSON placeholder value is not a secret"}
+{"id":"wallet-006","text":"settle at 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed thanks","expect":[{"kind":"crypto_wallet","value":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"}],"note":"EIP-55 spec example — Keccak casing verified"}
+{"id":"wallet-t05","text":"settle at 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD thanks","expect":[],"trap":"crypto_wallet","note":"one letter case-flipped — EIP-55 checksum broken"}
+{"id":"iban-005","text":"beneficiary FR1420041010050500013M02606 confirmed","expect":[{"kind":"iban","value":"FR1420041010050500013M02606"}],"note":"French IBAN, compact form"}
+{"id":"iban-006","text":"cuenta ES9121000418450200051332 activa","expect":[{"kind":"iban","value":"ES9121000418450200051332"}],"note":"Spanish IBAN — widens country coverage"}
+{"id":"jwt-004","text":"{\"access_token\": \"eyJhbGciOiJFUzI1NiJ9.eyJzY29wZSI6InJlYWQifQ.MEUCIQDx8v2mkKvta1u0eQ\"}","expect":[{"kind":"jwt","value":"eyJhbGciOiJFUzI1NiJ9.eyJzY29wZSI6InJlYWQifQ.MEUCIQDx8v2mkKvta1u0eQ"}],"note":"JWT as JSON value — config-secret grammar must defer to the JWT kind"}

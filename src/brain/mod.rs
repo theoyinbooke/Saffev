@@ -45,7 +45,9 @@ pub enum PiiKind {
     Iban,
     /// MAC address (colon or hyphen form).
     MacAddress,
-    /// `.env`-style credential assignment (`DB_PASSWORD=…`, `API_TOKEN=…`).
+    /// Config-file credential assignment — shell/`.env` (`DB_PASSWORD=…`),
+    /// JSON (`"password": "…"`), YAML (`password: …`), TOML (`password = "…"`).
+    /// (Wire name stays `env_assignment` — it predates the non-shell forms.)
     EnvAssignment,
     /// Cryptocurrency wallet address (base58check / bech32 / EVM hex).
     CryptoWallet,
