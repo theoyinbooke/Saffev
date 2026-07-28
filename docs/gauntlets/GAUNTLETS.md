@@ -60,13 +60,15 @@ does not.
 **Build first:** `tests/fixtures/agents/<tool>/` — one committed, sanitized
 fixture per tool format (the corpus that makes adapter claims testable).
 
-**Then build:** adapters for **Gemini CLI, Windsurf, Copilot CLI, Amp, Goose**
-(priority order — install base, with Windsurf promoted because it reuses the
-Cursor-style `state.vscdb` machinery). Copilot CLI transcripts live in
-`~/.copilot/history-session-state/` — the `~/.copilot/otel` dir this list
-originally pointed at is telemetry counters, not transcripts (G2 round-1
-critic). Format-drift tolerance rules as today: unparseable records skip,
-never fatal.
+**Then build:** adapters for **Gemini CLI (done, round 3), Copilot CLI, Amp,
+Goose, Cline, Aider** (priority order — install base). Copilot CLI transcripts
+live in `~/.copilot/history-session-state/` — the `~/.copilot/otel` dir this
+list originally pointed at is telemetry counters, not transcripts (G2 round-1
+critic). **Windsurf is ruled out for transcripts**: Cascade conversations are
+per-UUID ENCRYPTED `.pb` files (verified round 3; SpecStory reached the same
+verdict) — a metadata-only inventory is possible later but cannot meet the
+rubric fields. Format-drift tolerance rules as today: unparseable records
+skip, never fatal.
 
 **Artifact.** Adapter fixture suite passing per tool; `saffev status`-style
 coverage table (tool → sessions found) on a machine with fixtures installed.

@@ -48,6 +48,20 @@
       ],
       "sessions_found": 1
     },
+    "gemini": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 3
+    },
     "opencode": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -79,5 +93,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 5
+  "tools_covered": 6
 }

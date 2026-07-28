@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use saffev::agents::claude_code::ClaudeCodeReader;
 use saffev::agents::codex::CodexReader;
 use saffev::agents::cursor::CursorReader;
+use saffev::agents::gemini::GeminiReader;
 use saffev::agents::opencode::OpenCodeReader;
 use saffev::agents::vscode::VsCodeReader;
 use saffev::agents::{AgentReader, AgentSession, MessageKind, Role};
@@ -305,6 +306,51 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Gemini CLI (round 3 — format verified against gemini-cli source) --
+    {
+        let reader = GeminiReader::with_root(fixture("gemini"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("00000000000a"))
+            .expect("gemini: good session listed");
+        check_common(&mut cov, &reader, good, "gemini");
+        // The fixture re-appends the tokened message with the same id — a
+        // reader that sums without deduping doubles these. `input` is the
+        // TOTAL prompt (cached is a subset); `thoughts` count as output.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == (2113 - 1536) + (2290 - 2048)
+                && good.output_tokens == 38 + 95 + 21
+                && good.cache_tokens == 1536 + 2048,
+        );
+        assert_eq!(good.message_count, 3, "re-appended record must not add a turn");
+        assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
+        // Legacy pre-v0.39 single-JSON generation still parses.
+        let legacy = sessions
+            .iter()
+            .find(|s| s.id.ends_with("00000000000c"))
+            .expect("gemini: legacy .json session listed");
+        assert_eq!(legacy.model.as_deref(), Some("gemini-2.0-pro"));
+        // Subagent side threads (dirs under chats/) are skipped.
+        assert!(
+            sessions.iter().all(|s| !s.id.contains("sub-1")),
+            "gemini: subagent thread must not list"
+        );
+        // Corrupted variant: garbage + binary + truncated lines skipped, the
+        // $rewindTo honored — the abandoned turn is gone, two turns survive.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("00000000000b"))
+            .expect("gemini: corrupted session still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 2 && hurt.started_ts > 0;
+        table.insert("gemini".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -352,7 +398,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 5,
-        "adapter coverage regressed: {complete} of 5 complete"
+        complete >= 6,
+        "adapter coverage regressed: {complete} of 6 complete"
     );
 }
