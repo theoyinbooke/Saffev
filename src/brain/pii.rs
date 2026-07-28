@@ -227,6 +227,19 @@ static RE_YAML_SECRET: Lazy<Regex> = Lazy::new(|| {
         .expect("yaml secret regex")
 });
 
+/// YAML block-scalar candidate: `password: |` (or `>`, with optional
+/// chomping/indent indicators) and the secret on the following indented line
+/// — the edge named-unfixed since round 4, closed in round 12. The finding
+/// runs from the key through the FIRST content line: block scalars used for
+/// secrets are single-value in practice, and the first line is where the
+/// material starts. Capture 1 = key, 2 = first content line.
+static RE_YAML_BLOCK_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?m)^[ \t]*([A-Za-z0-9_.\-]+):[ \t]*[|>][0-9+\-]*[ \t]*\r?\n[ \t]+([^\s#][^\r\n#]{2,}[^\s#])",
+    )
+    .expect("yaml block scalar regex")
+});
+
 /// TOML/INI candidate with spaces around `=` and a paired-quote value
 /// (`password = "hunter2"`, single or double). The space-less shell form is
 /// [`RE_ENV_ASSIGN`]'s.
@@ -310,6 +323,7 @@ impl Detector {
         Lazy::force(&RE_RUBY_SYM_SECRET);
         Lazy::force(&RE_OBJ_SECRET);
         Lazy::force(&RE_YAML_SECRET);
+        Lazy::force(&RE_YAML_BLOCK_SECRET);
         Lazy::force(&RE_TOML_SECRET);
         Lazy::force(&RE_CONN_KV);
         Lazy::force(&RE_WALLET);
@@ -420,6 +434,10 @@ impl Detector {
             (&RE_RUBY_SYM_SECRET, false, false, true),
             (&RE_OBJ_SECRET, false, false, true),
             (&RE_YAML_SECRET, true, true, false),
+            // Block scalars skip the prose gate: writing `key: |` + an
+            // indented line is a deliberate multi-word construction, the
+            // moral equivalent of quoting.
+            (&RE_YAML_BLOCK_SECRET, true, false, false),
             (&RE_TOML_SECRET, true, false, true),
         ] {
             for caps in re.captures_iter(text) {
@@ -2709,6 +2727,32 @@ mod tests {
             &text[c.start..c.end],
             "redis://:p4ssw0rd@cache.internal:6379/0"
         );
+    }
+
+    #[test]
+    fn detects_yaml_block_scalar_secrets() {
+        // The edge named-unfixed since round 4: `password: |` with the
+        // secret on the following indented line.
+        let d = det();
+        let text = "credentials:\n  db_password: |\n    hunter2block99x\n  host: db";
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("block scalar secret");
+        assert_eq!(
+            &text[m.start..m.end],
+            "db_password: |\n    hunter2block99x"
+        );
+        // Folded style and chomping indicators too.
+        let f = d.scan(Side::Request, "api_token: >-\n  tok9f8e7d6c5b4a\n");
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "folded/chomped block missed");
+        // Value gates still apply inside a block.
+        let f = d.scan(Side::Request, "password: |\n  changeme\n");
+        assert!(!has_kind(&f, PiiKind::EnvAssignment), "placeholder in block fired");
+        // Non-secret keys don't fire regardless of block style.
+        let f = d.scan(Side::Request, "description: |\n  a long paragraph of text\n");
+        assert!(!has_kind(&f, PiiKind::EnvAssignment));
     }
 
     #[test]
