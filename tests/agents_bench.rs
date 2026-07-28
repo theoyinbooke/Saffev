@@ -29,6 +29,7 @@ use saffev::agents::codex::CodexReader;
 use saffev::agents::copilot::CopilotReader;
 use saffev::agents::cursor::CursorReader;
 use saffev::agents::gemini::GeminiReader;
+use saffev::agents::goose::GooseReader;
 use saffev::agents::opencode::OpenCodeReader;
 use saffev::agents::vscode::VsCodeReader;
 use saffev::agents::{AgentReader, AgentSession, MessageKind, Role};
@@ -495,6 +496,49 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Goose (round 8 — the tenth tool; schema v15 from source) ----------
+    {
+        let reader = GooseReader::with_db(build_db("goose/sessions.sql", "sessions.db"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("20260715_1"))
+            .expect("goose: good session listed");
+        check_common(&mut cov, &reader, good, "goose");
+        assert_eq!(good.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        // Accumulated totals win over the current-window columns.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == 8500
+                && good.output_tokens == 212
+                && good.cache_tokens == 8000 + 300,
+        );
+        cov.notes.push(
+            "input_tokens follows each provider's own convention (recorded as stored)".into(),
+        );
+        let detail = reader.session_detail("20260715_1").expect("detail");
+        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        // sub_agent side threads and archived sessions must not list.
+        assert!(sessions.iter().all(|s| !s.id.ends_with("sub-1")), "sub_agent listed");
+        assert!(sessions.iter().all(|s| !s.id.ends_with("arch-1")), "archived listed");
+        // Corrupted content_json: the session lists with its aggregates, the
+        // blob degrades to zero blocks in detail — never fatal.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("20260715_2"))
+            .expect("goose: corrupted-blob session still listed");
+        let hurt_detail = reader.session_detail("20260715_2").expect("detail");
+        cov.corrupted_nonfatal = hurt.message_count == 1
+            && hurt.input_tokens == 50
+            && hurt_detail.messages.is_empty();
+        table.insert("goose".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -516,6 +560,10 @@ fn agents_fixture_coverage() {
             assert!(
                 OpenCodeReader::with_db(db.clone()).list_sessions().is_empty(),
                 "opencode: binary-corrupt db must degrade to empty, got sessions from {db:?}"
+            );
+            assert!(
+                GooseReader::with_db(db.clone()).list_sessions().is_empty(),
+                "goose: binary-corrupt db must degrade to empty, got sessions from {db:?}"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -542,7 +590,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 9,
-        "adapter coverage regressed: {complete} of 9 complete"
+        complete >= 10,
+        "adapter coverage regressed: {complete} of 10 complete"
     );
 }

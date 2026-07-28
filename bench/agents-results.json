@@ -106,6 +106,22 @@
       "notes": [],
       "sessions_found": 3
     },
+    "goose": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [
+        "input_tokens follows each provider's own convention (recorded as stored)"
+      ],
+      "sessions_found": 2
+    },
     "opencode": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -137,5 +153,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 9
+  "tools_covered": 10
 }

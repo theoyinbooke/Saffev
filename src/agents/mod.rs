@@ -29,6 +29,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod export;
 pub mod gemini;
+pub mod goose;
 pub mod opencode;
 pub mod privacy;
 pub mod retention;
@@ -57,6 +58,8 @@ pub enum AgentTool {
     Cline,
     /// Aider (per-project `.aider.chat.history.md` markdown transcripts).
     Aider,
+    /// Goose / Block (`~/.local/share/goose/sessions/sessions.db` SQLite).
+    Goose,
 }
 
 impl AgentTool {
@@ -72,6 +75,7 @@ impl AgentTool {
             AgentTool::Copilot => "copilot",
             AgentTool::Cline => "cline",
             AgentTool::Aider => "aider",
+            AgentTool::Goose => "goose",
         }
     }
     /// Human label for the UI.
@@ -86,6 +90,7 @@ impl AgentTool {
             AgentTool::Copilot => "Copilot CLI",
             AgentTool::Cline => "Cline",
             AgentTool::Aider => "Aider",
+            AgentTool::Goose => "Goose",
         }
     }
 }
@@ -190,6 +195,7 @@ pub fn split_id(id: &str) -> Option<(AgentTool, &str)> {
         "copilot" => AgentTool::Copilot,
         "cline" => AgentTool::Cline,
         "aider" => AgentTool::Aider,
+        "goose" => AgentTool::Goose,
         _ => return None,
     };
     Some((tool, raw))
@@ -374,6 +380,7 @@ pub fn readers() -> Vec<Box<dyn AgentReader>> {
         Box::new(copilot::CopilotReader::new()),
         Box::new(cline::ClineReader::new()),
         Box::new(aider::AiderReader::new()),
+        Box::new(goose::GooseReader::new()),
     ]
 }
 
