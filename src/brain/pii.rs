@@ -162,6 +162,13 @@ static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*:\s*"([^"\r\n]{4,})""#).expect("json secret regex")
 });
 
+/// Ruby hash-rocket member candidate (`"password"=>"hunter2"` — every Rails
+/// console/log paste; G1 round-5 critic's missed grammar). Same gates as the
+/// JSON form. Capture 1 = key, 2 = value.
+static RE_RUBY_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*=>\s*"([^"\r\n]{4,})""#).expect("ruby secret regex")
+});
+
 /// YAML mapping candidate (`password: hunter2` at line start, any indent).
 /// The `[ \t]+` after the colon is load-bearing: `12:30` and `https://…`
 /// never qualify. Capture 1 = key, 2 = value (to end of line, `#` comments
@@ -247,6 +254,7 @@ impl Detector {
         Lazy::force(&RE_IPV6);
         Lazy::force(&RE_ENV_ASSIGN);
         Lazy::force(&RE_JSON_SECRET);
+        Lazy::force(&RE_RUBY_SECRET);
         Lazy::force(&RE_YAML_SECRET);
         Lazy::force(&RE_TOML_SECRET);
         Lazy::force(&RE_CONN_KV);
@@ -350,6 +358,7 @@ impl Detector {
         // YAML/TOML spans start at the key so line indent stays unmasked.
         for (re, from_key, prose_gate) in [
             (&RE_JSON_SECRET, false, false),
+            (&RE_RUBY_SECRET, false, false),
             (&RE_YAML_SECRET, true, true),
             (&RE_TOML_SECRET, true, false),
         ] {
@@ -827,9 +836,20 @@ fn env_value_is_real(value: &str) -> bool {
     if v.len() < 4 {
         return false;
     }
-    if v.starts_with('$') || v.starts_with('<') || v.starts_with("{{") || v.starts_with('%') {
+    // `[` covers bracketed redaction markers (`[FILTERED]`, `[REDACTED]` —
+    // the Rails/Rack log-scrubbing convention; G1 round-5 critic's FP).
+    if v.starts_with('$')
+        || v.starts_with('<')
+        || v.starts_with("{{")
+        || v.starts_with('%')
+        || v.starts_with('[')
+    {
         return false;
     }
+    // Status words make the single-token prose boundary a decision rather
+    // than an entropy accident (`password: incorrect` cleared the 2.0
+    // threshold while `password: reset` didn't — same class, opposite
+    // outcomes; G1 round-5 critic).
     const PLACEHOLDERS: &[&str] = &[
         "changeme",
         "change_me",
@@ -838,10 +858,19 @@ fn env_value_is_real(value: &str) -> bool {
         "example",
         "your-key-here",
         "redacted",
+        "filtered",
         "true",
         "false",
         "none",
         "null",
+        "incorrect",
+        "expired",
+        "invalid",
+        "missing",
+        "required",
+        "hidden",
+        "unknown",
+        "unset",
     ];
     if PLACEHOLDERS.contains(&v.to_ascii_lowercase().as_str()) {
         return false;
@@ -2207,6 +2236,33 @@ mod tests {
         // BYPASS must not qualify via its PASS substring — segments, not substrings.
         let f = d.scan(Side::Request, "FEATURE_BYPASS=enabled99x");
         assert!(!has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn redaction_markers_and_status_words_are_not_secrets() {
+        let d = det();
+        for benign in [
+            "password: [FILTERED]",         // Rails/Rack log scrubbing
+            "password: [REDACTED]",
+            "password: incorrect",          // status word, not material
+            "token: expired",
+            "export PASSWORD=incorrect",    // same class in the shell form
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
+    }
+
+    #[test]
+    fn detects_ruby_hash_rocket_secrets() {
+        let d = det();
+        let text = r#"{"password"=>"hunter2secret99", "role"=>"admin"}"#;
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("hash-rocket secret");
+        assert_eq!(&text[m.start..m.end], r#""password"=>"hunter2secret99""#);
     }
 
     #[test]

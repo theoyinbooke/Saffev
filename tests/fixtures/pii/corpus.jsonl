@@ -135,3 +135,6 @@
 {"id":"env-009","text":"client_secret = 'cs_4f9a2b7c1d'","expect":[{"kind":"env_assignment","value":"client_secret = 'cs_4f9a2b7c1d'"}],"note":"round-4 critic miss — single-quoted TOML value"}
 {"id":"env-010","text":"password: \"correct horse battery staple\"","expect":[{"kind":"env_assignment","value":"password: \"correct horse battery staple\""}],"note":"quoted multi-word value is deliberate config, not prose"}
 {"id":"env-t12","text":"FEATURE_BYPASS=enabled99x rollout","expect":[],"trap":"env_assignment","note":"PASS inside BYPASS — segment match, not substring"}
+{"id":"env-t13","text":"params: {\"password\"=>\"[FILTERED]\"}","expect":[],"trap":"env_assignment","note":"round-5 critic FP — Rails log-scrubbing marker is not a secret"}
+{"id":"env-t14","text":"password: incorrect","expect":[],"trap":"env_assignment","note":"round-5 critic — single-token status word, prose not material"}
+{"id":"env-011","text":"{\"user\"=>\"svc\", \"password\"=>\"hunter2secret99\"}","expect":[{"kind":"env_assignment","value":"\"password\"=>\"hunter2secret99\""}],"note":"round-5 critic miss — Ruby hash-rocket member"}
