@@ -386,9 +386,15 @@ pub struct ModelPrice {
     pub input: f64,
     /// Price per 1M output tokens.
     pub output: f64,
-    /// Price per 1M cached-input tokens.
+    /// Price per 1M cache-READ input tokens.
     #[serde(default)]
     pub cache: f64,
+    /// Price per 1M cache-WRITE (creation) tokens. `0.0` (absent in older
+    /// configs) derives the Anthropic convention, 1.25 × input — the only
+    /// vendor whose readers report write tokens separately today. Set it
+    /// explicitly to override.
+    #[serde(default)]
+    pub cache_write: f64,
 }
 
 /// Cost estimation inputs.
@@ -414,6 +420,16 @@ pub struct PricingConfig {
     /// number is never presented without saying what it is compared to.
     #[serde(default = "default_cloud_label")]
     pub cloud_label: String,
+    /// The date the built-in price table was last verified against published
+    /// list prices. Surfaced in analytics artifacts so pricing drift is
+    /// documented, never silent. NEVER fetched from the network (on-device
+    /// invariant) — updating this table is a release or a user edit.
+    #[serde(default = "default_pricing_as_of")]
+    pub as_of: String,
+}
+
+fn default_pricing_as_of() -> String {
+    "2026-07-28".to_string()
 }
 
 fn default_cloud_in() -> f64 {
@@ -433,6 +449,7 @@ impl Default for PricingConfig {
             cloud_input_per_m: default_cloud_in(),
             cloud_output_per_m: default_cloud_out(),
             cloud_label: default_cloud_label(),
+            as_of: default_pricing_as_of(),
         }
     }
 }
@@ -440,22 +457,26 @@ impl Default for PricingConfig {
 /// Built-in price table. Public list prices at the time of writing; correct them
 /// in config rather than waiting for a release.
 pub fn default_model_prices() -> Vec<ModelPrice> {
-    let p = |m: &str, i: f64, o: f64, c: f64| ModelPrice {
+    let p = |m: &str, i: f64, o: f64, c: f64, cw: f64| ModelPrice {
         match_: m.to_string(),
         input: i,
         output: o,
         cache: c,
+        cache_write: cw,
     };
     vec![
-        p("opus", 15.0, 75.0, 1.5),
-        p("sonnet", 3.0, 15.0, 0.3),
-        p("haiku", 1.0, 5.0, 0.1),
-        p("fable", 1.0, 5.0, 0.1),
-        p("gpt-5", 1.25, 10.0, 0.125),
-        p("gpt5", 1.25, 10.0, 0.125),
-        p("gpt-4o", 2.5, 10.0, 0.25),
-        p("gpt-4.1", 2.5, 10.0, 0.25),
-        p("gemini", 1.25, 10.0, 0.125),
+        // Anthropic: cache read = 0.1 × input, cache write (5m) = 1.25 × input.
+        p("opus", 15.0, 75.0, 1.5, 18.75),
+        p("sonnet", 3.0, 15.0, 0.3, 3.75),
+        p("haiku", 1.0, 5.0, 0.1, 1.25),
+        p("fable", 1.0, 5.0, 0.1, 1.25),
+        // OpenAI/Google bill no separate write premium; readers for those
+        // vendors never report write tokens, so the write rate mirrors input.
+        p("gpt-5", 1.25, 10.0, 0.125, 1.25),
+        p("gpt5", 1.25, 10.0, 0.125, 1.25),
+        p("gpt-4o", 2.5, 10.0, 0.25, 2.5),
+        p("gpt-4.1", 2.5, 10.0, 0.25, 2.5),
+        p("gemini", 1.25, 10.0, 0.125, 1.25),
     ]
 }
 
@@ -481,6 +502,34 @@ impl PricingConfig {
             }
         }
         (0.0, 0.0, 0.0)
+    }
+
+    /// Like [`Self::lookup`] but with the cache-WRITE rate as a fourth price:
+    /// `(input, output, cache_read, cache_write)`. A table entry without an
+    /// explicit `cache_write` derives 1.25 × input (Anthropic's convention —
+    /// the only vendor whose readers report write tokens separately today).
+    pub fn lookup_split(&self, model: &str) -> (f64, f64, f64, f64) {
+        let m = model.to_lowercase();
+        if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") || m.contains(':')
+        {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let table = if self.models.is_empty() {
+            return Self::default().lookup_split(model);
+        } else {
+            &self.models
+        };
+        for e in table {
+            if !e.match_.is_empty() && m.contains(&e.match_.to_lowercase()) {
+                let cw = if e.cache_write > 0.0 {
+                    e.cache_write
+                } else {
+                    e.input * 1.25
+                };
+                return (e.input, e.output, e.cache, cw);
+            }
+        }
+        (0.0, 0.0, 0.0, 0.0)
     }
 }
 

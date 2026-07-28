@@ -35,6 +35,7 @@ pub mod opencode;
 pub mod privacy;
 pub mod retention;
 pub mod roo;
+pub mod usage;
 pub mod vscode;
 
 /// A supported coding agent (the *source* of a session). The `#[serde]` repr is
@@ -701,6 +702,7 @@ mod tests {
                 input: 1.0,
                 output: 2.0,
                 cache: 0.5,
+                cache_write: 0.0, // absent => derives 1.25 x input
             }],
             ..Default::default()
         };

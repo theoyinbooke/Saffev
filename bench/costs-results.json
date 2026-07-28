@@ -1,0 +1,65 @@
+{
+  "ccusage_totals": {
+    "cacheCreationTokens": 17000,
+    "cacheReadTokens": 162000,
+    "inputTokens": 9000,
+    "outputTokens": 4800,
+    "totalCost": 0.84785,
+    "totalTokens": 192800
+  },
+  "command": "cargo test --test costs_bench -- --nocapture",
+  "comparisons": [
+    {
+      "ccusage": 0.84785,
+      "compared": "totals.cost",
+      "delta_pct": 0.0,
+      "explanation": "same per-event pricing formula; both price cache write at 1.25x input for Anthropic models",
+      "saffev": 0.84785
+    },
+    {
+      "ccusage": 0.463125,
+      "compared": "daily.2026-07-20",
+      "delta_pct": 0.0,
+      "explanation": "UTC date grouping on both sides",
+      "saffev": 0.463125
+    },
+    {
+      "ccusage": 0.379725,
+      "compared": "daily.2026-07-21",
+      "delta_pct": 0.0,
+      "explanation": "UTC date grouping on both sides",
+      "saffev": 0.379725
+    },
+    {
+      "ccusage": 0.005,
+      "compared": "daily.2026-07-22",
+      "delta_pct": 0.0,
+      "explanation": "UTC date grouping on both sides",
+      "saffev": 0.005
+    },
+    {
+      "ccusage": "reference blocks --json",
+      "compared": "blocks (9: 5 usage + 4 gaps)",
+      "delta_pct": 0.0,
+      "explanation": "block = entry ts floored to UTC hour + 5h; new block on window edge or 5h entry gap; synthetic gap from last entry + 5h to next entry",
+      "saffev": "boundaries, gap-ness, entry counts EXACT; costs within tolerance"
+    }
+  ],
+  "events": 6,
+  "fixture": "tests/fixtures/costs/home/.claude",
+  "harness": "costs_bench v1 (G3 loop 1 — docs/gauntlets/GAUNTLETS.md)",
+  "largest_unexplained_delta": "none — costs match to full float precision on this fixture",
+  "max_cost_delta_pct": 0.0,
+  "network": "none — pricing is a versioned on-disk table; the reference is committed; nothing fetches",
+  "pricing_table_as_of": "2026-07-28",
+  "reference": "ccusage 20.0.19 (npx, --offline bundled pricing, --timezone UTC)",
+  "saffev_totals": {
+    "cache_read": 162000,
+    "cache_write": 17000,
+    "cost_usd": 0.84785,
+    "entries": 6,
+    "input": 9000,
+    "output": 4800
+  },
+  "tolerance_pct": 2.0
+}
