@@ -84,12 +84,24 @@ impl AiderReader {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        // Split into sessions on the header line.
+        // Split into sessions on the header line. Session splitting is
+        // SAFFEV'S construct (aider itself never splits), so it must be
+        // conservative: a header line INSIDE a code fence is pasted log
+        // content, not a session boundary — splitting there corrupts
+        // per-session attribution (G2 comprehensive critic's over-split
+        // finding). Role classification below stays fence-UNaware on
+        // purpose, because aider's own reader is.
         let mut sessions: Vec<(i64, Vec<&str>)> = Vec::new();
+        let mut in_fence = false;
         for line in text.lines() {
-            if let Some(stamp) = line.strip_prefix(SESSION_HEADER) {
-                sessions.push((header_millis(stamp.trim()), Vec::new()));
-                continue;
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            if !in_fence {
+                if let Some(stamp) = line.strip_prefix(SESSION_HEADER) {
+                    sessions.push((header_millis(stamp.trim()), Vec::new()));
+                    continue;
+                }
             }
             if let Some((_, lines)) = sessions.last_mut() {
                 lines.push(line);
@@ -413,6 +425,25 @@ mod tests {
         assert_eq!(s2.input_tokens, 900);
         // Session 1 ends where session 2 starts.
         assert_eq!(s1.updated_ts, s2.started_ts);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fenced_session_header_does_not_split() {
+        // A pasted log line inside a code fence must not create a phantom
+        // second session (G2 comprehensive critic).
+        let dir = std::env::temp_dir().join(format!("saffev-aider-{}", uuid::Uuid::new_v4()));
+        let proj = dir.join("p3");
+        std::fs::create_dir_all(&proj).unwrap();
+        let md = "# aider chat started at 2026-07-27 17:00:00\n\n#### paste my old log\n\nHere is the log you pasted:\n\n```\n# aider chat started at 2020-01-01 00:00:00\nold pasted content\n```\n\nThat log is from January.\n";
+        std::fs::write(proj.join(".aider.chat.history.md"), md).unwrap();
+        let reader = AiderReader::with_roots(vec![dir.clone()]);
+        let sessions = reader.list_sessions();
+        assert_eq!(sessions.len(), 1, "fenced header split a phantom session");
+        assert_eq!(
+            sessions[0].started_ts,
+            header_millis("2026-07-27 17:00:00")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

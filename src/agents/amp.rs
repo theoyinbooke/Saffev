@@ -151,12 +151,19 @@ impl AmpReader {
                     }
                 }
             }
-            for b in m
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-            {
+            // The recovered format is blocks-only, but a bare-string content
+            // must degrade to one text block, not silent invisibility (G2
+            // comprehensive critic's amp probe).
+            let string_block;
+            let blocks: &[Value] = match m.get("content") {
+                Some(Value::Array(a)) => a.as_slice(),
+                Some(Value::String(s)) if !s.is_empty() => {
+                    string_block = [serde_json::json!({"type": "text", "text": s})];
+                    &string_block
+                }
+                _ => &[],
+            };
+            for b in blocks {
                 match b.get("type").and_then(Value::as_str).unwrap_or("") {
                     "text" => {
                         let t = b.get("text").and_then(Value::as_str).unwrap_or("");
@@ -313,6 +320,24 @@ impl AgentReader for AmpReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_content_degrades_to_a_text_block() {
+        // Blocks-only per the recovered format, but a bare string must list
+        // as one text turn, not vanish (G2 comprehensive critic).
+        let dir = std::env::temp_dir().join(format!("saffev-amp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("T-str.json"),
+            r#"{"v":1,"id":"T-str","created":1753660000000,"messages":[{"role":"user","messageId":0,"content":"plain string content"}]}"#,
+        )
+        .unwrap();
+        let reader = AmpReader::with_root(dir.clone());
+        let sessions = reader.list_sessions();
+        assert_eq!(sessions.len(), 1, "string-content thread vanished");
+        assert_eq!(sessions[0].message_count, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn garbage_thread_files_are_skipped() {

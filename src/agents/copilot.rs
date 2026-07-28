@@ -102,7 +102,7 @@ impl CopilotReader {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
             };
-            let value = value.trim().trim_matches('"');
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
             if value.is_empty() {
                 continue;
             }
@@ -325,7 +325,11 @@ impl CopilotReader {
                 .and_then(|d| d.file_name())
                 .map(|n| n.to_string_lossy().to_string())
         })?;
-        if msg_count == 0 {
+        // A session with recorded token spend but zero surviving messages
+        // (e.g. shutdown-only after truncation) must LIST — vanishing hides
+        // real spend (G2 comprehensive critic's silent-drop finding). Only a
+        // session with neither turns nor tokens is nothing.
+        if msg_count == 0 && inp + outp + cache == 0 {
             return None;
         }
         let title = title.or_else(|| {
@@ -624,6 +628,48 @@ mod tests {
         let d = CopilotReader::parse_modern(&events, false).expect("parses");
         assert_eq!(d.session.input_tokens, 0);
         assert_eq!(d.session.output_tokens, 42);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shutdown_only_session_lists_with_its_spend() {
+        // Token spend with zero surviving messages must not vanish (G2
+        // comprehensive critic's silent-drop finding).
+        let dir = std::env::temp_dir().join(format!("saffev-cop-{}", uuid::Uuid::new_v4()));
+        let sdir = dir.join("session-state/2c8e4b1a-5f63-4d9c-8e3a-000000000099");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("events.jsonl"),
+            r#"{"type":"session.shutdown","id":"e1","timestamp":"2026-07-02T10:00:00.000Z","data":{"shutdownType":"exit","tokenDetails":{"input":{"tokenCount":9000},"cache_read":{"tokenCount":0},"cache_write":{"tokenCount":0},"output":{"tokenCount":100}}}}"#,
+        )
+        .unwrap();
+        let reader = CopilotReader::with_root(dir.clone());
+        let sessions = reader.list_sessions();
+        assert_eq!(sessions.len(), 1, "shutdown-only session vanished");
+        assert_eq!(sessions[0].input_tokens, 9000);
+        assert_eq!(sessions[0].message_count, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_quoted_yaml_values_are_stripped() {
+        let dir = std::env::temp_dir().join(format!("saffev-cop-{}", uuid::Uuid::new_v4()));
+        let sdir = dir.join("session-state/3d9f5c2b-6a74-4e0d-9f4b-000000000098");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("workspace.yaml"),
+            "id: 3d9f5c2b-6a74-4e0d-9f4b-000000000098\ncwd: '/home/dev/spec chars'\nname: 'Quoted title'\ncreated_at: 2026-07-02T10:00:00.000Z\nupdated_at: 2026-07-02T10:01:00.000Z\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sdir.join("events.jsonl"),
+            r#"{"type":"user.message","id":"e1","timestamp":"2026-07-02T10:00:01.000Z","data":{"content":"hi"}}"#,
+        )
+        .unwrap();
+        let reader = CopilotReader::with_root(dir.clone());
+        let sessions = reader.list_sessions();
+        assert_eq!(sessions[0].project.as_deref(), Some("/home/dev/spec chars"));
+        assert_eq!(sessions[0].title.as_deref(), Some("Quoted title"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
