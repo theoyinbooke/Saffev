@@ -46,19 +46,16 @@
    "precision": 0.8181818181818182
   },
   "ssn": {
-   "tp": 2,
-   "fn": 3,
-   "fp": 1,
-   "recall": 0.4,
-   "precision": 0.6666666666666666
+   "tp": 5,
+   "fn": 0,
+   "fp": 2,
+   "recall": 1.0,
+   "precision": 0.7142857142857143
   }
  },
  "misses": [
   "[cross-004] phone missed '+1 555 010 2299'",
-  "[ssn-001] ssn missed '078-05-1120'",
   "[wallet-005] crypto_wallet missed '0x52908400098527886E0F7030069857D2E4169EE7'",
-  "[ssn-003] ssn missed '078051120'",
-  "[ssn-004] ssn missed '078 05 1120'",
   "[wallet-006] crypto_wallet missed '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed'",
   "[iban-006] iban missed 'ES9121000418450200051332'"
  ],
@@ -66,6 +63,7 @@
   "[phone-t02] phone fired on '06.06.2026 / 31-12-2025'",
   "[phone-t03] phone fired on '32980116750'",
   "[ip-t04] ip_address fired on '1.2.3.4'",
-  "[ssn-t02] ssn fired on '978-05-1120'"
+  "[ssn-t02] ssn fired on '978-05-1120'",
+  "[ssn-t04] ssn fired on '519304297'"
  ]
 }

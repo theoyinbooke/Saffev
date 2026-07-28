@@ -71,7 +71,7 @@
 {"id":"conn-003","text":"cache at redis://default:changeme@10.0.0.5:6379/0 ready","expect":[{"kind":"connection_string","value":"redis://default:changeme@10.0.0.5:6379/0"}],"note":"claims the embedded IP too — one masked span"}
 {"id":"conn-t01","text":"fetch https://example.com/path?q=1 now","expect":[],"trap":"connection_string","note":"no credentials"}
 {"id":"conn-t02","text":"db at postgres://db.internal:5432/prod up","expect":[],"trap":"connection_string","note":"host:port is not user:pass"}
-{"id":"ssn-001","text":"applicant SSN 078-05-1120 on file","expect":[{"kind":"ssn","value":"078-05-1120"}],"note":"promoted from xfail-002 — was miscaught as phone"}
+{"id":"ssn-001","text":"applicant SSN 519-30-4297 on file","expect":[{"kind":"ssn","value":"519-30-4297"}],"note":"promoted from xfail-002 — was miscaught as phone"}
 {"id":"ssn-002","text":"verify 219-09-9999 against records","expect":[{"kind":"ssn","value":"219-09-9999"}],"note":"upper serial band"}
 {"id":"ssn-t01","text":"id 000-12-3456 noted","expect":[],"trap":"ssn","note":"area 000 never issued"}
 {"id":"ssn-t02","text":"id 978-05-1120 noted","expect":[],"trap":"ssn","note":"area 900+ never issued"}
@@ -106,10 +106,10 @@
 {"id":"conn-004","text":"Server=db.internal;Database=app;User Id=svc;Password=Hunter2!;Encrypt=true","expect":[{"kind":"connection_string","value":"Server=db.internal;Database=app;User Id=svc;Password=Hunter2!;Encrypt=true"}],"note":"ODBC/ADO.NET property form — whole run is the span"}
 {"id":"conn-005","text":"queue at amqp://guest:s3cretpw@mq.internal:5672/vhost","expect":[{"kind":"connection_string","value":"amqp://guest:s3cretpw@mq.internal:5672/vhost"}],"note":"amqp scheme with embedded credentials"}
 {"id":"conn-t03","text":"Server=db.internal;Database=app;Encrypt=true","expect":[],"trap":"connection_string","note":"property run without a password pair"}
-{"id":"ssn-003","text":"applicant SSN 078051120 verified","expect":[{"kind":"ssn","value":"078051120"}],"note":"dash-less form — needs explicit SSN context"}
-{"id":"ssn-004","text":"social security number: 078 05 1120","expect":[{"kind":"ssn","value":"078 05 1120"}],"note":"spaced form with context"}
+{"id":"ssn-003","text":"applicant SSN 519304297 verified","expect":[{"kind":"ssn","value":"519304297"}],"note":"dash-less form — needs explicit SSN context"}
+{"id":"ssn-004","text":"social security number: 519 30 4297","expect":[{"kind":"ssn","value":"519 30 4297"}],"note":"spaced form with context"}
 {"id":"ssn-005","text":"SSN 219-09-9999 on file","expect":[{"kind":"ssn","value":"219-09-9999"}],"note":"dashed form — thickens thin positives"}
-{"id":"ssn-t04","text":"order 078051120 shipped yesterday","expect":[],"trap":"ssn","note":"bare nine digits without SSN context"}
+{"id":"ssn-t04","text":"order 519304297 shipped yesterday","expect":[],"trap":"ssn","note":"bare nine digits without SSN context"}
 {"id":"phone-007","text":"reach me on +2348035551234 anytime","expect":[{"kind":"phone","value":"+2348035551234"}],"note":"spaceless E.164"}
 {"id":"phone-008","text":"fax 555.123.4567 available","expect":[{"kind":"phone","value":"555.123.4567"}],"note":"NANP dot-separated 3.3.4 — versions never take this shape"}
 {"id":"jwt-003","text":"Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcGkifQ.c2lnbmF0dXJlLXNlZ21lbnQtaGVyZQ","expect":[{"kind":"jwt","value":"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhcGkifQ.c2lnbmF0dXJlLXNlZ21lbnQtaGVyZQ"}],"note":"literal Authorization: Bearer header form"}
@@ -151,3 +151,10 @@
 {"id":"env-014","text":"logger.info({password: \"hunter2xyz99\", user: \"svc\"})","expect":[{"kind":"env_assignment","value":"password: \"hunter2xyz99\""}],"note":"round-7 critic FN — JS object literal, unquoted key mid-line"}
 {"id":"env-015","text":"opts = {password: 'railsKw99x'}","expect":[{"kind":"env_assignment","value":"password: 'railsKw99x'"}],"note":"round-7 critic FN — Ruby 1.9 keyword hash"}
 {"id":"env-016","text":"{'db_password': 'py2repr99x'}","expect":[{"kind":"env_assignment","value":"'db_password': 'py2repr99x'"}],"note":"round-7 critic FN — Python dict repr, single-quoted"}
+{"id":"env-017","text":"password_hint: \"mother's maiden name\"","expect":[{"kind":"env_assignment","value":"password_hint: \"mother's maiden name\""}],"note":"round-8 critic span bug — apostrophe inside double quotes must not close the pair"}
+{"id":"env-018","text":"{password: \"hu\\\"nter99x\"}","expect":[{"kind":"env_assignment","value":"password: \"hu\\\"nter99x\""}],"note":"round-8 critic FN — escaped quote inside a double-quoted value"}
+{"id":"env-019","text":"{password: `tpl99secret`}","expect":[{"kind":"env_assignment","value":"password: `tpl99secret`"}],"note":"round-8 critic FN — JS template literal value"}
+{"id":"env-020","text":"password: was-removed-x9q","expect":[{"kind":"env_assignment","value":"password: was-removed-x9q"}],"note":"scrub verb NOT in first position stays material — backs the round-8 probe"}
+{"id":"env-t21","text":"password: \"TBD-final\"","expect":[],"trap":"env_assignment","note":"round-8 critic FP — filler lead plus annotation"}
+{"id":"phone-t09","text":"ref 1212-1212-1212 issued","expect":[],"trap":"phone","note":"round-8 critic FP — all groups identical"}
+{"id":"phone-t10","text":"code 1111-2222-3334 assigned","expect":[],"trap":"phone","note":"round-8 critic FP — 4-4-4 quad shape is a serial, not a phone plan"}

@@ -155,41 +155,55 @@ static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
         .expect("env assignment regex")
 });
 
+/// Quoting in these grammars is PAIRED: the regex crate has no
+/// backreferences, so every quote kind is a spelled-out alternation branch —
+/// a `['"]…['"]` class would let a `"` open and an apostrophe close
+/// (`password_hint: "mother's maiden name"` mangled its span to `"mother'`;
+/// G1 round-8 critic's span-correctness bug). Double-quoted branches accept
+/// backslash escapes (`"hu\"nter99"`), single-quoted stay literal. Because
+/// alternation multiplies capture groups, the claim loop reads captures
+/// positionally: first participating group = key, second = value.
+
 /// JSON / Python-dict member candidate (`"password": "hunter2"`,
-/// `'password': 'hunter2'`). Same key/value gates as the shell form (G1
-/// round 4 — the round-3 critic's named gap: config-file secrets outside
-/// shell syntax were invisible; single quotes cover Python dict reprs, G1
-/// round 7). Capture 1 = key, 2 = value.
+/// `'password': 'hunter2'` — single quotes cover Python dict reprs).
 static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"['"]([A-Za-z0-9_.\-]+)['"]\s*:\s*['"]([^'"\r\n]{4,})['"]"#)
-        .expect("json secret regex")
+    Regex::new(
+        r#"(?:"([A-Za-z0-9_.\-]+)"|'([A-Za-z0-9_.\-]+)')\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+    )
+    .expect("json secret regex")
 });
 
 /// Object-literal member candidate: UNQUOTED key, quoted value, anywhere on a
 /// line — `{password: "hunter2"}` (JS), `opts = {password: 'x'}` (Ruby 1.9
-/// keyword hash). The round-7 critic called this the single most common
-/// secret-paste shape in logs, and no anchored grammar reached it. The
+/// keyword hash), `` {password: `tpl`} `` (JS template literal). The round-7
+/// critic called this the single most common secret-paste shape in logs. The
 /// mandatory QUOTED value is what separates an object literal from prose —
 /// mid-line `password: hunter2` unquoted stays out of scope.
 static RE_OBJ_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*['"]([^'"\r\n]{4,})['"]"#)
-        .expect("object literal secret regex")
+    Regex::new(
+        r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})'|`([^`\r\n]{4,})`)"#,
+    )
+    .expect("object literal secret regex")
 });
 
 /// Ruby hash-rocket member candidate (`"password"=>"hunter2"` — every Rails
 /// console/log paste; G1 round-5 critic's missed grammar). Same gates as the
-/// JSON form. Capture 1 = key, 2 = value (single or double quotes).
+/// JSON form; paired quotes (see the note above RE_JSON_SECRET).
 static RE_RUBY_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*=>\s*['"]([^'"\r\n]{4,})['"]"#)
-        .expect("ruby secret regex")
+    Regex::new(
+        r#""([A-Za-z0-9_.\-]+)"\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+    )
+    .expect("ruby secret regex")
 });
 
 /// Ruby SYMBOL-key hash-rocket candidate (`:password=>"hunter2"` — the older,
 /// very common form; G1 round-6 critic's miss: the quoted-key grammar above
-/// doesn't reach it). Capture 1 = key, 2 = value.
+/// doesn't reach it). Paired quotes.
 static RE_RUBY_SYM_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#":([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*['"]([^'"\r\n]{4,})['"]"#)
-        .expect("ruby symbol secret regex")
+    Regex::new(
+        r#":([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+    )
+    .expect("ruby symbol secret regex")
 });
 
 /// YAML mapping candidate (`password: hunter2` at line start, any indent).
@@ -201,13 +215,14 @@ static RE_YAML_SECRET: Lazy<Regex> = Lazy::new(|| {
         .expect("yaml secret regex")
 });
 
-/// TOML/INI candidate with spaces around `=` and a quoted value
-/// (`password = "hunter2"`, single or double quotes). The space-less shell
-/// form is [`RE_ENV_ASSIGN`]'s. Capture 1 = key, 2 = value. The value class
-/// excludes both quote chars, so a mismatched-quote pair can't overrun.
+/// TOML/INI candidate with spaces around `=` and a paired-quote value
+/// (`password = "hunter2"`, single or double). The space-less shell form is
+/// [`RE_ENV_ASSIGN`]'s.
 static RE_TOML_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*['"]([^'"\r\n]{4,})['"]"#)
-        .expect("toml secret regex")
+    Regex::new(
+        r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*(?:"([^"\r\n]{4,})"|'([^'\r\n]{4,})')"#,
+    )
+    .expect("toml secret regex")
 });
 
 /// `Key=Value;`-style connection string (ODBC / ADO.NET / JDBC properties)
@@ -394,7 +409,15 @@ impl Detector {
             (&RE_TOML_SECRET, true, false, true),
         ] {
             for caps in re.captures_iter(text) {
-                let (Some(whole), Some(key), Some(value)) = (caps.get(0), caps.get(1), caps.get(2))
+                let Some(whole) = caps.get(0) else {
+                    continue;
+                };
+                // Positional read: quote alternation multiplies group
+                // numbers, but group ORDER is fixed — the first
+                // participating group is always the key, the second the
+                // value, whichever quote branch matched.
+                let mut participating = (1..caps.len()).filter_map(|i| caps.get(i));
+                let (Some(key), Some(value)) = (participating.next(), participating.next())
                 else {
                     continue;
                 };
@@ -954,12 +977,24 @@ fn env_value_is_real(value: &str) -> bool {
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
         .collect();
-    // A value whose FIRST word is a scrub verb is an annotated marker —
-    // `REDACTED_BY_SOC_TEAM`, `MASKED (by proxy)` — the annotation doesn't
-    // make it material (G1 round-7 critic). Scrub VERBS only: `hidden` stays
-    // out so a passphrase like `hidden-gem-x9` isn't collateral.
-    const SCRUB_VERBS: &[&str] = &["redacted", "filtered", "masked", "scrubbed", "removed"];
-    if segments.first().is_some_and(|s| SCRUB_VERBS.contains(s)) {
+    // A value whose FIRST word is a scrub verb or filler lead is an
+    // annotated marker — `REDACTED_BY_SOC_TEAM`, `MASKED (by proxy)`,
+    // `TBD-final` — the annotation doesn't make it material (G1 round-7/8
+    // critics). Leads only: `hidden` stays out so a passphrase like
+    // `hidden-gem-x9` isn't collateral, and `was-removed-x9q` is material
+    // because `removed` isn't FIRST.
+    const NON_MATERIAL_LEADS: &[&str] = &[
+        "redacted",
+        "filtered",
+        "masked",
+        "scrubbed",
+        "removed",
+        "tbd",
+        "todo",
+        "placeholder",
+        "changeme",
+    ];
+    if segments.first().is_some_and(|s| NON_MATERIAL_LEADS.contains(s)) {
         return false;
     }
     if !segments.is_empty() && segments.iter().all(|s| NON_MATERIAL.contains(s)) {
@@ -1250,24 +1285,27 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
         return false;
     }
 
-    // (e) Not an adversarial digit-run: a candidate where EVERY separator
-    // group is one repeated digit (`1111-2222-3333`, `0000-0000-0000`) is a
-    // serial or placeholder, never a dialable number (G1 round-7 critic).
-    // Real numbers always carry at least one mixed-digit group.
-    let groups_uniform = {
-        let mut any = false;
-        let all_uniform = s
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|g| !g.is_empty())
-            .all(|g| {
-                any = true;
-                let first = g.as_bytes()[0];
-                g.bytes().all(|b| b == first)
-            });
-        any && all_uniform
-    };
-    if groups_uniform {
-        return false;
+    // (e) Not an adversarial digit-run (G1 round-7/8 critics). Three serial
+    // shapes, none a dialable format anywhere common:
+    //   - every group one repeated digit   (`1111-2222-3333`, `0000-0000-0000`)
+    //   - all groups identical             (`1212-1212-1212`)
+    //   - exactly three quads              (`1111-2222-3334` — 4-4-4 is a
+    //     serial/PIN-block shape; NANP is 3-3-4, and no plan groups 12
+    //     digits as quads)
+    let groups: Vec<&str> = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if !groups.is_empty() {
+        let all_repeated = groups.iter().all(|g| {
+            let first = g.as_bytes()[0];
+            g.bytes().all(|b| b == first)
+        });
+        let all_identical = groups.len() >= 2 && groups.iter().all(|g| *g == groups[0]);
+        let three_quads = groups.len() == 3 && groups.iter().all(|g| g.len() == 4);
+        if all_repeated || all_identical || three_quads {
+            return false;
+        }
     }
 
     // (f) Not SSN-shaped. A 3-2-4 dashed group is an SSN (valid or garbage),
@@ -2470,6 +2508,52 @@ mod tests {
         // The quoted value is load-bearing: mid-line unquoted prose stays out.
         let f = d.scan(Side::Request, "he typed password: hunter2 and hit enter");
         assert!(!has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn quote_pairing_is_exact_and_escapes_work() {
+        let d = det();
+        // Round-8 critic's span bug: an apostrophe inside a double-quoted
+        // value must not close the span.
+        let text = r#"password_hint: "mother's maiden name""#;
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("apostrophe-in-double-quotes");
+        assert_eq!(&text[m.start..m.end], text, "span must cover the full pair");
+        // Escaped quote inside a double-quoted value.
+        let text = r#"{password: "hu\"nter99x"}"#;
+        let f = d.scan(Side::Request, text);
+        let m = f
+            .iter()
+            .find(|f| f.kind == PiiKind::EnvAssignment)
+            .expect("escaped-quote value");
+        assert_eq!(&text[m.start..m.end], r#"password: "hu\"nter99x""#);
+        // JS template literal.
+        let text = "{password: `tpl99secret`}";
+        let f = d.scan(Side::Request, text);
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "template literal missed");
+    }
+
+    #[test]
+    fn serial_shaped_digit_groups_are_not_phones() {
+        // Round-8 critic: identical groups and the 4-4-4 quad shape.
+        let d = det();
+        for benign in ["ref 1212-1212-1212 issued", "code 1111-2222-3334 assigned"] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::Phone), "must reject {benign:?}");
+        }
+    }
+
+    #[test]
+    fn filler_leads_are_not_secrets() {
+        let d = det();
+        let f = d.scan(Side::Request, "password: \"TBD-final\"");
+        assert!(!has_kind(&f, PiiKind::EnvAssignment), "TBD-annotation is filler");
+        // But a value merely CONTAINING a filler word later stays material.
+        let f = d.scan(Side::Request, "password: was-removed-x9q");
+        assert!(has_kind(&f, PiiKind::EnvAssignment));
     }
 
     #[test]
