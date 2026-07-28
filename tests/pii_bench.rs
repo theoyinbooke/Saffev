@@ -88,8 +88,8 @@ fn pii_bench_scorecard() {
     let traps = cases.iter().filter(|c| c.trap.is_some()).count();
     let xfails = cases.iter().filter(|c| c.xfail.is_some()).count();
     let scored = cases.len() - xfails;
-    assert!(scored >= 155, "scored corpus shrank to {scored} cases");
-    assert!(traps >= 63, "adversarial trap count shrank to {traps}");
+    assert!(scored >= 164, "scored corpus shrank to {scored} cases");
+    assert!(traps >= 66, "adversarial trap count shrank to {traps}");
 
     let mut kinds: BTreeMap<String, Tally> = BTreeMap::new();
     let mut known_gaps: Vec<serde_json::Value> = Vec::new();

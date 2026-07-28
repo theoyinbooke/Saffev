@@ -128,12 +128,19 @@ static RE_CONN_STRING: Lazy<Regex> = Lazy::new(|| {
 static RE_SSN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn regex"));
 
-/// IBAN candidate: country code + 2 check digits + grouped body, spaced or
-/// compact. Validated by ISO 7064 mod-97 ([`iban_valid`]) before emission, so
-/// a random uppercase/digit run has a 1-in-97 chance of surviving the gate.
+/// IBAN candidate: canonical uppercase (spaced groups or compact), plus a
+/// COMPACT-only lowercase branch (lowercase pastes are real — G1 round-9
+/// critic). Lowercase must be compact because a blanket `(?i)` let the
+/// greedy spaced-group tail glue a following ordinary word into the
+/// candidate (`ES91… activa` absorbed `acti`+`va`, failed mod-97, and the
+/// true IBAN vanished — caught by the bench, round 10). Validated by ISO
+/// 7064 mod-97 ([`iban_valid`]) before emission, so a random letter/digit
+/// run has a 1-in-97 chance of surviving the gate.
 static RE_IBAN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b")
-        .expect("iban regex")
+    Regex::new(
+        r"\b(?:[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?|[a-z]{2}\d{2}[a-z0-9]{11,30})\b",
+    )
+    .expect("iban regex")
 });
 
 /// MAC address — six colon- or hyphen-separated hex pairs. (The regex crate
@@ -151,8 +158,10 @@ static RE_MAC: Lazy<Regex> = Lazy::new(|| {
 /// interpolations don't count) before a finding is emitted. The whole
 /// assignment is the finding so masking removes the value, not just part.
 static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"';]{6,})"#)
-        .expect("env assignment regex")
+    Regex::new(
+        r#"\b[A-Za-z_][A-Za-z0-9_]*=(?:"(?:\\.|[^"\\\r\n]){4,}"|'[^'\r\n]{4,}'|[^\s"';]{6,})"#,
+    )
+    .expect("env assignment regex")
 });
 
 /// Quoting in these grammars is PAIRED: the regex crate has no
@@ -168,7 +177,7 @@ static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
 /// `'password': 'hunter2'` — single quotes cover Python dict reprs).
 static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?:"([A-Za-z0-9_.\-]+)"|'([A-Za-z0-9_.\-]+)')\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+        r#"(?:"([A-Za-z0-9_.\-]+)"|'([A-Za-z0-9_.\-]+)')\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'((?:\\.|[^'\\\r\n]){4,})')"#,
     )
     .expect("json secret regex")
 });
@@ -181,7 +190,7 @@ static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
 /// mid-line `password: hunter2` unquoted stays out of scope.
 static RE_OBJ_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})'|`([^`\r\n]{4,})`)"#,
+        r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'((?:\\.|[^'\\\r\n]){4,})'|`([^`\r\n]{4,})`)"#,
     )
     .expect("object literal secret regex")
 });
@@ -191,7 +200,7 @@ static RE_OBJ_SECRET: Lazy<Regex> = Lazy::new(|| {
 /// JSON form; paired quotes (see the note above RE_JSON_SECRET).
 static RE_RUBY_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#""([A-Za-z0-9_.\-]+)"\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+        r#""([A-Za-z0-9_.\-]+)"\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'((?:\\.|[^'\\\r\n]){4,})')"#,
     )
     .expect("ruby secret regex")
 });
@@ -201,7 +210,7 @@ static RE_RUBY_SECRET: Lazy<Regex> = Lazy::new(|| {
 /// doesn't reach it). Paired quotes.
 static RE_RUBY_SYM_SECRET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#":([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
+        r#":([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*(?:"((?:\\.|[^"\\\r\n]){4,})"|'((?:\\.|[^'\\\r\n]){4,})')"#,
     )
     .expect("ruby symbol secret regex")
 });
@@ -219,8 +228,10 @@ static RE_YAML_SECRET: Lazy<Regex> = Lazy::new(|| {
 /// (`password = "hunter2"`, single or double). The space-less shell form is
 /// [`RE_ENV_ASSIGN`]'s.
 static RE_TOML_SECRET: Lazy<Regex> = Lazy::new(|| {
+    // TOML basic strings take backslash escapes; literal (single-quoted)
+    // strings by spec do not — the asymmetry here is TOML's, not ours.
     Regex::new(
-        r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*(?:"([^"\r\n]{4,})"|'([^'\r\n]{4,})')"#,
+        r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*(?:"((?:\\.|[^"\\\r\n]){4,})"|'([^'\r\n]{4,})')"#,
     )
     .expect("toml secret regex")
 });
@@ -452,14 +463,21 @@ impl Detector {
             if !env_key_is_secret(&key) || !env_value_is_real(&value) {
                 continue;
             }
-            // Defer to the more specific secret detectors: a value that is
-            // itself a known-prefix API key or a JWT gets claimed by those
-            // steps instead — their kind label carries more signal than
-            // "config credential".
+            // Defer to the more specific secret detectors — but ONLY when the
+            // hand-off will actually be claimed (G1 round-9 critic's severe
+            // FN: base64-encoded JSON starts `eyJ` without being a JWT, and a
+            // below-entropy `sk-…` value clears neither detector — a naive
+            // prefix defer made both vanish entirely). A real JWT shape or an
+            // accepted key keeps its specific label; everything else stays a
+            // config credential.
             let v = value
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'');
-            if v.starts_with("eyJ") || RE_API_KEY.is_match(v) {
+            if RE_JWT.is_match(v)
+                || RE_API_KEY
+                    .find(v)
+                    .is_some_and(|m| api_key_accepts(m.as_str()))
+            {
                 continue;
             }
             out.push(make_finding(
@@ -504,11 +522,7 @@ impl Detector {
         //    key body is never re-read as a phone/card.
         for m in RE_API_KEY.find_iter(text) {
             let token = m.as_str();
-            let body_len = token.split(['-', '_']).next_back().map_or(0, str::len);
-            if body_len < API_KEY_MIN_BODY {
-                continue;
-            }
-            if shannon_entropy(token) < API_KEY_MIN_ENTROPY {
+            if !api_key_accepts(token) {
                 continue;
             }
             if overlaps(&claimed, m.start(), m.end()) {
@@ -792,6 +806,14 @@ impl Detector {
     }
 }
 
+/// Would the API-key detector claim this exact token? Shared by the scan
+/// step and the config-secret deferral check — deferral must only skip when
+/// the hand-off will actually be caught (G1 round-9 critic).
+fn api_key_accepts(token: &str) -> bool {
+    let body_len = token.split(['-', '_']).next_back().map_or(0, str::len);
+    body_len >= API_KEY_MIN_BODY && shannon_entropy(token) >= API_KEY_MIN_ENTROPY
+}
+
 /// Structural validation for a dashed SSN candidate: area 001–899 excluding
 /// 666, group 01–99, serial 0001–9999 (the SSA's never-issued ranges).
 fn ssn_valid(s: &str) -> bool {
@@ -861,6 +883,7 @@ fn env_key_is_secret(key: &str) -> bool {
         "SECRET",
         "PASSWORD",
         "PASSWD",
+        "PASSPHRASE",
         "PASS", // DB_PASS et al. — segment match, so BYPASS never qualifies
         "PWD",
         "TOKEN",
@@ -944,6 +967,11 @@ fn env_value_is_real(value: &str) -> bool {
         "denied",
         "error",
         "failed",
+        "rejected",
+        "unauthorized",
+        "forbidden",
+        "wrong",
+        "mismatch",
         // filler connectors — `not_set`, `to_be_filled` are template noise,
         // not material (G1 round-7 critic)
         "not",
@@ -1129,6 +1157,7 @@ fn iban_valid(candidate: &str) -> bool {
         let v = match c {
             '0'..='9' => c as u32 - '0' as u32,
             'A'..='Z' => c as u32 - 'A' as u32 + 10,
+            'a'..='z' => c as u32 - 'a' as u32 + 10,
             _ => return false,
         };
         rem = if v < 10 {
@@ -1292,11 +1321,15 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
     //   - exactly three quads              (`1111-2222-3334` — 4-4-4 is a
     //     serial/PIN-block shape; NANP is 3-3-4, and no plan groups 12
     //     digits as quads)
+    // A leading `+` exempts the candidate: the explicit country-code prefix
+    // is a deliberate phone signal, and real numbers can look degenerate
+    // (`+7 777 777 7777` is a plausible Kazakh mobile — G1 round-9 critic's
+    // over-kill).
     let groups: Vec<&str> = s
         .split(|c: char| !c.is_ascii_digit())
         .filter(|g| !g.is_empty())
         .collect();
-    if !groups.is_empty() {
+    if !has_plus && !groups.is_empty() {
         let all_repeated = groups.iter().all(|g| {
             let first = g.as_bytes()[0];
             g.bytes().all(|b| b == first)
@@ -2554,6 +2587,70 @@ mod tests {
         // But a value merely CONTAINING a filler word later stays material.
         let f = d.scan(Side::Request, "password: was-removed-x9q");
         assert!(has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn deferral_only_hands_off_when_the_target_claims() {
+        // Round-9 critic's severe FN: base64-encoded JSON starts `eyJ`
+        // without being a JWT; a below-entropy sk- value clears neither
+        // detector. Deferral must verify the hand-off.
+        let d = det();
+        let text = "PASSWORD=eyJ0eXBlIjoiYWNjb3VudCJ9";
+        let f = d.scan(Side::Request, text);
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "base64-JSON credential vanished");
+        assert!(!has_kind(&f, PiiKind::Jwt));
+        let f = d.scan(Side::Request, "PASSWORD=sk-abcdabcdabcdabcdabcd");
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "below-entropy sk- value vanished");
+        // A REAL key or JWT still keeps its specific label.
+        let f = d.scan(Side::Request, "GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a");
+        assert!(has_kind(&f, PiiKind::ApiKey));
+        assert!(!has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn escaped_quotes_span_fully_in_every_grammar() {
+        // Round-9 critic: the escape fix was asymmetric — TOML, shell, and
+        // single-quoted branches still leaked or truncated.
+        let d = det();
+        for (text, want) in [
+            (
+                "db_password = \"hu\\\"nter99x\"",
+                "db_password = \"hu\\\"nter99x\"",
+            ),
+            (
+                "export DB_PASSWORD=\"hux\\\"nter99\"",
+                "DB_PASSWORD=\"hux\\\"nter99\"",
+            ),
+            (
+                r#"{password: 'hunter\'s99x'}"#,
+                r#"password: 'hunter\'s99x'"#,
+            ),
+        ] {
+            let f = d.scan(Side::Request, text);
+            let m = f
+                .iter()
+                .find(|f| f.kind == PiiKind::EnvAssignment)
+                .unwrap_or_else(|| panic!("missed {text:?}"));
+            assert_eq!(&text[m.start..m.end], want, "span in {text:?}");
+        }
+    }
+
+    #[test]
+    fn passphrase_keys_and_lowercase_ibans_and_plus_phones() {
+        let d = det();
+        let f = d.scan(Side::Request, "GPG_PASSPHRASE=correct-horse-battery-x99");
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "PASSPHRASE key missed");
+        let f = d.scan(Side::Request, "iban de89370400440532013000 on the invoice");
+        assert!(has_kind(&f, PiiKind::Iban), "lowercase IBAN missed");
+        // A '+' country prefix exempts degenerate-looking real numbers from
+        // the serial-shape rules.
+        let f = d.scan(Side::Request, "call +7 777 777 7777 today");
+        assert!(has_kind(&f, PiiKind::Phone), "+7 Kazakh mobile over-killed");
+        // Status-vocab synonyms are non-material.
+        for benign in ["password: rejected", "token: unauthorized"] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
     }
 
     #[test]

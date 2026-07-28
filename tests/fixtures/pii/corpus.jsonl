@@ -158,3 +158,12 @@
 {"id":"env-t21","text":"password: \"TBD-final\"","expect":[],"trap":"env_assignment","note":"round-8 critic FP — filler lead plus annotation"}
 {"id":"phone-t09","text":"ref 1212-1212-1212 issued","expect":[],"trap":"phone","note":"round-8 critic FP — all groups identical"}
 {"id":"phone-t10","text":"code 1111-2222-3334 assigned","expect":[],"trap":"phone","note":"round-8 critic FP — 4-4-4 quad shape is a serial, not a phone plan"}
+{"id":"env-021","text":"PASSWORD=eyJ0eXBlIjoiYWNjb3VudCJ9","expect":[{"kind":"env_assignment","value":"PASSWORD=eyJ0eXBlIjoiYWNjb3VudCJ9"}],"note":"round-9 critic severe FN — base64 JSON starts eyJ without being a JWT; deferral must verify the hand-off"}
+{"id":"env-022","text":"db_password = \"hu\\\"nter99x\"","expect":[{"kind":"env_assignment","value":"db_password = \"hu\\\"nter99x\""}],"note":"round-9 critic — TOML basic string with escaped quote"}
+{"id":"env-023","text":"export DB_PASSWORD=\"hux\\\"nter99\"","expect":[{"kind":"env_assignment","value":"DB_PASSWORD=\"hux\\\"nter99\""}],"note":"round-9 critic — shell double-quoted escape must span fully"}
+{"id":"env-024","text":"{password: 'hunter\\'s99x'}","expect":[{"kind":"env_assignment","value":"password: 'hunter\\'s99x'"}],"note":"round-9 critic — single-quoted escape (JS/Ruby) must span fully"}
+{"id":"env-025","text":"GPG_PASSPHRASE=correct-horse-battery-x99 exported","expect":[{"kind":"env_assignment","value":"GPG_PASSPHRASE=correct-horse-battery-x99"}],"note":"round-9 critic — PASSPHRASE joins the credential key words"}
+{"id":"env-t22","text":"password: rejected","expect":[],"trap":"env_assignment","note":"round-9 critic — status-vocab synonym"}
+{"id":"env-t23","text":"token: unauthorized","expect":[],"trap":"env_assignment","note":"round-9 critic — status-vocab synonym"}
+{"id":"iban-007","text":"iban de89370400440532013000 on the invoice","expect":[{"kind":"iban","value":"de89370400440532013000"}],"note":"round-9 critic — lowercase paste of a valid IBAN"}
+{"id":"phone-009","text":"call +7 777 777 7777 today","expect":[{"kind":"phone","value":"+7 777 777 7777"}],"note":"round-9 critic over-kill — '+' country prefix exempts degenerate-looking real numbers"}
