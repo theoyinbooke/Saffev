@@ -318,8 +318,10 @@ pub fn spawn_background_child(
     no_open: bool,
     log_to: Option<&Path>,
 ) -> Result<std::process::Child> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
+    // On-disk path, not the raw /proc readlink — a process whose binary was
+    // replaced would otherwise respawn a " (deleted)" path (see
+    // current_exe_on_disk).
+    let exe = current_exe_on_disk()?;
 
     let mut cmd = std::process::Command::new(exe);
     if let Some(cfg) = config_path {
@@ -383,28 +385,67 @@ fn open_rotated_log(path: &Path) -> Option<(std::process::Stdio, std::process::S
     Some((file.into(), clone.into()))
 }
 
+/// The running executable's ON-DISK path, surviving in-place replacement.
+///
+/// On Linux `std::env::current_exe()` reads `/proc/self/exe`, and once an
+/// in-app update has REPLACED the binary the kernel reports the old mapping
+/// as `<path> (deleted)` — a path that does not exist. Every respawn built
+/// from that string fails, and because helper stderr goes to /dev/null it
+/// failed SILENTLY: the daemon kept running the old image forever while the
+/// Studio showed "restart to update" doing nothing. (macOS's
+/// `_NSGetExecutablePath` returns the clean original path, which is why the
+/// same button worked there.) Stripping the marker recovers the real path —
+/// which now holds the NEW binary, exactly what a restart should run.
+pub fn current_exe_on_disk() -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
+    let cleaned = PathBuf::from(strip_deleted_marker(&exe.to_string_lossy()));
+    if cleaned.is_file() {
+        return Ok(cleaned);
+    }
+    // Neither the cleaned nor the raw path exists — fail loudly rather than
+    // spawn a helper that can't work.
+    Err(Error::Other(anyhow::anyhow!(
+        "executable path {} no longer exists on disk; cannot respawn",
+        cleaned.display()
+    )))
+}
+
+/// Strip the kernel's ` (deleted)` marker from a `/proc/self/exe` readlink.
+/// Pure so it is testable.
+pub(crate) fn strip_deleted_marker(path: &str) -> String {
+    path.strip_suffix(" (deleted)").unwrap_or(path).to_string()
+}
+
 /// Spawn a fully-detached helper that **stops this daemon and starts a fresh
 /// one** (the now-updated binary), so an in-app update can relaunch without the
 /// user touching the terminal. The helper sleeps briefly (so the triggering HTTP
 /// response can flush), runs `<exe> stop` (SIGTERMs us + waits for exit, freeing
 /// the ports), then `<exe> start --no-open` (the new binary binds them). The
 /// helper lives in its own process group/console so our own SIGTERM never reaches
-/// it. Used by `POST /api/restart`.
+/// it, and its output goes to `restart-helper.log` next to the daemon log so a
+/// failed relaunch is diagnosable instead of silent. Used by `POST /api/restart`.
 pub fn spawn_restart_helper() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::Other(anyhow::anyhow!("cannot locate current executable: {e}")))?;
+    let exe = current_exe_on_disk()?;
     let exe = exe.to_string_lossy().to_string();
+    // Failures here were invisible (null stderr) — the Linux update bug hid
+    // behind that for two releases. Best-effort log file instead.
+    let log = dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("saffev/restart-helper.log");
+    let (out, err) = open_rotated_log(&log)
+        .unwrap_or((std::process::Stdio::null(), std::process::Stdio::null()));
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let script = format!("sleep 0.6; \"{exe}\" stop; \"{exe}\" start --no-open");
+        let script = format!("sleep 0.6; \"{exe}\" stop; exec \"{exe}\" start --no-open");
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c")
             .arg(script)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
             // Own process group so the `stop` SIGTERM we send to ourselves can't
             // reach this helper (safe CommandExt — respects forbid(unsafe_code)).
             .process_group(0);
@@ -421,8 +462,8 @@ pub fn spawn_restart_helper() -> Result<()> {
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", &line])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         cmd.spawn()
             .map_err(|e| Error::Other(anyhow::anyhow!("failed to spawn restart helper: {e}")))?;
@@ -430,6 +471,7 @@ pub fn spawn_restart_helper() -> Result<()> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = (out, err);
         Err(Error::Other(anyhow::anyhow!(
             "self-restart is not supported on this platform"
         )))
@@ -646,6 +688,31 @@ mod tests {
         )
         .await;
         assert!(!gone);
+    }
+
+    #[test]
+    fn deleted_marker_is_stripped_from_exe_paths() {
+        // The Linux in-app-update bug: /proc/self/exe reads
+        // "<path> (deleted)" once the binary is replaced; respawning that
+        // literal string fails silently and the old daemon runs forever.
+        assert_eq!(
+            strip_deleted_marker("/home/u/.cargo/bin/saffev (deleted)"),
+            "/home/u/.cargo/bin/saffev"
+        );
+        assert_eq!(strip_deleted_marker("/usr/bin/saffev"), "/usr/bin/saffev");
+        // Only the exact kernel marker strips — a path merely containing the
+        // word keeps its name.
+        assert_eq!(
+            strip_deleted_marker("/tmp/not (deleted) dir/saffev"),
+            "/tmp/not (deleted) dir/saffev"
+        );
+    }
+
+    #[test]
+    fn current_exe_on_disk_resolves_for_a_live_binary() {
+        // Our own test binary exists on disk, so this must resolve.
+        let p = current_exe_on_disk().expect("resolves");
+        assert!(p.is_file());
     }
 
     #[test]
