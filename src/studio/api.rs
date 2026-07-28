@@ -2933,13 +2933,15 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
     let total_tool_calls: u64 = sessions.iter().map(|s| s.tool_call_count as u64).sum();
     let total_cost_usd: f64 = by_tool.iter().map(|t| t.cost_usd).sum();
 
+    let _state_pricing = state.config.load().pricing.clone();
     let mut models: BTreeMap<String, (u32, u64, f64)> = BTreeMap::new();
     for s in &sessions {
         let name = s.model.clone().unwrap_or_else(|| "unknown".into());
         let e = models.entry(name).or_insert((0, 0, 0.0));
         e.0 += 1;
         e.1 += s.input_tokens + s.output_tokens;
-        e.2 += crate::agents::cost_usd_split(
+        e.2 += crate::agents::cost_usd_split_with(
+            &_state_pricing,
             s.model.as_deref(),
             s.input_tokens,
             s.output_tokens,
@@ -2981,11 +2983,21 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
                 .map(|active| {
                     // Allowance: the user's configured estimate, else the
                     // highest OBSERVED block (needs no invented number).
-                    let observed_max = blocks
+                    // Baseline = the max of COMPLETED blocks — including the
+                    // active one made the bar read exactly 100% whenever the
+                    // current block was the all-time max (G3 closing critic).
+                    // With no completed history the active block is all there
+                    // is, and 100% is the honest answer.
+                    let completed_max = blocks
                         .iter()
-                        .filter(|b| !b.is_gap)
+                        .filter(|b| !b.is_gap && !b.is_active)
                         .map(|b| b.totals.cost_usd)
                         .fold(0.0f64, f64::max);
+                    let observed_max = if completed_max > 0.0 {
+                        completed_max
+                    } else {
+                        active.totals.cost_usd
+                    };
                     let allowance = if pricing.plan_block_allowance_usd > 0.0 {
                         pricing.plan_block_allowance_usd
                     } else {

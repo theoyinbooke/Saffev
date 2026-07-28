@@ -568,8 +568,29 @@ pub fn cost_usd_split(
     cache: u64,
     cache_write: u64,
 ) -> f64 {
+    cost_usd_split_with(
+        &crate::config::PricingConfig::default(),
+        model,
+        input,
+        output,
+        cache,
+        cache_write,
+    )
+}
+
+/// As [`cost_usd_split`], against a caller-supplied price table — the
+/// session views pass the LIVE config so their dollars use the same table
+/// as the usage report (G3 closing critic: the default-table shortcut was
+/// one more way the two paths could disagree).
+pub fn cost_usd_split_with(
+    pricing: &crate::config::PricingConfig,
+    model: Option<&str>,
+    input: u64,
+    output: u64,
+    cache: u64,
+    cache_write: u64,
+) -> f64 {
     let Some(model) = model else { return 0.0 };
-    let pricing = crate::config::PricingConfig::default();
     let (pin, pout, pread, pwrite) = pricing.lookup_split(model);
     let reads = cache.saturating_sub(cache_write);
     (input as f64 * pin
