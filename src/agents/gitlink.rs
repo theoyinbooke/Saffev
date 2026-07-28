@@ -61,21 +61,25 @@ pub fn commits_for(
 fn run_log(project: &Path, branch: Option<&str>, since: i64, until: i64) -> Option<Vec<CommitLink>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(project).arg("log");
-    if let Some(b) = branch {
-        cmd.arg(b);
-    }
-    // `@<unix>` is git's own unix-epoch date form, so the window needs no
-    // timezone-sensitive string formatting on our side. `%x1f` (unit separator)
-    // cannot appear in a hash or a single-line subject, making the parse
-    // unambiguous. `-n 50` caps a pathological window at the git side.
-    let out = cmd
-        .arg("--format=%h%x1f%ct%x1f%s")
+    // All OUR options first — `@<unix>` is git's own unix-epoch date form, so
+    // the window needs no timezone-sensitive string formatting; `%x1f` (unit
+    // separator) cannot appear in a hash or a single-line subject, making the
+    // parse unambiguous; `-n 50` caps a pathological window at the git side.
+    cmd.arg("--format=%h%x1f%ct%x1f%s")
         .arg(format!("--since=@{since}"))
         .arg(format!("--until=@{until}"))
         .arg("-n")
-        .arg("50")
-        .output()
-        .ok()?;
+        .arg("50");
+    if let Some(b) = branch {
+        // The branch is UNTRUSTED (parsed from an agent's session file). git
+        // has no shell here, but a `-`-prefixed value is read as an OPTION,
+        // not a revision — `--output=<path>` writes an arbitrary file
+        // (G5 critic: arbitrary-file-write via a crafted `git_branch`).
+        // `--end-of-options` forces everything AFTER it to be a revision, so
+        // it goes last, after all of our own options.
+        cmd.arg("--end-of-options").arg(b);
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -122,6 +126,48 @@ mod tests {
     fn missing_directory_is_fail_soft_too() {
         let dir = Path::new("/definitely/not/a/real/project/path");
         assert!(commits_for(dir, None, 0, 1_000_000, DEFAULT_PAD_MS).is_empty());
+    }
+
+    #[test]
+    fn dash_prefixed_branch_cannot_write_a_file() {
+        // G5 critic's finding: an untrusted branch like `--output=<path>` was
+        // read by `git log` as an option and wrote a file. `--end-of-options`
+        // must force it to be treated as a (nonexistent) revision instead.
+        let dir = std::env::temp_dir().join(format!("saffev-gitinj-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A real repo so `git log` actually runs (a non-repo would short out
+        // before arg interpretation and prove nothing).
+        let ok = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !ok(&["init", "-q"]) {
+            return; // no git on this machine — nothing to prove
+        }
+        let _ = ok(&["config", "user.email", "t@t"]);
+        let _ = ok(&["config", "user.name", "t"]);
+        let _ = ok(&["commit", "-q", "--allow-empty", "-m", "seed"]);
+        let canary = dir.join("PWNED");
+        // The attack payload as a branch name.
+        let _ = commits_for(
+            &dir,
+            Some("--output=PWNED"),
+            0,
+            i64::MAX / 2,
+            DEFAULT_PAD_MS,
+        );
+        assert!(
+            !canary.exists(),
+            "arg injection: a --output= branch wrote a file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // End-to-end behavior against a real temp repo (window filtering, branch
