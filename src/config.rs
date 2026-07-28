@@ -343,6 +343,16 @@ pub struct ArchiveConfig {
     /// Run a snapshot automatically (on Studio start + periodically) when enabled.
     #[serde(default)]
     pub auto: bool,
+    /// Minutes between automatic snapshots when `auto` is on.
+    ///
+    /// Defaults to 5 so a session is never more than a few minutes from durable:
+    /// the source apps prune on their own schedule, and an archive that only
+    /// catches up hourly can lose exactly the session you needed. Snapshots are
+    /// incremental (unchanged sessions are hash-skipped without re-parsing), so
+    /// a short cadence costs milliseconds, not re-reads. Clamped to ≥1 at the
+    /// scheduler so a hand-edited `0` cannot spin the loop.
+    #[serde(default = "default_archive_interval_minutes")]
+    pub interval_minutes: u32,
     /// Our-side retention in days. `None` (default) = keep forever. Set only if the
     /// user explicitly wants us to prune — we never do so on our own.
     #[serde(default)]
@@ -369,10 +379,17 @@ impl Default for ArchiveConfig {
         ArchiveConfig {
             enabled: false,
             auto: false,
+            interval_minutes: default_archive_interval_minutes(),
             retention_days: None,
             redact: false,
         }
     }
+}
+
+/// Default auto-snapshot cadence (minutes). Kept ≤5 so the freshness promise —
+/// "a finished session is durable within minutes" — holds by default (G5).
+fn default_archive_interval_minutes() -> u32 {
+    5
 }
 
 /// One entry in the model price table. USD per 1,000,000 tokens.

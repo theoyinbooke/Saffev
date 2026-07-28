@@ -1,10 +1,10 @@
 # Saffev privacy report — last 30 days
 
-Generated 2025-07-28 10:53 UTC · saffev v0.7.1 · **generated offline — producing this report performs no network calls**
+Generated 2026-07-29 04:40 UTC · saffev v0.7.1 · **generated offline — producing this report performs no network calls**
 
 ## What left this machine?
 
-- **2 model exchanges** were proxied in the period; every one went to a **local engine** (see Exposure below for whether anything else could reach it).
+- **2 model exchanges** were proxied in the period. The proxy forwards ONLY to the configured local engine port — a structural property of the configuration, not a per-request measurement (see Exposure below for whether anything else could reach that engine).
 - Saffev stored **metadata only — raw prompt/response text was never written to disk** for those exchanges. 
 - **Masking was off** (observe-only): request bodies passed through unchanged; findings below are what a masking policy WOULD have caught.
 
@@ -30,7 +30,7 @@ Generated 2025-07-28 10:53 UTC · saffev v0.7.1 · **generated offline — produ
 - llama3.3:70b: 1
 - qwen3:8b: 1
 
-> **Boundary:** application attribution is socket-PID based where possible (high confidence) and header-based otherwise; "unknown" rows had neither.
+> **Boundary:** application attribution is socket-PID based where possible (high confidence) and header-based otherwise; "unknown" rows had neither. History is read up to a 100,000-row cap before period filtering — periods busier than that are truncated, oldest first.
 
 ## Sensitive-data findings
 
@@ -60,7 +60,7 @@ Generated 2025-07-28 10:53 UTC · saffev v0.7.1 · **generated offline — produ
 - Codex: 5 sessions
 - Aider: 3 sessions
 
-> **Boundary:** session counts come from each tool's own on-disk store (see `bench/agents-results.json` for the fixture-proven coverage per tool). Tools that encrypt their history (e.g. Windsurf) cannot be read and are not counted.
+> **Boundary:** session and archive counts are ALL-TIME, not period-scoped (tools do not index sessions by report period). Session counts come from each tool's own on-disk store (see `bench/agents-results.json` for the fixture-proven coverage per tool). Tools that encrypt their history (e.g. Windsurf) cannot be read and are not counted.
 
 ## Archive integrity
 

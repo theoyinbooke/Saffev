@@ -492,6 +492,7 @@
     kv('Confidence', it.sourceConfidence);
     kv('Engine', it.engine);
     if (it.engineVersion) kv('Engine version', it.engineVersion);
+    if (it.requestHash) kv('Request hash', it.requestHash);
     kv('Model', it.model || '·');
     kv('Endpoint', it.endpoint);
     kv('Streamed', it.stream ? 'yes' : 'no');
@@ -3272,6 +3273,9 @@
         this.loadIntegrity();
       }
       wrap.appendChild(actions);
+      // The verify verdict as a full sentence (the proof statement), not just a
+      // chip — filled by loadIntegrity() once /archive/verify answers.
+      if (arch.enabled) wrap.appendChild(el('p', { class: 'preserve-proof', id: 'integrityProof', hidden: 'hidden' }));
       return wrap;
     },
 
@@ -3293,6 +3297,14 @@
         chip.className = 'integrity-chip bad';
         chip.textContent = '⚠ integrity failed';
         chip.title = v.brokenAt || 'The archive does not match what was recorded.';
+      }
+      // The human-readable proof: what was recomputed, what anchors it, what a
+      // failure means. Shown verbatim so "verified" is never an unexplained tick.
+      const proof = $('#integrityProof');
+      if (proof && v.proofStatement) {
+        proof.hidden = false;
+        proof.textContent = v.proofStatement;
+        proof.className = 'preserve-proof' + (v.entries && !v.intact ? ' bad' : '');
       }
     },
 
@@ -3459,6 +3471,23 @@
         });
         fl.appendChild(list);
         body.appendChild(fl);
+      }
+
+      // Commits made in the project while this session was active — the link
+      // between what was said and what the repo actually recorded. Skipped
+      // entirely when the backend found none (no repo, no project, no commits).
+      if (d.linkedCommits && d.linkedCommits.length) {
+        const cb = el('div', { class: 'payblk' }, [el('h4', { text: 'Commits during this session · ' + d.linkedCommits.length })]);
+        const list = el('div', { class: 'commitlist' });
+        d.linkedCommits.forEach((c) => {
+          list.appendChild(el('div', { class: 'commit' }, [
+            el('code', { class: 'commit-hash', text: c.hash }),
+            el('span', { class: 'commit-summary', text: c.summary }),
+            el('span', { class: 'commit-when', text: c.ts ? new Date(c.ts).toLocaleString() : '' }),
+          ]));
+        });
+        cb.appendChild(list);
+        body.appendChild(cb);
       }
 
       // Transcript.

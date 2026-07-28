@@ -750,6 +750,15 @@ a{color:inherit}
 .integrity-chip{font-family:var(--font-mono);font-size:.68rem;padding:3px 9px;border-radius:var(--r-full);background:var(--surface-3);color:var(--text-3);cursor:help;white-space:nowrap;flex:none}
 .integrity-chip.ok{color:var(--safe);background:var(--safe-soft)}
 .integrity-chip.bad{color:var(--danger);background:var(--danger-soft)}
+/* The verify verdict spelled out (proof statement) under the banner's one-liner. */
+.preserve-proof{flex-basis:100%;margin:0;font-size:.76rem;color:var(--text-3);line-height:1.5}
+.preserve-proof.bad{color:var(--danger)}
+/* Session drawer: commits made in the project during the session window. */
+.commitlist{display:flex;flex-direction:column;gap:6px}
+.commit{display:flex;align-items:baseline;gap:8px;font-size:.8rem;min-width:0}
+.commit-hash{font-family:var(--font-mono);font-size:.72rem;color:var(--brand);flex:none}
+.commit-summary{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.commit-when{font-size:.7rem;color:var(--text-3);flex:none}
 /* Team policy notice on Settings: what governs these controls, and from where. */
 .policycard{border-left:3px solid var(--brand)}
 .policycard.bad{border-left-color:var(--danger)}

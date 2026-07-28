@@ -99,7 +99,7 @@ pub fn render(i: &ReportInputs) -> String {
     let payload = i.config.payload_storage;
     let blocked_kinds = masking.block_kinds.len();
     push(&mut out, &format!(
-        "- **{total} model exchanges** were proxied in the period; every one went to a **local engine** (see Exposure below for whether anything else could reach it)."
+        "- **{total} model exchanges** were proxied in the period. The proxy forwards ONLY to the configured local engine port — a structural property of the configuration, not a per-request measurement (see Exposure below for whether anything else could reach that engine)."
     ));
     push(&mut out, &format!(
         "- Saffev stored **{}** for those exchanges. {}",
@@ -156,7 +156,7 @@ pub fn render(i: &ReportInputs) -> String {
         push(&mut out, &format!("- {model}: {n}"));
     }
     push(&mut out, "");
-    push(&mut out, "> **Boundary:** application attribution is socket-PID based where possible (high confidence) and header-based otherwise; \"unknown\" rows had neither.");
+    push(&mut out, "> **Boundary:** application attribution is socket-PID based where possible (high confidence) and header-based otherwise; \"unknown\" rows had neither. History is read up to a 100,000-row cap before period filtering — periods busier than that are truncated, oldest first.");
     push(&mut out, "");
 
     // ---- Findings -------------------------------------------------------------
@@ -231,7 +231,7 @@ pub fn render(i: &ReportInputs) -> String {
         }
     }
     push(&mut out, "");
-    push(&mut out, "> **Boundary:** session counts come from each tool's own on-disk store (see `bench/agents-results.json` for the fixture-proven coverage per tool). Tools that encrypt their history (e.g. Windsurf) cannot be read and are not counted.");
+    push(&mut out, "> **Boundary:** session and archive counts are ALL-TIME, not period-scoped (tools do not index sessions by report period). Session counts come from each tool's own on-disk store (see `bench/agents-results.json` for the fixture-proven coverage per tool). Tools that encrypt their history (e.g. Windsurf) cannot be read and are not counted.");
     push(&mut out, "");
 
     // ---- Archive integrity ----------------------------------------------------------

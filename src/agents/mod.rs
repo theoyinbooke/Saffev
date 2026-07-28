@@ -30,6 +30,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod export;
 pub mod gemini;
+pub mod gitlink;
 pub mod goose;
 pub mod opencode;
 pub mod privacy;

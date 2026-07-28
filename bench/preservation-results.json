@@ -1,0 +1,20 @@
+{
+  "boundaries": "The chain proves self-consistency (any edit after capture breaks it), not resistance to an attacker who controls the machine and recomputes every digest — that needs the head digest anchored off-machine. Git linkage is time-window correlation (±10 min pad), not proof the session authored the commit. Freshness is the scheduler's default cadence; a stopped Studio archives nothing until it runs again.",
+  "command": "cargo test --test preservation_bench -- --nocapture",
+  "freshness_interval_minutes": 5,
+  "fts_tools_matched": 3,
+  "git_linked_pct": 83.3,
+  "harness": "preservation_bench v1 (G5 — docs/gauntlets/GAUNTLETS.md §G5)",
+  "network": "none — temp store, temp git repos, fixtures built in-test; nothing fetches",
+  "scheduler_gate": "studio::should_run — archive.enabled && archive.auto, re-read from the live config every tick",
+  "tamper": {
+    "detected": true,
+    "named_precisely": true,
+    "sessions_archived": 3,
+    "tools": [
+      "aider",
+      "claude_code",
+      "codex"
+    ]
+  }
+}

@@ -68,8 +68,10 @@ fn specimen() -> HistoryRow {
 fn attribute_count_meets_the_bar() {
     // The attributes visible in History DETAIL for a fully-populated
     // exchange. Derived-only fields (tokens/sec) and detail-only enrichment
-    // (engine version) are part of the surface; each name here maps to a
-    // rendered row or badge in the Studio detail drawer.
+    // (engine version) are part of the surface. Honesty notes (G4 critic):
+    // input/output_tokens_src render as provenance markers (the ~ prefix on
+    // token values), and request_hash renders in the integrity row of the
+    // drawer — both counted, both visible.
     let attributes: Vec<&str> = vec![
         // identity + time
         "id",
@@ -197,7 +199,7 @@ fn sample_report_regenerates_deterministically() {
     ];
 
     let inputs = report::ReportInputs {
-        now_ms: 1_753_700_000_000,
+        now_ms: 1_785_300_000_000,
         period_days: 30,
         version: "0.7.1".into(),
         history,

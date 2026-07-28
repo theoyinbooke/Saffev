@@ -118,6 +118,10 @@ pub struct HistoryItem {
     /// an engines-table read); always null in list/live rows.
     #[serde(default)]
     pub engine_version: Option<String>,
+    /// Hash of the request body (integrity attribute — never the body).
+    /// Populated in the detail path.
+    #[serde(default)]
+    pub request_hash: Option<String>,
 }
 
 /// One quality-judge score as shown in the History detail drawer.
@@ -770,6 +774,19 @@ pub struct AgentMessageView {
     pub tool_name: Option<String>,
 }
 
+/// One git commit made in the session's project while the session was active —
+/// the "what did this conversation actually produce" link (G5 rubric d).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitLinkView {
+    /// Abbreviated commit hash.
+    pub hash: String,
+    /// The commit's subject line.
+    pub summary: String,
+    /// Committer timestamp (unix millis).
+    pub ts: i64,
+}
+
 /// `GET /api/agents/sessions/:id` — full transcript + PII lens.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -778,6 +795,11 @@ pub struct AgentSessionDetailView {
     pub messages: Vec<AgentMessageView>,
     /// PII findings across the transcript (what was pasted into the agent).
     pub pii: Vec<PiiFindingView>,
+    /// Commits made in the session's project during (±10 min) the session
+    /// window. Populated for preserved sessions with a known project; empty
+    /// when there is no repo, no project, or nothing was committed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_commits: Vec<CommitLinkView>,
 }
 
 /// Per-model rollup for the Agents analytics.
@@ -1008,6 +1030,10 @@ pub struct ArchiveIntegrityView {
     /// Newest entry digest — the value to record elsewhere to anchor the archive.
     pub head_digest: Option<String>,
     pub head_ts: Option<i64>,
+    /// The verdict as one human-readable proof statement — what was checked,
+    /// what anchors it, and what a failure means. The UI shows this verbatim so
+    /// "verified" is never an unexplained green tick.
+    pub proof_statement: String,
 }
 
 /// `POST /api/archive/audit` — where the bundle was written.

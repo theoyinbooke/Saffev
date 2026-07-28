@@ -1,0 +1,23 @@
+# G5 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G5).
+#
+# Mirrors costs-bench.yml: the bench enforces the preservation floors (default
+# snapshot cadence ≤5 min, tamper detected AND named precisely, one content
+# search spanning three tools, ≥80% of fixture sessions linked to their
+# commits) from fixtures built in-test — temp store, temp git repos, zero
+# network — and the git-diff step proves the committed artifact matches what
+# the code at this commit actually produces.
+name: preservation-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the preservation floors from in-test fixtures (floors enforced)
+        run: cargo test --test preservation_bench -- --nocapture
+      - name: Committed artifact must match the code
+        run: git diff --exit-code bench/preservation-results.json

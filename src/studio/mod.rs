@@ -191,12 +191,79 @@ impl StudioServer {
 
         tracing::info!("Studio listening on http://{addr}");
 
-        axum::serve(listener, router)
+        // Preservation freshness: the continuous snapshot loop lives with the
+        // Studio server (it only makes sense while the control plane is up) and
+        // dies with it, so a stopped Studio never leaves a stray archiver.
+        let scheduler = spawn_archive_scheduler(self.state.clone());
+
+        let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
-            .await
-            .map_err(|e| Error::Studio(format!("Studio server error: {e}")))?;
+            .await;
+        scheduler.abort();
+        served.map_err(|e| Error::Studio(format!("Studio server error: {e}")))?;
         Ok(())
     }
+}
+
+/// Whether an archive-scheduler tick should snapshot under `cfg`.
+///
+/// Pure gate logic, split out of the loop so the freshness promise is testable
+/// without running a server: Preservation must be ON (`archive.enabled`) and
+/// auto-snapshots must be ON (`archive.auto`). Evaluated against the LIVE config
+/// on every tick, so flipping either switch in Settings applies without a
+/// restart.
+pub fn should_run(cfg: &crate::config::Config) -> bool {
+    cfg.archive.enabled && cfg.archive.auto
+}
+
+/// Spawn the continuous-archive loop (G5 freshness: a finished session is
+/// durable within `archive.interval_minutes`, default 5).
+///
+/// The first tick of `tokio::time::interval` completes immediately, which is
+/// the on-start snapshot — nothing waits a full period to become durable after
+/// a restart. Every tick re-loads the live config handle so enabled/auto apply
+/// without a restart; the cadence itself is read once at spawn (changing it
+/// takes a restart, like ports). Snapshot failures are logged and retried next
+/// tick — this loop must never take the Studio down.
+fn spawn_archive_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
+    // Clamp at use-site: a hand-edited `interval_minutes = 0` must not busy-spin.
+    let minutes = u64::from(state.config.load().archive.interval_minutes.max(1));
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(minutes * 60));
+        // If a snapshot overruns the period, just resume the cadence — bursts of
+        // catch-up snapshots would only re-hash the same sessions.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let cfg = state.config.load();
+            if !should_run(&cfg) {
+                continue;
+            }
+            match crate::agents::archive::Redaction::from_config(&cfg) {
+                // Redaction is on but its patterns will not compile: skip rather
+                // than archive raw text under a setting that says otherwise
+                // (same stance as the manual /api/archive/run path).
+                Err(e) => tracing::warn!(
+                    target: "saffev::archive",
+                    "auto snapshot skipped — redaction is on but failed to build: {e}"
+                ),
+                Ok(redaction) => {
+                    match crate::agents::archive::run_snapshot(&state.store, redaction).await {
+                        Ok(s) => tracing::info!(
+                            target: "saffev::archive",
+                            "auto snapshot: {} archived · {} unchanged · {} deleted-at-source · {} errors",
+                            s.archived, s.skipped, s.deleted_detected, s.errors
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "saffev::archive",
+                            "auto snapshot failed (will retry next tick): {e}"
+                        ),
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Default broadcast capacity for the live SSE event channel.

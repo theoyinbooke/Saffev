@@ -136,6 +136,7 @@ pub(crate) fn item_from_parts(
         tokens_per_sec,
         // Populated only by the detail handler (costs an engines-table read).
         engine_version: None,
+        request_hash: None,
     }
 }
 
@@ -372,6 +373,8 @@ pub async fn history_detail(
     // Engine version — DETAIL-ONLY enrichment (one engines-table read per detail
     // open; list paths stay cheap with `engineVersion: null`). Best-effort: an
     // unknown engine simply leaves it null.
+    // Integrity attribute: always present on detail (never the body itself).
+    item.request_hash = Some(row.request.request_hash.clone());
     if let Ok(engines) = state.store.engines().await {
         item.engine_version = engines
             .iter()
@@ -2321,6 +2324,36 @@ pub async fn agents_detail(
             }
         }
     }
+    // Session ↔ commit linkage (G5 rubric d): for a preserved session with a
+    // known project, list the commits made there during the session window.
+    // Computed on-demand — one local `git log`, off the async runtime because
+    // it execs a process — and fail-soft: no repo / no git = just no list.
+    let linked_commits = match (&d.session.project, preserved) {
+        (Some(project), true) if !project.is_empty() => {
+            let project = std::path::PathBuf::from(project);
+            let branch = d.session.git_branch.clone();
+            let (started, updated) = (d.session.started_ts, d.session.updated_ts);
+            tokio::task::spawn_blocking(move || {
+                crate::agents::gitlink::commits_for(
+                    &project,
+                    branch.as_deref(),
+                    started,
+                    updated,
+                    crate::agents::gitlink::DEFAULT_PAD_MS,
+                )
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| dto::CommitLinkView {
+                hash: c.hash,
+                summary: c.summary,
+                ts: c.ts,
+            })
+            .collect()
+        }
+        _ => Vec::new(),
+    };
     let mut session = agent_session_view(&d.session, pii.len() as u32);
     session.preserved = preserved;
     session.source_deleted = source_deleted;
@@ -2329,6 +2362,7 @@ pub async fn agents_detail(
         session,
         messages,
         pii,
+        linked_commits,
     }))
 }
 
@@ -2543,6 +2577,7 @@ pub async fn archive_verify(
 ) -> Result<Json<dto::ArchiveIntegrityView>, Response> {
     let v = state.store.verify_archive().await.map_err(internal)?;
     Ok(Json(dto::ArchiveIntegrityView {
+        proof_statement: proof_statement(&v),
         entries: v.entries,
         sessions: v.sessions,
         intact: v.intact,
@@ -2551,6 +2586,64 @@ pub async fn archive_verify(
         head_digest: v.head_digest,
         head_ts: v.head_ts,
     }))
+}
+
+/// The integrity verdict as one sentence a person can read out loud.
+///
+/// A bare `intact: true` is a green tick with no argument behind it. This
+/// states what was recomputed, what value anchors it and when, and — on
+/// failure — exactly where the chain broke and which sessions were altered, so
+/// the user never has to translate digests into meaning themselves.
+fn proof_statement(v: &crate::store::ArchiveIntegrity) -> String {
+    if v.entries == 0 {
+        return "The integrity chain has no entries yet. The next snapshot writes the first \
+                entries; sessions preserved by an older version predate the chain."
+            .to_string();
+    }
+    if v.intact {
+        let head = v.head_digest.as_deref().unwrap_or_default();
+        let head_short: String = head.chars().take(16).collect();
+        return format!(
+            "Every one of the {} chain entries across {} sessions recomputed correctly. \
+             The head digest is {}… committed at {}. Any edit to archived content after \
+             capture would break this chain.",
+            v.entries,
+            v.sessions,
+            head_short,
+            fmt_utc(v.head_ts.unwrap_or_default()),
+        );
+    }
+    let altered = if v.altered_sessions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Altered since capture: {}.",
+            v.altered_sessions.join(", ")
+        )
+    };
+    format!(
+        "Integrity verification FAILED: {}.{altered} The archived content no longer matches \
+         what was recorded when it was preserved.",
+        v.broken_at.as_deref().unwrap_or("the chain does not recompute"),
+    )
+}
+
+/// Unix millis as a compact UTC stamp (`2026-07-28 14:03 UTC`). UTC on purpose:
+/// a proof statement may be quoted to someone in another timezone, and a local
+/// wall-clock time would make two people read two different moments.
+fn fmt_utc(ms: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .map(|t| {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute()
+            )
+        })
+        .unwrap_or_else(|_| format!("unix {ms} ms"))
 }
 
 /// `POST /api/archive/audit` — write an audit bundle to a folder on disk.

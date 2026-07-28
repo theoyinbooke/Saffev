@@ -207,7 +207,15 @@ pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Resu
         .filter(|f| ids.contains(f.record_id.as_str()))
         .collect();
 
-    let exposure = crate::exposure::check(cfg.ports.proxy).await;
+    // The ENGINE's port, mode-aware — the exposure verdict is about whether
+    // the ENGINE is reachable from the network, and probing the proxy port
+    // instead falsely reassured the reviewer (G4 critic: in Cooperative mode
+    // the engine can be world-bound while the proxy is loopback).
+    let engine_port = match cfg.mode {
+        crate::config::Mode::Gateway => cfg.ports.shadow,
+        crate::config::Mode::Cooperative => cfg.ports.upstream,
+    };
+    let exposure = crate::exposure::check(engine_port).await;
     let (exposure_line, exposure_known) = match &exposure {
         Ok(e) => (e.detail.clone(), true),
         Err(_) => (String::new(), false),
@@ -1324,9 +1332,6 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     // page. Purely a cache fill: no writes, nothing user-visible, and failure
     // just means the page warms lazily as before.
     {
-        let store = proxy_state.store.clone();
-        let cfg = proxy_state.config.load();
-        let snapshot_after_warm = cfg.archive.enabled && cfg.archive.auto;
         tokio::spawn(async move {
             let t = std::time::Instant::now();
             let n = tokio::task::spawn_blocking(|| crate::agents::all_sessions().len())
@@ -1336,50 +1341,29 @@ async fn run_servers(cfg: &Config) -> Result<()> {
                 target: "saffev::agents",
                 "warmed session cache: {n} sessions in {:?}", t.elapsed()
             );
-
-            // Preservation: if auto-archive is on, snapshot the durable copy once
-            // the cache is warm, so the two passes do not read the same files
-            // twice. Off the hot path, fail-open.
-            if snapshot_after_warm {
-                match crate::agents::archive::Redaction::from_config(&cfg) {
-                    // Redaction was requested but its patterns will not compile.
-                    // Skip the snapshot entirely: archiving raw text under a
-                    // "redact" setting is worse than not archiving at all.
-                    Err(e) => tracing::warn!(
-                        target: "saffev::archive",
-                        "auto snapshot skipped — redaction is on but failed to build: {e}"
-                    ),
-                    Ok(redaction) => {
-                        if let Err(e) =
-                            crate::agents::archive::run_snapshot(&store, redaction).await
-                        {
-                            tracing::warn!(target: "saffev::archive", "auto snapshot failed: {e}");
-                        }
-                    }
-                }
-            }
         });
     }
 
-    // Background maintenance: retention pruning + periodic archive snapshots.
+    // Background maintenance: retention pruning.
     //
-    // Both are promised by the Settings copy ("how long exchanges are kept
-    // before pruning"; "snapshot on start and periodically") and both are
-    // live-reloadable: every tick re-reads the config handle, so changing
-    // retention or archive.auto applies without a restart. Fail-open: a failed
-    // pass is logged to the diagnostic log and the next tick tries again;
-    // nothing here can touch the request hot path.
+    // Promised by the Settings copy ("how long exchanges are kept before
+    // pruning") and live-reloadable: every tick re-reads the config handle, so
+    // changing retention applies without a restart. Fail-open: a failed pass is
+    // logged to the diagnostic log and the next tick tries again; nothing here
+    // can touch the request hot path. Auto archive snapshots used to live on
+    // this hourly tick too, but hourly is the wrong cadence for a freshness
+    // promise — they moved to the Studio's own scheduler
+    // (`studio::spawn_archive_scheduler`, default every 5 minutes, first tick
+    // immediate = the on-start snapshot).
     {
         let store = proxy_state.store.clone();
         let config = proxy_state.config.clone();
         tokio::spawn(async move {
             // First retention pass shortly after start — the DB may already be
-            // over policy from a long downtime. Snapshots skip this early pass:
-            // the cache-warm task above already takes one when auto is on.
+            // over policy from a long downtime.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let cfg = config.load();
-            let (prune, _) = maintenance_plan(&cfg);
-            if prune {
+            if maintenance_plan(&cfg) {
                 if let Err(e) = store.enforce_retention(cfg.retention).await {
                     tracing::warn!(target: "saffev::store", "retention pass failed: {e}");
                 }
@@ -1392,31 +1376,9 @@ async fn run_servers(cfg: &Config) -> Result<()> {
             loop {
                 tick.tick().await;
                 let cfg = config.load();
-                let (prune, snapshot) = maintenance_plan(&cfg);
-                if prune {
+                if maintenance_plan(&cfg) {
                     if let Err(e) = store.enforce_retention(cfg.retention).await {
                         tracing::warn!(target: "saffev::store", "retention pass failed: {e}");
-                    }
-                }
-                if snapshot {
-                    match crate::agents::archive::Redaction::from_config(&cfg) {
-                        // Redaction is on but will not compile: refuse to archive
-                        // raw text under a "redact" setting (same stance as the
-                        // startup snapshot).
-                        Err(e) => tracing::warn!(
-                            target: "saffev::archive",
-                            "periodic snapshot skipped — redaction failed to build: {e}"
-                        ),
-                        Ok(redaction) => {
-                            if let Err(e) =
-                                crate::agents::archive::run_snapshot(&store, redaction).await
-                            {
-                                tracing::warn!(
-                                    target: "saffev::archive",
-                                    "periodic snapshot failed: {e}"
-                                );
-                            }
-                        }
                     }
                 }
             }
@@ -2466,21 +2428,19 @@ fn controller_can_adopt(cfg: &Config) -> bool {
     cfg.mode == Mode::Gateway && cfg!(target_os = "linux")
 }
 
-/// Cadence of the background maintenance loop (retention + auto-snapshots).
-/// Hourly: retention policies are day/size-grained and a snapshot pass over a
-/// warm cache is ~ms, so finer ticks buy nothing.
+/// Cadence of the background maintenance loop (retention pruning). Hourly:
+/// retention policies are day/size-grained, so finer ticks buy nothing. Archive
+/// snapshots run on their own, much faster clock — see
+/// `studio::spawn_archive_scheduler`.
 const MAINTENANCE_TICK_SECS: u64 = 60 * 60;
 
-/// What a maintenance tick should do under `cfg`: `(prune, snapshot)`.
+/// Whether a maintenance tick should prune under `cfg`.
 ///
 /// Pure gate logic, split out so it is testable without running the loop:
-/// - prune unless retention is `Unlimited` (skipping avoids opening a writer
-///   connection just to no-op);
-/// - snapshot only when Preservation is on AND auto-snapshots are on.
-fn maintenance_plan(cfg: &Config) -> (bool, bool) {
-    let prune = !matches!(cfg.retention, crate::config::Retention::Unlimited);
-    let snapshot = cfg.archive.enabled && cfg.archive.auto;
-    (prune, snapshot)
+/// prune unless retention is `Unlimited` (skipping avoids opening a writer
+/// connection just to no-op).
+fn maintenance_plan(cfg: &Config) -> bool {
+    !matches!(cfg.retention, crate::config::Retention::Unlimited)
 }
 
 /// Does a detected engine match the requested [`EngineArg`]?
@@ -2518,33 +2478,25 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn maintenance_plan_gates_prune_and_snapshot() {
+    fn maintenance_plan_gates_prune() {
         use crate::config::Retention;
 
         let mut cfg = Config::default();
 
-        // Defaults: 30-day retention prunes; archive off → no snapshot.
+        // Defaults: 30-day retention prunes.
         cfg.retention = Retention::default();
-        cfg.archive.enabled = false;
-        cfg.archive.auto = true;
-        assert_eq!(maintenance_plan(&cfg), (true, false));
+        assert!(maintenance_plan(&cfg));
 
         // Unlimited retention must not open a writer just to no-op.
         cfg.retention = Retention::Unlimited;
-        assert_eq!(maintenance_plan(&cfg), (false, false));
-
-        // Preservation on + auto on → snapshot.
-        cfg.archive.enabled = true;
-        cfg.archive.auto = true;
-        assert_eq!(maintenance_plan(&cfg), (false, true));
-
-        // Preservation on but auto off → manual-only, no periodic snapshot.
-        cfg.archive.auto = false;
-        assert_eq!(maintenance_plan(&cfg), (false, false));
+        assert!(!maintenance_plan(&cfg));
 
         // Size-based retention prunes too.
         cfg.retention = Retention::Size { mb: 512 };
-        assert_eq!(maintenance_plan(&cfg), (true, false));
+        assert!(maintenance_plan(&cfg));
+
+        // (Archive snapshot gating lives in `studio::should_run` now, next to
+        // the scheduler that uses it.)
     }
 
     #[test]
