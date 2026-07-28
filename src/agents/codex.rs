@@ -304,9 +304,24 @@ impl CodexReader {
         }
 
         let id = id.unwrap_or_else(|| {
-            path.file_stem()
+            // Fallback for rollouts without a session_meta record. The
+            // filename is `rollout-<timestamp>-<uuid>`; the id is the
+            // trailing uuid — keeping the timestamp prefix broke the
+            // title-index join and produced non-uuid ids (G2 round-1
+            // critic).
+            let stem = path
+                .file_stem()
                 .map(|s| s.to_string_lossy().replace("rollout-", ""))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            match stem.len().checked_sub(36) {
+                Some(cut)
+                    if stem.is_char_boundary(cut)
+                        && super::claude_code::looks_like_uuid(&stem[cut..]) =>
+                {
+                    stem[cut..].to_string()
+                }
+                _ => stem,
+            }
         });
         if first_ts == 0 {
             first_ts = last_ts;

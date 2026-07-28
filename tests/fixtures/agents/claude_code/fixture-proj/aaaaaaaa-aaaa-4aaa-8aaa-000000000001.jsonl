@@ -1,3 +1,9 @@
+{"type":"mode","timestamp":"2026-07-15T08:59:59.000Z","mode":"default","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-000000000001"}
 {"type":"user","timestamp":"2026-07-15T09:00:00.000Z","cwd":"/home/dev/fixture-proj","gitBranch":"main","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-000000000001","message":{"role":"user","content":"add a healthcheck endpoint"}}
+{"type":"file-history-snapshot","timestamp":"2026-07-15T09:00:01.000Z","messageId":"m1","snapshot":{"trackedFileBackups":{}},"isSnapshotUpdate":false}
+{"type":"permission-mode","timestamp":"2026-07-15T09:00:02.000Z","permissionMode":"acceptEdits"}
+{"type":"attachment","timestamp":"2026-07-15T09:00:03.000Z","attachment":{"type":"file","path":"src/api.rs"}}
+{"type":"last-prompt","timestamp":"2026-07-15T09:00:04.000Z","prompt":"add a healthcheck endpoint"}
 {"type":"assistant","timestamp":"2026-07-15T09:00:05.000Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"Adding /healthz now."},{"type":"tool_use","id":"tu1","name":"Edit","input":{"file":"src/api.rs"}}],"usage":{"input_tokens":1200,"output_tokens":340,"cache_read_input_tokens":90,"cache_creation_input_tokens":10}}}
+{"type":"queue-operation","timestamp":"2026-07-15T09:00:06.000Z","operation":"dequeue"}
 {"type":"ai-title","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-000000000001","aiTitle":"Add healthcheck endpoint"}

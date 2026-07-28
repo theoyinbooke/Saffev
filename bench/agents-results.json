@@ -41,10 +41,10 @@
         "session_id": true,
         "timestamps": true,
         "title": true,
-        "token_counts": "absent_in_format"
+        "token_counts": "present_but_unpopulated"
       },
       "notes": [
-        "format carries no token usage"
+        "tokenCount fields exist but are never populated in real stores"
       ],
       "sessions_found": 1
     },

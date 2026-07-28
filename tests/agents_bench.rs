@@ -14,9 +14,10 @@
 //! It emits `bench/agents-results.json`, the coverage-table artifact
 //! (tool → fields), and enforces floors so coverage can only regress loudly.
 //!
-//! Honesty rule: a field the tool's on-disk format does not carry (Cursor
-//! and VS Code store no token usage locally) is recorded as
-//! `"absent_in_format"` — never claimed, never silently skipped.
+//! Honesty rule: token coverage is three-valued — proven against fixture
+//! numbers, `absent_in_format` (VS Code: no token fields at all), or
+//! `present_but_unpopulated` (Cursor: tokenCount fields exist, never
+//! filled) — never claimed, never silently skipped.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,21 @@ fn raw_id(session: &AgentSession) -> &str {
     session.id.split_once(':').map(|(_, r)| r).unwrap_or(&session.id)
 }
 
+/// Token-count coverage — three-valued because honesty demands it: `Proven`
+/// against fixture numbers; `AbsentInFormat` when the on-disk format carries
+/// no token fields at all (VS Code, verified); `PresentButUnpopulated` when
+/// the fields exist but are never filled (Cursor — the round-1 critic
+/// scanned 1,351 real bubbles: every tokenCount was zero). The distinction
+/// matters: if Cursor starts populating them, "absent" would hide it.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum TokenCoverage {
+    #[default]
+    Unchecked,
+    Proven(bool),
+    AbsentInFormat,
+    PresentButUnpopulated,
+}
+
 /// The rubric-field checklist for one tool, serialized into the artifact.
 #[derive(Default)]
 struct Coverage {
@@ -67,7 +83,7 @@ struct Coverage {
     model: bool,
     timestamps: bool,
     roles: bool,
-    token_counts: Option<bool>, // None = absent_in_format
+    token_counts: TokenCoverage,
     corrupted_nonfatal: bool,
     notes: Vec<String>,
 }
@@ -84,8 +100,12 @@ impl Coverage {
                 "timestamps": self.timestamps,
                 "per_message_roles": self.roles,
                 "token_counts": match self.token_counts {
-                    Some(b) => serde_json::json!(b),
-                    None => serde_json::json!("absent_in_format"),
+                    TokenCoverage::Proven(b) => serde_json::json!(b),
+                    TokenCoverage::AbsentInFormat => serde_json::json!("absent_in_format"),
+                    TokenCoverage::PresentButUnpopulated => {
+                        serde_json::json!("present_but_unpopulated")
+                    }
+                    TokenCoverage::Unchecked => serde_json::json!("UNCHECKED"),
                 },
             },
             "corrupted_nonfatal": self.corrupted_nonfatal,
@@ -93,7 +113,8 @@ impl Coverage {
         })
     }
 
-    /// Every rubric field proven (token counts may be honestly absent).
+    /// Every rubric field proven (token counts may be honestly absent or
+    /// unpopulated — but never unchecked or failing).
     fn complete(&self) -> bool {
         self.session_id
             && self.title
@@ -101,7 +122,10 @@ impl Coverage {
             && self.model
             && self.timestamps
             && self.roles
-            && self.token_counts != Some(false)
+            && !matches!(
+                self.token_counts,
+                TokenCoverage::Proven(false) | TokenCoverage::Unchecked
+            )
             && self.corrupted_nonfatal
     }
 }
@@ -154,7 +178,7 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("000000000001"))
             .expect("claude_code: good session listed");
         check_common(&mut cov, &reader, good, "claude_code");
-        cov.token_counts = Some(
+        cov.token_counts = TokenCoverage::Proven(
             good.input_tokens == 1200 && good.output_tokens == 340 && good.cache_tokens == 100,
         );
         assert_eq!(good.git_branch.as_deref(), Some("main"));
@@ -164,7 +188,9 @@ fn agents_fixture_coverage() {
             .iter()
             .find(|s| s.id.ends_with("000000000002"))
             .expect("claude_code: corrupted session still listed");
-        cov.corrupted_nonfatal = hurt.message_count == 1;
+        // The surviving record carries a timestamp — a partially-degraded
+        // session must not report epoch-0 (round-1 critic's degenerate edge).
+        cov.corrupted_nonfatal = hurt.message_count == 1 && hurt.started_ts > 0;
         table.insert("claude_code".into(), cov.to_json());
         complete += usize::from(cov.complete());
     }
@@ -185,7 +211,7 @@ fn agents_fixture_coverage() {
         assert_eq!(good.title.as_deref(), Some("Wire healthcheck"), "title from session_index");
         assert_eq!(good.git_branch.as_deref(), Some("feature/g2"));
         // OpenAI convention: input_tokens is TOTAL; adapter must subtract cache.
-        cov.token_counts = Some(
+        cov.token_counts = TokenCoverage::Proven(
             good.input_tokens == 1100 && good.output_tokens == 260 && good.cache_tokens == 400,
         );
         let hurt = sessions
@@ -193,6 +219,9 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("000000000004"))
             .expect("codex: corrupted rollout still listed");
         cov.corrupted_nonfatal = hurt.message_count == 1;
+        // No session_meta in this rollout — the fallback id must be the bare
+        // trailing uuid, not the whole timestamped stem (round-1 critic).
+        assert_eq!(hurt.id, "codex:dddddddd-dddd-4ddd-8ddd-000000000004");
         table.insert("codex".into(), cov.to_json());
         complete += usize::from(cov.complete());
     }
@@ -211,7 +240,7 @@ fn agents_fixture_coverage() {
             .expect("opencode: good session listed");
         check_common(&mut cov, &reader, good, "opencode");
         assert_eq!(good.model.as_deref(), Some("anthropic/claude-opus-4-8"));
-        cov.token_counts = Some(
+        cov.token_counts = TokenCoverage::Proven(
             good.input_tokens == 900 && good.output_tokens == 150 && good.cache_tokens == 150,
         );
         // Corrupted data blob: json_extract degrades to NULL, session still
@@ -238,9 +267,12 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("comp-0001"))
             .expect("cursor: good session listed");
         check_common(&mut cov, &reader, good, "cursor");
-        // Cursor stores no token usage locally — recorded, not claimed.
-        cov.token_counts = None;
-        cov.notes.push("format carries no token usage".into());
+        // Cursor's bubbles carry tokenCount fields but they are never
+        // populated (round-1 critic verified against 1,351 real bubbles) —
+        // recorded as such, not claimed and not hidden behind "absent".
+        cov.token_counts = TokenCoverage::PresentButUnpopulated;
+        cov.notes
+            .push("tokenCount fields exist but are never populated in real stores".into());
         // Corrupted composer blob: skipped in list, nothing fatal, the good
         // session is unaffected.
         cov.corrupted_nonfatal = sessions.iter().all(|s| !s.id.contains("comp-broken"));
@@ -262,7 +294,7 @@ fn agents_fixture_coverage() {
             .expect("vscode: good session listed");
         check_common(&mut cov, &reader, good, "vscode");
         assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
-        cov.token_counts = None;
+        cov.token_counts = TokenCoverage::AbsentInFormat;
         cov.notes.push("format carries no token usage".into());
         let hurt = sessions
             .iter()
@@ -271,6 +303,32 @@ fn agents_fixture_coverage() {
         cov.corrupted_nonfatal = hurt.message_count >= 1;
         table.insert("vscode".into(), cov.to_json());
         complete += usize::from(cov.complete());
+    }
+
+    // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
+    // The .sql fixtures exercise blob-level corruption only; the snapshot
+    // machinery's real hazards are a truncated database and a non-SQLite
+    // file. Both must degrade to an empty list, never a panic.
+    {
+        let dir = std::env::temp_dir().join(format!("saffev-g2-{}", uuid_ish()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good_db = build_db("cursor/state.sql", "whole.vscdb");
+        let bytes = std::fs::read(&good_db).unwrap();
+        let truncated = dir.join("truncated.vscdb");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        let not_sqlite = dir.join("not-a-db.vscdb");
+        std::fs::write(&not_sqlite, b"this is just text pretending to be a database").unwrap();
+        for db in [truncated.clone(), not_sqlite.clone()] {
+            assert!(
+                CursorReader::with_db(db.clone()).list_sessions().is_empty(),
+                "cursor: binary-corrupt db must degrade to empty, got sessions from {db:?}"
+            );
+            assert!(
+                OpenCodeReader::with_db(db.clone()).list_sessions().is_empty(),
+                "opencode: binary-corrupt db must degrade to empty, got sessions from {db:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- Artifact ----------------------------------------------------------

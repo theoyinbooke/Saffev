@@ -372,7 +372,7 @@ fn is_injected_prompt(s: &str) -> bool {
 
 /// Cheap check that a filename stem is a UUID (`8-4-4-4-12` hex), to skip
 /// non-session `.jsonl` files (plugin/index) sitting in a project dir.
-fn looks_like_uuid(s: &str) -> bool {
+pub(super) fn looks_like_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
         && b.iter().enumerate().all(|(i, &c)| {
