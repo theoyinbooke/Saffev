@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use saffev::agents::aider::AiderReader;
 use saffev::agents::claude_code::ClaudeCodeReader;
 use saffev::agents::cline::ClineReader;
 use saffev::agents::codex::CodexReader;
@@ -451,6 +452,49 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Aider (round 7 — honest-partial: markdown, no ids on disk) --------
+    {
+        let reader = AiderReader::with_roots(vec![fixture("aider")]);
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.title.as_deref().is_some_and(|t| t.contains("healthcheck endpoint")))
+            .expect("aider: good session listed");
+        check_common(&mut cov, &reader, good, "aider");
+        assert_eq!(good.model.as_deref(), Some("gpt-4o"));
+        // k-rounded by aider itself — approximate, and recorded as such.
+        cov.token_counts =
+            TokenCoverage::Proven(good.input_tokens == 4200 && good.output_tokens == 312);
+        cov.notes.push(
+            "ids synthesized (none on disk); tokens k-rounded above 1000 by aider; \
+             per-message timestamps absent (messages inherit the session header)"
+                .into(),
+        );
+        // Second session in the same file: model suffixes stripped, Weak
+        // model NOT mistaken for the main model.
+        let s2 = sessions
+            .iter()
+            .find(|s| s.title.as_deref().is_some_and(|t| t.contains("tighten")))
+            .expect("aider: second session listed");
+        assert_eq!(s2.model.as_deref(), Some("claude-sonnet-4-6"));
+        // Corrupted project: binary noise + unparseable token/model lines are
+        // just assistant text / ignored announcements — never fatal.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.title.as_deref().is_some_and(|t| t.contains("before the noise")))
+            .expect("aider: corrupted session still listed");
+        // 1 user + 2 assistant blocks (the `> ` announcement lines split the
+        // assistant text — correct per aider's own reading rules).
+        cov.corrupted_nonfatal =
+            hurt.message_count == 3 && hurt.input_tokens == 0 && hurt.model.is_none();
+        table.insert("aider".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -498,7 +542,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 8,
-        "adapter coverage regressed: {complete} of 8 complete"
+        complete >= 9,
+        "adapter coverage regressed: {complete} of 9 complete"
     );
 }

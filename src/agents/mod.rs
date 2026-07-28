@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+pub mod aider;
 pub mod archive;
 pub mod claude_code;
 pub mod cline;
@@ -54,6 +55,8 @@ pub enum AgentTool {
     Copilot,
     /// Cline (VS Code globalStorage `saoudrizwan.claude-dev/tasks/<id>/`).
     Cline,
+    /// Aider (per-project `.aider.chat.history.md` markdown transcripts).
+    Aider,
 }
 
 impl AgentTool {
@@ -68,6 +71,7 @@ impl AgentTool {
             AgentTool::Gemini => "gemini",
             AgentTool::Copilot => "copilot",
             AgentTool::Cline => "cline",
+            AgentTool::Aider => "aider",
         }
     }
     /// Human label for the UI.
@@ -81,6 +85,7 @@ impl AgentTool {
             AgentTool::Gemini => "Gemini CLI",
             AgentTool::Copilot => "Copilot CLI",
             AgentTool::Cline => "Cline",
+            AgentTool::Aider => "Aider",
         }
     }
 }
@@ -184,6 +189,7 @@ pub fn split_id(id: &str) -> Option<(AgentTool, &str)> {
         "gemini" => AgentTool::Gemini,
         "copilot" => AgentTool::Copilot,
         "cline" => AgentTool::Cline,
+        "aider" => AgentTool::Aider,
         _ => return None,
     };
     Some((tool, raw))
@@ -367,6 +373,7 @@ pub fn readers() -> Vec<Box<dyn AgentReader>> {
         Box::new(gemini::GeminiReader::new()),
         Box::new(copilot::CopilotReader::new()),
         Box::new(cline::ClineReader::new()),
+        Box::new(aider::AiderReader::new()),
     ]
 }
 

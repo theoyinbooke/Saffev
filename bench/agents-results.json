@@ -4,6 +4,22 @@
   "fixtures": "tests/fixtures/agents/<tool>/ (committed, sanitized; SQLite tools as reviewable .sql)",
   "harness": "agents_bench v1 (G2 loop 1 — docs/gauntlets/GAUNTLETS.md)",
   "tools": {
+    "aider": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [
+        "ids synthesized (none on disk); tokens k-rounded above 1000 by aider; per-message timestamps absent (messages inherit the session header)"
+      ],
+      "sessions_found": 3
+    },
     "claude_code": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -121,5 +137,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 8
+  "tools_covered": 9
 }
