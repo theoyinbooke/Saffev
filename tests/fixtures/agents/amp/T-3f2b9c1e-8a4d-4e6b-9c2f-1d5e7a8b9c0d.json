@@ -1,0 +1,42 @@
+{
+  "v": 7,
+  "id": "T-3f2b9c1e-8a4d-4e6b-9c2f-1d5e7a8b9c0d",
+  "created": 1753660000123,
+  "title": "Fix the flaky attribution test",
+  "nextMessageId": 3,
+  "messages": [
+    {
+      "role": "user",
+      "messageId": 0,
+      "content": [{ "type": "text", "text": "run the tests and fix the flake" }],
+      "meta": { "sentAt": 1753660000123 }
+    },
+    {
+      "role": "assistant",
+      "messageId": 1,
+      "content": [
+        { "type": "thinking", "thinking": "run the suite first", "signature": "sig" },
+        { "type": "text", "text": "Running the suite." },
+        { "type": "tool_use", "id": "toolu_01Xa9k2m", "name": "Bash", "input": { "cmd": "cargo test" } }
+      ],
+      "state": { "type": "complete", "stopReason": "tool_use" },
+      "usage": {
+        "inputTokens": 512, "outputTokens": 96,
+        "cacheCreationInputTokens": 2048, "cacheReadInputTokens": 84000,
+        "totalInputTokens": 86560, "credits": 0.42, "model": "claude-sonnet-4-5"
+      }
+    },
+    {
+      "role": "user",
+      "messageId": 2,
+      "content": [
+        { "type": "tool_result", "toolUseID": "toolu_01Xa9k2m",
+          "run": { "status": "done", "result": { "output": "test result: ok. 42 passed" } } }
+      ],
+      "meta": { "sentAt": 1753660042000 }
+    },
+    { "role": "info", "messageId": 3, "content": [{ "type": "summary", "summary": { "type": "message", "summary": "noise marker" } }] }
+  ],
+  "usageLedger": { "events": [{ "id": "b1a2c3d4-0000-4000-8000-000000000001", "timestamp": "2026-07-28T01:06:41.500Z", "model": "claude-sonnet-4-5", "credits": 0.42, "tokens": { "input": 512, "output": 96 }, "operationType": "inference" }] },
+  "env": { "initial": { "trees": [{ "displayName": "fixture-proj", "uri": "file:///home/dev/fixture-proj", "repository": { "url": "https://github.com/dev/fixture-proj" } }] } }
+}

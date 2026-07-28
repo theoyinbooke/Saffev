@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 pub mod aider;
+pub mod amp;
 pub mod archive;
 pub mod claude_code;
 pub mod cline;
@@ -60,6 +61,8 @@ pub enum AgentTool {
     Aider,
     /// Goose / Block (`~/.local/share/goose/sessions/sessions.db` SQLite).
     Goose,
+    /// Amp / Sourcegraph (`~/.local/share/amp/threads/T-*.json`).
+    Amp,
 }
 
 impl AgentTool {
@@ -76,6 +79,7 @@ impl AgentTool {
             AgentTool::Cline => "cline",
             AgentTool::Aider => "aider",
             AgentTool::Goose => "goose",
+            AgentTool::Amp => "amp",
         }
     }
     /// Human label for the UI.
@@ -91,6 +95,7 @@ impl AgentTool {
             AgentTool::Cline => "Cline",
             AgentTool::Aider => "Aider",
             AgentTool::Goose => "Goose",
+            AgentTool::Amp => "Amp",
         }
     }
 }
@@ -196,6 +201,7 @@ pub fn split_id(id: &str) -> Option<(AgentTool, &str)> {
         "cline" => AgentTool::Cline,
         "aider" => AgentTool::Aider,
         "goose" => AgentTool::Goose,
+        "amp" => AgentTool::Amp,
         _ => return None,
     };
     Some((tool, raw))
@@ -381,6 +387,7 @@ pub fn readers() -> Vec<Box<dyn AgentReader>> {
         Box::new(cline::ClineReader::new()),
         Box::new(aider::AiderReader::new()),
         Box::new(goose::GooseReader::new()),
+        Box::new(amp::AmpReader::new()),
     ]
 }
 

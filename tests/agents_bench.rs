@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use saffev::agents::aider::AiderReader;
+use saffev::agents::amp::AmpReader;
 use saffev::agents::claude_code::ClaudeCodeReader;
 use saffev::agents::cline::ClineReader;
 use saffev::agents::codex::CodexReader;
@@ -539,6 +540,44 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Amp (round 9 — eleventh tool, margin above the bar) ---------------
+    {
+        let reader = AmpReader::with_root(fixture("amp"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("1d5e7a8b9c0d"))
+            .expect("amp: good thread listed");
+        check_common(&mut cov, &reader, good, "amp");
+        assert_eq!(good.title.as_deref(), Some("Fix the flaky attribution test"));
+        assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
+        // Per-message usage, Anthropic camelCase: inputTokens excludes cache.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == 512
+                && good.output_tokens == 96
+                && good.cache_tokens == 2048 + 84000,
+        );
+        // The info/summary marker message is noise, not a turn.
+        assert_eq!(good.message_count, 2);
+        cov.notes.push(
+            "local threads dir is a mirror; pre-Nov-2025 threads may exist only on ampcode.com"
+                .into(),
+        );
+        let detail = reader
+            .session_detail(&format!("T-{}", "3f2b9c1e-8a4d-4e6b-9c2f-1d5e7a8b9c0d"))
+            .expect("detail");
+        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        // Corrupted (truncated) thread file: skipped, never fatal.
+        cov.corrupted_nonfatal = sessions.iter().all(|s| !s.id.ends_with("T-corrupt"));
+        table.insert("amp".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -590,7 +629,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 10,
-        "adapter coverage regressed: {complete} of 10 complete"
+        complete >= 11,
+        "adapter coverage regressed: {complete} of 11 complete"
     );
 }

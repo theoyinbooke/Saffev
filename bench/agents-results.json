@@ -20,6 +20,22 @@
       ],
       "sessions_found": 3
     },
+    "amp": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [
+        "local threads dir is a mirror; pre-Nov-2025 threads may exist only on ampcode.com"
+      ],
+      "sessions_found": 1
+    },
     "claude_code": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -153,5 +169,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 10
+  "tools_covered": 11
 }
