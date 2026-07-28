@@ -341,12 +341,13 @@ fn agents_fixture_coverage() {
             "gemini: subagent thread must not list"
         );
         // Corrupted variant: garbage + binary + truncated lines skipped, the
-        // $rewindTo honored — the abandoned turn is gone, two turns survive.
+        // $rewindTo honored INCLUSIVELY (real semantics: the target turn is
+        // removed too — round-3 critic) — only the first user turn survives.
         let hurt = sessions
             .iter()
             .find(|s| s.id.ends_with("00000000000b"))
             .expect("gemini: corrupted session still listed");
-        cov.corrupted_nonfatal = hurt.message_count == 2 && hurt.started_ts > 0;
+        cov.corrupted_nonfatal = hurt.message_count == 1 && hurt.started_ts > 0;
         table.insert("gemini".into(), cov.to_json());
         complete += usize::from(cov.complete());
     }

@@ -6,8 +6,10 @@
 //! * **v0.39+ (current)** — append-only JSONL. First line is a metadata
 //!   record (`sessionId`, `projectHash`, `startTime`, `lastUpdated`, `kind`);
 //!   message lines are full `MessageRecord`s; `{"$set":{…}}` lines patch the
-//!   metadata; `{"$rewindTo":"<messageId>"}` discards everything after that
-//!   message. When a message mutates (tokens attach, tool result arrives) the
+//!   metadata (a `$set` carrying `messages` is a CHECKPOINT that replaces the
+//!   whole message map); `{"$rewindTo":"<messageId>"}` discards that message
+//!   AND everything after it (inclusive — the target is the turn being
+//!   redone). When a message mutates (tokens attach, tool result arrives) the
 //!   WHOLE record is re-appended with the same `id` — readers dedupe by id,
 //!   last write wins, original position kept. Summing tokens without that
 //!   dedupe double-counts.
@@ -82,9 +84,17 @@ impl GeminiReader {
                 let name = f.file_name().to_string_lossy().to_string();
                 let is_session = name.starts_with("session-")
                     && (name.ends_with(".jsonl") || name.ends_with(".json"));
-                if is_session {
-                    out.push((p, pdir.clone()));
+                if !is_session {
+                    continue;
                 }
+                // Resuming a legacy `.json` migrates it by appending `l` to
+                // the FILENAME (`x.json` → `x.jsonl`, same stem). If the
+                // migrated twin exists, the `.json` is superseded — listing
+                // both would double-count the session (G2 round-3 critic).
+                if name.ends_with(".json") && p.with_extension("jsonl").is_file() {
+                    continue;
+                }
+                out.push((p, pdir.clone()));
             }
         }
         out
@@ -141,11 +151,31 @@ impl GeminiReader {
                     if let Some(s) = set.get("summary").and_then(Value::as_str) {
                         summary = Some(s.to_string());
                     }
+                    // A `$set` carrying a `messages` array is a CHECKPOINT:
+                    // the real reader clears and rebuilds the message map
+                    // from it (G2 round-3 critic — keeping pre-checkpoint
+                    // messages over-counts turns and tokens).
+                    if let Some(msgs) = set.get("messages").and_then(Value::as_array) {
+                        order.clear();
+                        by_id.clear();
+                        for m in msgs {
+                            if let Some(id) = m.get("id").and_then(Value::as_str) {
+                                if !by_id.contains_key(id) {
+                                    order.push(id.to_string());
+                                }
+                                by_id.insert(id.to_string(), m.clone());
+                            }
+                        }
+                    }
                     continue;
                 }
                 if let Some(target) = v.get("$rewindTo").and_then(Value::as_str) {
+                    // INCLUSIVE: the real source removes "all messages from
+                    // (and including) the specified ID" — the target is the
+                    // message being redone (G2 round-3 critic; the first cut
+                    // kept it and over-counted a turn per rewind).
                     if let Some(pos) = order.iter().position(|id| id == target) {
-                        for dropped in order.drain(pos + 1..) {
+                        for dropped in order.drain(pos..) {
                             by_id.remove(&dropped);
                         }
                     }
@@ -159,14 +189,22 @@ impl GeminiReader {
                     by_id.insert(id.to_string(), v);
                     continue;
                 }
-                if v.get("sessionId").is_some() {
-                    // Metadata record (first line).
-                    session_id = v
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                        .or(session_id);
-                    absorb_meta(&v, &mut start_ts, &mut updated_ts);
+                // Metadata record — the real `isPartialMetadataRecord`
+                // requires BOTH sessionId and projectHash, and the CLI reads
+                // first-line metadata: first wins, later imposters don't
+                // rewrite the session identity (G2 round-3 critic).
+                if v.get("sessionId").is_some() && v.get("projectHash").is_some() {
+                    if session_id.is_none() {
+                        session_id = v
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        absorb_meta(&v, &mut start_ts, &mut updated_ts);
+                    } else {
+                        // Still absorb a later lastUpdated (monotonic max).
+                        let mut ignored_start = start_ts;
+                        absorb_meta(&v, &mut ignored_start, &mut updated_ts);
+                    }
                 }
             }
         } else {
@@ -195,7 +233,11 @@ impl GeminiReader {
 
         // Aggregate the FINAL (deduped, rewound) message set.
         let mut first_user: Option<String> = None;
-        let mut model_counts: HashMap<String, u32> = HashMap::new();
+        // (count, last-seen order) per model — the tie-break must be
+        // deterministic (a bare HashMap max flapped between runs; G2
+        // round-3 critic), and recency is the sensible tie-winner.
+        let mut model_counts: HashMap<String, (u32, usize)> = HashMap::new();
+        let mut model_seq = 0usize;
         let (mut inp, mut outp, mut cache) = (0u64, 0u64, 0u64);
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
         let mut messages: Vec<AgentMessage> = Vec::new();
@@ -234,16 +276,22 @@ impl GeminiReader {
                 "gemini" => {
                     msg_count += 1;
                     if let Some(model) = m.get("model").and_then(Value::as_str) {
-                        *model_counts.entry(model.to_string()).or_default() += 1;
+                        model_seq += 1;
+                        let e = model_counts.entry(model.to_string()).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 = model_seq;
                     }
                     if let Some(t) = m.get("tokens").filter(|t| !t.is_null()) {
                         // Gemini's `input` is the TOTAL prompt; `cached` is a
                         // subset of it (Codex convention — counting both
-                        // double-bills the cached portion). `thoughts` are
-                        // generated tokens, billed as output.
+                        // double-bills the cached portion). `tool` tokens
+                        // (toolUsePromptTokenCount) are prompt-side and NOT
+                        // included in `input` — they count as input.
+                        // `thoughts` are generated tokens, billed as output.
                         let total_in = t.get("input").and_then(Value::as_u64).unwrap_or(0);
                         let cached = t.get("cached").and_then(Value::as_u64).unwrap_or(0);
-                        inp += total_in.saturating_sub(cached);
+                        inp += total_in.saturating_sub(cached)
+                            + t.get("tool").and_then(Value::as_u64).unwrap_or(0);
                         cache += cached;
                         outp += t.get("output").and_then(Value::as_u64).unwrap_or(0)
                             + t.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
@@ -328,7 +376,7 @@ impl GeminiReader {
         });
         let model = model_counts
             .into_iter()
-            .max_by_key(|(_, n)| *n)
+            .max_by_key(|(_, (n, last))| (*n, *last))
             .map(|(m, _)| m);
         let title = summary
             .or_else(|| first_user.map(|t| super::claude_code::truncate(&t, 80)));
@@ -475,7 +523,11 @@ mod tests {
     }
 
     #[test]
-    fn rewind_discards_messages_after_target() {
+    fn rewind_is_inclusive_of_its_target() {
+        // Real semantics (chatRecordingService.ts): "All messages from (and
+        // including) the specified ID onwards are removed" — the target is
+        // the turn being redone (G2 round-3 critic caught the exclusive
+        // first cut).
         let dir = std::env::temp_dir().join(format!("saffev-gem-{}", uuid::Uuid::new_v4()));
         let chats = dir.join("proj/chats");
         std::fs::create_dir_all(&chats).unwrap();
@@ -483,16 +535,97 @@ mod tests {
         let lines = [
             r#"{"sessionId":"22223333-aaaa-4bbb-8ccc-000000000008","projectHash":"d","startTime":"2026-07-28T10:00:00.000Z","lastUpdated":"2026-07-28T10:00:00.000Z"}"#,
             r#"{"id":"m1","timestamp":"2026-07-28T10:00:01.000Z","type":"user","content":"first"}"#,
-            r#"{"id":"m2","timestamp":"2026-07-28T10:00:02.000Z","type":"gemini","content":"answer one","model":"gemini-2.5-flash"}"#,
+            // A TOKENED gemini turn that the rewind must also un-count.
+            r#"{"id":"m2","timestamp":"2026-07-28T10:00:02.000Z","type":"gemini","content":"answer one","model":"gemini-2.5-flash","tokens":{"input":1000,"output":50,"cached":0,"total":1050}}"#,
             r#"{"id":"m3","timestamp":"2026-07-28T10:00:03.000Z","type":"user","content":"abandoned turn"}"#,
             r#"{"$rewindTo":"m2"}"#,
             r#"{"id":"m4","timestamp":"2026-07-28T10:00:05.000Z","type":"user","content":"second try"}"#,
         ];
         std::fs::write(&p, lines.join("\n")).unwrap();
         let d = GeminiReader::parse(&p, &dir.join("proj"), true).expect("parses");
-        assert_eq!(d.session.message_count, 3, "rewound turn must not count");
+        assert_eq!(d.session.message_count, 2, "target turn must be rewound too");
+        assert_eq!(d.session.input_tokens, 0, "rewound tokens must not count");
+        assert!(!d.messages.iter().any(|m| m.content == "answer one"));
         assert!(!d.messages.iter().any(|m| m.content == "abandoned turn"));
         assert!(d.messages.iter().any(|m| m.content == "second try"));
+        // A rewind to a ghost id is a no-op, never fatal.
+        std::fs::write(&p, format!("{}\n{{\"$rewindTo\":\"ghost\"}}", lines.join("\n"))).unwrap();
+        assert!(GeminiReader::parse(&p, &dir.join("proj"), false).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_messages_is_a_checkpoint_that_replaces_history() {
+        // A $set carrying `messages` rebuilds the map from scratch — keeping
+        // pre-checkpoint turns over-counts (G2 round-3 critic).
+        let dir = std::env::temp_dir().join(format!("saffev-gem-{}", uuid::Uuid::new_v4()));
+        let chats = dir.join("proj/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let p = chats.join("session-2026-07-28T11-00-44445555.jsonl");
+        let lines = [
+            r#"{"sessionId":"44445555-aaaa-4bbb-8ccc-000000000010","projectHash":"d","startTime":"2026-07-28T11:00:00.000Z","lastUpdated":"2026-07-28T11:00:00.000Z"}"#,
+            r#"{"id":"old1","timestamp":"2026-07-28T11:00:01.000Z","type":"user","content":"pre-checkpoint"}"#,
+            r#"{"id":"old2","timestamp":"2026-07-28T11:00:02.000Z","type":"gemini","content":"pre","model":"gemini-2.5-pro","tokens":{"input":500,"output":10,"cached":0,"total":510}}"#,
+            r#"{"$set":{"messages":[{"id":"new1","timestamp":"2026-07-28T11:00:03.000Z","type":"user","content":"post-checkpoint"}]}}"#,
+        ];
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        let d = GeminiReader::parse(&p, &dir.join("proj"), true).expect("parses");
+        assert_eq!(d.session.message_count, 1);
+        assert_eq!(d.session.input_tokens, 0, "pre-checkpoint tokens must not count");
+        assert!(d.messages.iter().any(|m| m.content == "post-checkpoint"));
+        assert!(!d.messages.iter().any(|m| m.content == "pre-checkpoint"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metadata_is_first_wins_and_model_ties_break_by_recency() {
+        let dir = std::env::temp_dir().join(format!("saffev-gem-{}", uuid::Uuid::new_v4()));
+        let chats = dir.join("proj/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let p = chats.join("session-2026-07-28T12-00-66667777.jsonl");
+        let lines = [
+            r#"{"sessionId":"66667777-aaaa-4bbb-8ccc-000000000011","projectHash":"d","startTime":"2026-07-28T12:00:00.000Z","lastUpdated":"2026-07-28T12:00:00.000Z"}"#,
+            // A later sessionId-bearing imposter must not rewrite identity.
+            r#"{"sessionId":"eeeeffff-0000-4000-8000-000000000099","projectHash":"x","startTime":"2020-01-01T00:00:00.000Z","lastUpdated":"2026-07-28T12:09:00.000Z"}"#,
+            r#"{"id":"m1","timestamp":"2026-07-28T12:00:01.000Z","type":"user","content":"q1"}"#,
+            r#"{"id":"m2","timestamp":"2026-07-28T12:00:02.000Z","type":"gemini","content":"a1","model":"gemini-2.5-flash"}"#,
+            r#"{"id":"m3","timestamp":"2026-07-28T12:00:03.000Z","type":"gemini","content":"a2","model":"gemini-2.5-pro"}"#,
+        ];
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        let d = GeminiReader::parse(&p, &dir.join("proj"), false).expect("parses");
+        assert!(d.session.id.ends_with("000000000011"), "identity is first-wins");
+        assert_eq!(
+            d.session.started_ts,
+            super::super::rfc3339_millis("2026-07-28T12:00:00.000Z")
+        );
+        // 1-vs-1 model tie: recency wins, deterministically.
+        assert_eq!(d.session.model.as_deref(), Some("gemini-2.5-pro"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrated_legacy_twin_is_not_double_listed() {
+        // Resuming a legacy .json appends 'l' to the filename; both files
+        // then exist for one sessionId — only the .jsonl must list.
+        let dir = std::env::temp_dir().join(format!("saffev-gem-{}", uuid::Uuid::new_v4()));
+        let chats = dir.join("proj/chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let meta = r#"{"sessionId":"88889999-aaaa-4bbb-8ccc-000000000012","projectHash":"d","startTime":"2026-07-28T13:00:00.000Z","lastUpdated":"2026-07-28T13:00:00.000Z"}"#;
+        let msg = r#"{"id":"m1","timestamp":"2026-07-28T13:00:01.000Z","type":"user","content":"hi"}"#;
+        std::fs::write(
+            chats.join("session-2026-07-28T13-00-88889999.json"),
+            r#"{"sessionId":"88889999-aaaa-4bbb-8ccc-000000000012","projectHash":"d","startTime":"2026-07-28T13:00:00.000Z","lastUpdated":"2026-07-28T13:00:00.000Z","messages":[{"id":"m1","timestamp":"2026-07-28T13:00:01.000Z","type":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            chats.join("session-2026-07-28T13-00-88889999.jsonl"),
+            format!("{meta}\n{msg}"),
+        )
+        .unwrap();
+        let reader = GeminiReader::with_root(dir.clone());
+        let sessions = reader.list_sessions();
+        assert_eq!(sessions.len(), 1, "migration twin double-listed");
+        assert!(sessions[0].source_path.ends_with(".jsonl"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
