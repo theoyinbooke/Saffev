@@ -155,11 +155,25 @@ static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
         .expect("env assignment regex")
 });
 
-/// JSON member candidate (`"password": "hunter2"`). Same key/value gates as
-/// the shell form (G1 round 4 — the round-3 critic's named gap: config-file
-/// secrets outside shell syntax were invisible). Capture 1 = key, 2 = value.
+/// JSON / Python-dict member candidate (`"password": "hunter2"`,
+/// `'password': 'hunter2'`). Same key/value gates as the shell form (G1
+/// round 4 — the round-3 critic's named gap: config-file secrets outside
+/// shell syntax were invisible; single quotes cover Python dict reprs, G1
+/// round 7). Capture 1 = key, 2 = value.
 static RE_JSON_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""([A-Za-z0-9_.\-]+)"\s*:\s*"([^"\r\n]{4,})""#).expect("json secret regex")
+    Regex::new(r#"['"]([A-Za-z0-9_.\-]+)['"]\s*:\s*['"]([^'"\r\n]{4,})['"]"#)
+        .expect("json secret regex")
+});
+
+/// Object-literal member candidate: UNQUOTED key, quoted value, anywhere on a
+/// line — `{password: "hunter2"}` (JS), `opts = {password: 'x'}` (Ruby 1.9
+/// keyword hash). The round-7 critic called this the single most common
+/// secret-paste shape in logs, and no anchored grammar reached it. The
+/// mandatory QUOTED value is what separates an object literal from prose —
+/// mid-line `password: hunter2` unquoted stays out of scope.
+static RE_OBJ_SECRET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*['"]([^'"\r\n]{4,})['"]"#)
+        .expect("object literal secret regex")
 });
 
 /// Ruby hash-rocket member candidate (`"password"=>"hunter2"` — every Rails
@@ -265,6 +279,7 @@ impl Detector {
         Lazy::force(&RE_JSON_SECRET);
         Lazy::force(&RE_RUBY_SECRET);
         Lazy::force(&RE_RUBY_SYM_SECRET);
+        Lazy::force(&RE_OBJ_SECRET);
         Lazy::force(&RE_YAML_SECRET);
         Lazy::force(&RE_TOML_SECRET);
         Lazy::force(&RE_CONN_KV);
@@ -374,6 +389,7 @@ impl Detector {
             (&RE_JSON_SECRET, false, false, true),
             (&RE_RUBY_SECRET, false, false, true),
             (&RE_RUBY_SYM_SECRET, false, false, true),
+            (&RE_OBJ_SECRET, false, false, true),
             (&RE_YAML_SECRET, true, true, false),
             (&RE_TOML_SECRET, true, false, true),
         ] {
@@ -905,6 +921,18 @@ fn env_value_is_real(value: &str) -> bool {
         "denied",
         "error",
         "failed",
+        // filler connectors — `not_set`, `to_be_filled` are template noise,
+        // not material (G1 round-7 critic)
+        "not",
+        "set",
+        "to",
+        "be",
+        "filled",
+        "pending",
+        "todo",
+        "tbd",
+        "blank",
+        "empty",
         // protocol nouns (compound segments)
         "token",
         "password",
@@ -922,12 +950,19 @@ fn env_value_is_real(value: &str) -> bool {
     if NON_MATERIAL.contains(&normalized.as_str()) {
         return false;
     }
-    if !normalized.is_empty()
-        && normalized
-            .split(['_', '-', ' '])
-            .filter(|s| !s.is_empty())
-            .all(|s| NON_MATERIAL.contains(&s))
-    {
+    let segments: Vec<&str> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // A value whose FIRST word is a scrub verb is an annotated marker —
+    // `REDACTED_BY_SOC_TEAM`, `MASKED (by proxy)` — the annotation doesn't
+    // make it material (G1 round-7 critic). Scrub VERBS only: `hidden` stays
+    // out so a passphrase like `hidden-gem-x9` isn't collateral.
+    const SCRUB_VERBS: &[&str] = &["redacted", "filtered", "masked", "scrubbed", "removed"];
+    if segments.first().is_some_and(|s| SCRUB_VERBS.contains(s)) {
+        return false;
+    }
+    if !segments.is_empty() && segments.iter().all(|s| NON_MATERIAL.contains(s)) {
         return false;
     }
     shannon_entropy(v) >= 2.0
@@ -1215,7 +1250,27 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
         return false;
     }
 
-    // (e) Not SSN-shaped. A 3-2-4 dashed group is an SSN (valid or garbage),
+    // (e) Not an adversarial digit-run: a candidate where EVERY separator
+    // group is one repeated digit (`1111-2222-3333`, `0000-0000-0000`) is a
+    // serial or placeholder, never a dialable number (G1 round-7 critic).
+    // Real numbers always carry at least one mixed-digit group.
+    let groups_uniform = {
+        let mut any = false;
+        let all_uniform = s
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|g| !g.is_empty())
+            .all(|g| {
+                any = true;
+                let first = g.as_bytes()[0];
+                g.bytes().all(|b| b == first)
+            });
+        any && all_uniform
+    };
+    if groups_uniform {
+        return false;
+    }
+
+    // (f) Not SSN-shaped. A 3-2-4 dashed group is an SSN (valid or garbage),
     // never a real phone format — NANP is 3-3-4. Structurally valid SSNs are
     // claimed by the SSN detector before phone runs; this rejects the invalid
     // remainder instead of mislabeling it.
@@ -2351,6 +2406,70 @@ mod tests {
         // Status-word SUBSTRINGS must not kill real secrets.
         let f = d.scan(Side::Request, "password: hidden2secret");
         assert!(has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn uniform_digit_groups_are_not_phones() {
+        // Round-7 critic: serials/placeholders where every group is one
+        // repeated digit must not read as phones.
+        let d = det();
+        for benign in ["serial 1111-2222-3333 registered", "card PIN block 0000-0000-0000"] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::Phone), "must reject {benign:?}");
+        }
+        // A real number always has a mixed group.
+        let f = d.scan(Side::Request, "call 555-123-4567");
+        assert!(has_kind(&f, PiiKind::Phone));
+    }
+
+    #[test]
+    fn filler_compounds_and_annotated_markers_are_not_secrets() {
+        // Round-7 critic: filler connectors and marker-plus-annotation.
+        let d = det();
+        for benign in [
+            "token: not_set",
+            "password: to_be_filled",
+            "PASSWORD=REDACTED_BY_SOC_TEAM",
+            "password: \"MASKED (by proxy)\"",
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
+        // Scrub verbs gate on the FIRST segment only — a passphrase merely
+        // containing one is material.
+        let f = d.scan(Side::Request, "password: was-removed-x9q");
+        assert!(has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    #[test]
+    fn detects_object_literal_secrets() {
+        // Round-7 critic's named FN class: mid-line unquoted-key object
+        // literals (JS, Ruby 1.9 keyword hash, Python dict repr).
+        let d = det();
+        for (text, want) in [
+            (
+                r#"logger.info({password: "hunter2xyz99", user: "svc"})"#,
+                r#"password: "hunter2xyz99""#,
+            ),
+            (
+                "opts = {password: 'railsKw99x'}",
+                "password: 'railsKw99x'",
+            ),
+            (
+                "{'db_password': 'py2repr99x'}",
+                "'db_password': 'py2repr99x'",
+            ),
+        ] {
+            let f = d.scan(Side::Request, text);
+            let m = f
+                .iter()
+                .find(|f| f.kind == PiiKind::EnvAssignment)
+                .unwrap_or_else(|| panic!("missed {text:?}"));
+            assert_eq!(&text[m.start..m.end], want);
+        }
+        // The quoted value is load-bearing: mid-line unquoted prose stays out.
+        let f = d.scan(Side::Request, "he typed password: hunter2 and hit enter");
+        assert!(!has_kind(&f, PiiKind::EnvAssignment));
     }
 
     #[test]

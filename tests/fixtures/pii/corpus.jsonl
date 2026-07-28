@@ -143,3 +143,11 @@
 {"id":"env-t17","text":"token: invalid_token","expect":[],"trap":"env_assignment","note":"round-6 critic FP — OAuth2 error code; all-vocabulary compound is protocol noise"}
 {"id":"env-012","text":"{:password=>\"hunter2secret99\", :role=>\"admin\"}","expect":[{"kind":"env_assignment","value":":password=>\"hunter2secret99\""}],"note":"round-6 critic miss — symbol-key Ruby hash rocket"}
 {"id":"env-013","text":"export PASSWORD='[k9!fQ2xW8z'","expect":[{"kind":"env_assignment","value":"PASSWORD='[k9!fQ2xW8z'"}],"note":"round-6 critic over-kill — quoted real secret starting with [ is literal, not a marker"}
+{"id":"phone-t07","text":"serial 1111-2222-3333 registered","expect":[],"trap":"phone","note":"round-7 critic FP — every group one repeated digit, a serial not a number"}
+{"id":"phone-t08","text":"PIN block 0000-0000-0000 zeroed","expect":[],"trap":"phone","note":"round-7 critic FP — all-zero groups"}
+{"id":"env-t18","text":"token: not_set","expect":[],"trap":"env_assignment","note":"round-7 critic FP — filler connectors are template noise"}
+{"id":"env-t19","text":"PASSWORD=REDACTED_BY_SOC_TEAM","expect":[],"trap":"env_assignment","note":"round-7 critic FP — marker-plus-annotation is still a marker"}
+{"id":"env-t20","text":"password: \"MASKED (by proxy)\"","expect":[],"trap":"env_assignment","note":"round-7 critic FP — scrub verb leads, annotation follows"}
+{"id":"env-014","text":"logger.info({password: \"hunter2xyz99\", user: \"svc\"})","expect":[{"kind":"env_assignment","value":"password: \"hunter2xyz99\""}],"note":"round-7 critic FN — JS object literal, unquoted key mid-line"}
+{"id":"env-015","text":"opts = {password: 'railsKw99x'}","expect":[{"kind":"env_assignment","value":"password: 'railsKw99x'"}],"note":"round-7 critic FN — Ruby 1.9 keyword hash"}
+{"id":"env-016","text":"{'db_password': 'py2repr99x'}","expect":[{"kind":"env_assignment","value":"'db_password': 'py2repr99x'"}],"note":"round-7 critic FN — Python dict repr, single-quoted"}
