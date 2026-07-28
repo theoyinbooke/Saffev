@@ -46,6 +46,7 @@ pub mod engine;
 pub mod error;
 pub mod exposure;
 pub mod policy;
+pub mod report;
 pub mod proxy;
 pub mod store;
 pub mod studio;

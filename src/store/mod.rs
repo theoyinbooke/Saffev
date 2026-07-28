@@ -137,6 +137,25 @@ pub struct RequestMeta {
     pub latency_ms: Option<u32>,
     /// Hash of the request body (never the body itself).
     pub request_hash: String,
+    /// Request body size in bytes (metadata only — never the body).
+    pub req_bytes: Option<u32>,
+    /// `User-Agent` header, truncated to 120 chars.
+    pub user_agent: Option<String>,
+    /// `Content-Type` header, truncated to 60 chars.
+    pub content_type: Option<String>,
+    /// Sampled `temperature` request param (root or Ollama `options`).
+    pub temperature: Option<f64>,
+    /// Sampled `top_p` request param (root or Ollama `options`).
+    pub top_p: Option<f64>,
+    /// Requested completion cap: `max_tokens` (OpenAI) / `num_predict` (Ollama).
+    pub max_tokens: Option<u32>,
+    /// Length of the `messages` array (or 1 for a `prompt`-string body).
+    pub msg_count: Option<u32>,
+    /// True when a system prompt is present (a `system`-role message or a
+    /// top-level `system` field). Stored as a nullable INTEGER 0/1.
+    pub has_system: Option<bool>,
+    /// Length of the `tools` array, when present.
+    pub tool_count: Option<u32>,
 }
 
 /// `responses` row — keyed 1:1 to a [`RequestMeta`].
@@ -162,6 +181,10 @@ pub struct ResponseMeta {
     /// (failed mid-stream). `None` for a normal HTTP response (including 4xx/5xx —
     /// those are conveyed by `status`).
     pub error_kind: Option<String>,
+    /// TOTAL bytes streamed to the client, counted per tee chunk (NOT the capped
+    /// logger buffer's length, which lies for big streams). Clamped to
+    /// `u32::MAX`.
+    pub resp_bytes: Option<u32>,
 }
 
 /// `payloads` row — raw text; written only when `payload_storage` is on.
@@ -1396,8 +1419,10 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             conn.execute(
                 "INSERT OR REPLACE INTO requests \
                  (id, ts, source_app, source_confidence, engine, model, endpoint, stream, \
-                  input_tokens, input_tokens_src, latency_ms, request_hash) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                  input_tokens, input_tokens_src, latency_ms, request_hash, \
+                  req_bytes, user_agent, content_type, temperature, top_p, max_tokens, \
+                  msg_count, has_system, tool_count) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 rusqlite::params![
                     r.id,
                     r.ts,
@@ -1411,6 +1436,15 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                     token_source_str(r.input_tokens_src),
                     r.latency_ms,
                     r.request_hash,
+                    r.req_bytes,
+                    r.user_agent,
+                    r.content_type,
+                    r.temperature,
+                    r.top_p,
+                    r.max_tokens,
+                    r.msg_count,
+                    r.has_system.map(|b| b as i64),
+                    r.tool_count,
                 ],
             )?;
         }
@@ -1433,8 +1467,8 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             conn.execute(
                 "INSERT INTO responses \
                  (request_id, finish_reason, output_tokens, output_tokens_src, ttft_ms, total_ms, \
-                  status, error_kind) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                  status, error_kind, resp_bytes) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 rusqlite::params![
                     r.request_id,
                     r.finish_reason,
@@ -1444,6 +1478,7 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                     r.total_ms,
                     r.status,
                     r.error_kind,
+                    r.resp_bytes,
                 ],
             )?;
         }
@@ -1674,8 +1709,10 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
         "SELECT \
            r.id, r.ts, r.source_app, r.source_confidence, r.engine, r.model, r.endpoint, \
            r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
+           r.req_bytes, r.user_agent, r.content_type, r.temperature, r.top_p, r.max_tokens, \
+           r.msg_count, r.has_system, r.tool_count, \
            resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
-           resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, \
+           resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, resp.resp_bytes, \
            {pii_count_expr}, {safety_count_expr} \
          FROM requests r \
          LEFT JOIN responses resp ON resp.request_id = r.id \
@@ -1707,28 +1744,38 @@ fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
         input_tokens_src: parse_token_source(&row.get::<_, String>(9)?),
         latency_ms: row.get(10)?,
         request_hash: row.get(11)?,
+        req_bytes: row.get(12)?,
+        user_agent: row.get(13)?,
+        content_type: row.get(14)?,
+        temperature: row.get(15)?,
+        top_p: row.get(16)?,
+        max_tokens: row.get(17)?,
+        msg_count: row.get(18)?,
+        has_system: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+        tool_count: row.get(20)?,
     };
 
     // responses.request_id is NULL when there's no joined response row.
-    let response = match row.get::<_, Option<String>>(12)? {
+    let response = match row.get::<_, Option<String>>(21)? {
         Some(req_id) => Some(ResponseMeta {
             request_id: req_id,
-            finish_reason: row.get(13)?,
-            output_tokens: row.get(14)?,
+            finish_reason: row.get(22)?,
+            output_tokens: row.get(23)?,
             output_tokens_src: row
-                .get::<_, Option<String>>(15)?
+                .get::<_, Option<String>>(24)?
                 .map(|s| parse_token_source(&s))
                 .unwrap_or(TokenSource::Exact),
-            ttft_ms: row.get(16)?,
-            total_ms: row.get(17)?,
-            status: row.get(18)?,
-            error_kind: row.get(19)?,
+            ttft_ms: row.get(25)?,
+            total_ms: row.get(26)?,
+            status: row.get(27)?,
+            error_kind: row.get(28)?,
+            resp_bytes: row.get(29)?,
         }),
         None => None,
     };
 
-    let pii_count: i64 = row.get(20)?;
-    let safety_count: i64 = row.get(21)?;
+    let pii_count: i64 = row.get(30)?;
+    let safety_count: i64 = row.get(31)?;
 
     Ok(HistoryRow {
         request,
@@ -2182,6 +2229,15 @@ mod tests {
             input_tokens_src: TokenSource::Exact,
             latency_ms: Some(120),
             request_hash: "deadbeef".into(),
+            req_bytes: None,
+            user_agent: None,
+            content_type: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            msg_count: None,
+            has_system: None,
+            tool_count: None,
         }
     }
 
@@ -2200,6 +2256,7 @@ mod tests {
             total_ms: Some(110),
             status: Some(200),
             error_kind: None,
+            resp_bytes: None,
         }));
         store.flush().await.unwrap();
 
@@ -2214,6 +2271,71 @@ mod tests {
         assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
         assert_eq!(resp.output_tokens_src, TokenSource::Estimated);
         assert_eq!(row.pii_count, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// G4: the widened per-request record round-trips — every new metadata
+    /// column (request shape/params/headers, response byte count) persists and
+    /// reads back through `history` exactly as written.
+    #[tokio::test]
+    async fn g4_widened_columns_round_trip() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        let mut request = req("g4", 5000);
+        request.req_bytes = Some(1234);
+        request.user_agent = Some("ollama-python/0.3.3".into());
+        request.content_type = Some("application/json".into());
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.95);
+        request.max_tokens = Some(4096);
+        request.msg_count = Some(3);
+        request.has_system = Some(true);
+        request.tool_count = Some(2);
+        store.enqueue(WriteOp::Request(request.clone()));
+        store.enqueue(WriteOp::Response(ResponseMeta {
+            request_id: "g4".into(),
+            finish_reason: Some("stop".into()),
+            output_tokens: Some(7),
+            output_tokens_src: TokenSource::Exact,
+            ttft_ms: Some(30),
+            total_ms: Some(110),
+            status: Some(200),
+            error_kind: None,
+            resp_bytes: Some(987_654),
+        }));
+        store.flush().await.unwrap();
+
+        let rows = store.history(HistoryQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.request.req_bytes, Some(1234));
+        assert_eq!(
+            row.request.user_agent.as_deref(),
+            Some("ollama-python/0.3.3")
+        );
+        assert_eq!(
+            row.request.content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(row.request.temperature, Some(0.7));
+        assert_eq!(row.request.top_p, Some(0.95));
+        assert_eq!(row.request.max_tokens, Some(4096));
+        assert_eq!(row.request.msg_count, Some(3));
+        assert_eq!(row.request.has_system, Some(true));
+        assert_eq!(row.request.tool_count, Some(2));
+        let resp = row.response.as_ref().expect("response joined");
+        assert_eq!(resp.resp_bytes, Some(987_654));
+
+        // A row written with the new fields unset stays honestly NULL.
+        store.enqueue(WriteOp::Request(req("g4-null", 6000)));
+        store.flush().await.unwrap();
+        let rows = store.history(HistoryQuery::default()).await.unwrap();
+        let bare = rows.iter().find(|r| r.request.id == "g4-null").unwrap();
+        assert_eq!(bare.request.req_bytes, None);
+        assert_eq!(bare.request.has_system, None);
+        assert_eq!(bare.request.tool_count, None);
 
         let _ = std::fs::remove_file(&path);
     }

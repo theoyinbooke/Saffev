@@ -684,6 +684,10 @@ struct InFlight {
     response_buf: BytesMut,
     /// True once we stopped accumulating because the cap was hit.
     response_truncated: bool,
+    /// TOTAL bytes streamed to the client, counted per tee chunk. This is the
+    /// honest size for the stored `resp_bytes` — `response_buf.len()` lies once
+    /// the cap truncates a big stream.
+    resp_bytes: u64,
     /// When the request started (for latency).
     started: Instant,
     /// When the first response chunk arrived (for TTFT).
@@ -736,6 +740,9 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                     if entry.first_chunk_at.is_none() {
                         entry.first_chunk_at = Some(Instant::now());
                     }
+                    // Count every byte BEFORE the cap logic — the total must
+                    // reflect what the client received, not what we buffered.
+                    entry.resp_bytes += chunk.len() as u64;
                     if !entry.response_truncated {
                         let remaining =
                             MAX_RESPONSE_BUFFER.saturating_sub(entry.response_buf.len());
@@ -799,8 +806,11 @@ fn on_request_started(
     let started = Instant::now();
     let ts_millis = now_millis();
 
-    // Parse the request JSON cheaply for `model` and `stream`.
+    // Parse the request JSON cheaply for `model` and `stream`, plus the
+    // metadata-only shape/params (G4): sampling params, message/tool counts,
+    // system-prompt presence. Never the content itself.
     let (model, stream) = parse_request_meta(&body);
+    let params = parse_request_params(&body);
 
     // Inline-cheap deterministic PII scan of the request body text.
     let request_text = lossy_str(&body);
@@ -835,6 +845,15 @@ fn on_request_started(
         input_tokens_src,
         latency_ms: None,
         request_hash,
+        req_bytes: Some(body.len().min(u32::MAX as usize) as u32),
+        user_agent: header_value(headers, axum::http::header::USER_AGENT, 120),
+        content_type: header_value(headers, axum::http::header::CONTENT_TYPE, 60),
+        temperature: params.temperature,
+        top_p: params.top_p,
+        max_tokens: params.max_tokens,
+        msg_count: params.msg_count,
+        has_system: params.has_system,
+        tool_count: params.tool_count,
     };
 
     // Distinct request-side PII kinds + count (for the live row's badges/KPIs).
@@ -917,6 +936,7 @@ fn on_request_started(
             input_tokens_src,
             response_buf: BytesMut::new(),
             response_truncated: false,
+            resp_bytes: 0,
             started,
             first_chunk_at: None,
             ts_millis,
@@ -1014,6 +1034,7 @@ fn on_response_finished(
         total_ms: total,
         status,
         error_kind,
+        resp_bytes: Some(entry.resp_bytes.min(u32::MAX as u64) as u32),
     };
 
     // Response-side PII findings (computed before building the live item so the
@@ -1158,6 +1179,82 @@ fn parse_request_meta(body: &Bytes) -> (Option<String>, bool) {
         }
         Err(_) => (None, false),
     }
+}
+
+/// Metadata-only shape/params sampled from a request body (G4). Counts and
+/// numbers only — never the message text.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct RequestParams {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_tokens: Option<u32>,
+    msg_count: Option<u32>,
+    has_system: Option<bool>,
+    tool_count: Option<u32>,
+}
+
+/// Best-effort extract of sampling params + body shape from a request JSON
+/// body. OpenAI-style bodies carry params at the root; Ollama-style bodies nest
+/// them under `options` ({"options":{"temperature":0,...}}) — the root is
+/// checked first, then `options`. The completion cap is `max_tokens` (OpenAI)
+/// or `num_predict` (Ollama options). Non-JSON / empty bodies yield all-`None`.
+fn parse_request_params(body: &Bytes) -> RequestParams {
+    let mut p = RequestParams::default();
+    if body.is_empty() {
+        return p;
+    }
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return p,
+    };
+
+    let options = v.get("options");
+    let lookup = |field: &str| v.get(field).or_else(|| options.and_then(|o| o.get(field)));
+
+    p.temperature = lookup("temperature").and_then(|x| x.as_f64());
+    p.top_p = lookup("top_p").and_then(|x| x.as_f64());
+    p.max_tokens = lookup("max_tokens")
+        .or_else(|| lookup("num_predict"))
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32);
+
+    // Body shape: a chat body has a `messages` array; a completion body has a
+    // `prompt` string (counted as 1 message). Anything else stays unknown.
+    let has_top_system = v.get("system").is_some();
+    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        p.msg_count = Some(msgs.len().min(u32::MAX as usize) as u32);
+        let system_role = msgs
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
+        p.has_system = Some(system_role || has_top_system);
+    } else if v.get("prompt").is_some_and(|x| x.is_string()) {
+        p.msg_count = Some(1);
+        p.has_system = Some(has_top_system);
+    } else if has_top_system {
+        p.has_system = Some(true);
+    }
+
+    p.tool_count = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| a.len().min(u32::MAX as usize) as u32);
+
+    p
+}
+
+/// Lossy, truncated view of one request header for the stored metadata (G4).
+/// Character-truncated (never mid-UTF-8) to keep the column bounded.
+fn header_value(
+    headers: &axum::http::HeaderMap,
+    name: axum::http::header::HeaderName,
+    max_chars: usize,
+) -> Option<String> {
+    headers.get(name).map(|v| {
+        String::from_utf8_lossy(v.as_bytes())
+            .chars()
+            .take(max_chars)
+            .collect()
+    })
 }
 
 /// Extract a finish reason from a response body. For OpenAI SSE we look for the
@@ -1312,6 +1409,71 @@ mod tests {
         let (model, stream) = parse_request_meta(&Bytes::from_static(b"not json"));
         assert!(model.is_none());
         assert!(!stream);
+    }
+
+    #[test]
+    fn parse_request_params_openai_root() {
+        // OpenAI-style: params at the root, `max_tokens`, a system-role message,
+        // and a `tools` array.
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-4o","temperature":0.2,"top_p":0.9,"max_tokens":512,
+                "messages":[{"role":"system","content":"be terse"},
+                            {"role":"user","content":"hi"}],
+                "tools":[{"type":"function"},{"type":"function"},{"type":"function"}]}"#,
+        );
+        let p = parse_request_params(&body);
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.max_tokens, Some(512));
+        assert_eq!(p.msg_count, Some(2));
+        assert_eq!(p.has_system, Some(true));
+        assert_eq!(p.tool_count, Some(3));
+    }
+
+    #[test]
+    fn parse_request_params_ollama_options_nesting() {
+        // Ollama-style: params nested under `options`, `num_predict` as the
+        // completion cap, no system message.
+        let body = Bytes::from_static(
+            br#"{"model":"llama3","options":{"temperature":0,"top_p":0.5,"num_predict":128},
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let p = parse_request_params(&body);
+        assert_eq!(p.temperature, Some(0.0));
+        assert_eq!(p.top_p, Some(0.5));
+        assert_eq!(p.max_tokens, Some(128));
+        assert_eq!(p.msg_count, Some(1));
+        assert_eq!(p.has_system, Some(false));
+        assert_eq!(p.tool_count, None);
+    }
+
+    #[test]
+    fn parse_request_params_root_wins_over_options() {
+        let body = Bytes::from_static(br#"{"temperature":0.7,"options":{"temperature":0.1}}"#);
+        let p = parse_request_params(&body);
+        assert_eq!(p.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn parse_request_params_generate_prompt_and_system() {
+        // Ollama /api/generate: a `prompt` string counts as one message; a
+        // top-level `system` field marks the system prompt present.
+        let body = Bytes::from_static(br#"{"model":"llama3","prompt":"hi","system":"be terse"}"#);
+        let p = parse_request_params(&body);
+        assert_eq!(p.msg_count, Some(1));
+        assert_eq!(p.has_system, Some(true));
+    }
+
+    #[test]
+    fn parse_request_params_empty_and_invalid() {
+        assert_eq!(
+            parse_request_params(&Bytes::new()),
+            RequestParams::default()
+        );
+        assert_eq!(
+            parse_request_params(&Bytes::from_static(b"not json")),
+            RequestParams::default()
+        );
     }
 
     #[test]

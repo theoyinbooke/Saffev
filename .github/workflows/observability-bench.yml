@@ -1,0 +1,18 @@
+# G4 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G4). Same shape as the
+# other gauntlet guards: run the bench, then prove the committed artifacts
+# (attribute table + sample privacy report) match what the code produces.
+name: observability-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Attribute count + sample report (floors enforced)
+        run: cargo test --test observability_bench -- --nocapture
+      - name: Committed artifacts must match the code
+        run: git diff --exit-code bench/observability-results.json docs/examples/privacy-report.md

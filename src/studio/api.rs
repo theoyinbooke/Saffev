@@ -84,6 +84,18 @@ pub(crate) fn item_from_parts(
     pii_count: u32,
     pii_kinds: Vec<PiiKind>,
 ) -> dto::HistoryItem {
+    // Decode throughput, derived — only when both inputs exist and time is
+    // non-zero (never divide by zero, never fabricate a rate). One decimal.
+    let tokens_per_sec = match (
+        resp.and_then(|r| r.output_tokens),
+        resp.and_then(|r| r.total_ms),
+    ) {
+        (Some(out), Some(ms)) if ms > 0 => {
+            Some((out as f64 / (ms as f64 / 1000.0) * 10.0).round() / 10.0)
+        }
+        _ => None,
+    };
+
     dto::HistoryItem {
         id: req.id.clone(),
         ts: req.ts,
@@ -109,6 +121,21 @@ pub(crate) fn item_from_parts(
         // projection (history_item) sets this, and a Safety stream event updates
         // live rows retroactively.
         safety_flagged: false,
+        req_bytes: req.req_bytes,
+        user_agent: req.user_agent.clone(),
+        content_type: req.content_type.clone(),
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_tokens: req.max_tokens,
+        msg_count: req.msg_count,
+        has_system: req.has_system,
+        tool_count: req.tool_count,
+        resp_bytes: resp.and_then(|r| r.resp_bytes),
+        total_ms: resp.and_then(|r| r.total_ms),
+        finish_reason: resp.and_then(|r| r.finish_reason.clone()),
+        tokens_per_sec,
+        // Populated only by the detail handler (costs an engines-table read).
+        engine_version: None,
     }
 }
 
@@ -340,7 +367,17 @@ pub async fn history_detail(
         .collect();
     let kinds = distinct_kinds(&all_findings, &id);
 
-    let item = history_item(&row, kinds);
+    let mut item = history_item(&row, kinds);
+
+    // Engine version — DETAIL-ONLY enrichment (one engines-table read per detail
+    // open; list paths stay cheap with `engineVersion: null`). Best-effort: an
+    // unknown engine simply leaves it null.
+    if let Ok(engines) = state.store.engines().await {
+        item.engine_version = engines
+            .iter()
+            .find(|e| e.engine == item.engine)
+            .and_then(|e| e.version.clone());
+    }
 
     // Safety findings for this record (eval pipeline), projected to views.
     let safety: Vec<dto::SafetyView> = state
@@ -3490,6 +3527,15 @@ mod tests {
             input_tokens_src: TokenSource::Exact,
             latency_ms: Some(40),
             request_hash: "deadbeef".to_string(),
+            req_bytes: Some(256),
+            user_agent: Some("zed/1.0".to_string()),
+            content_type: Some("application/json".to_string()),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: Some(1024),
+            msg_count: Some(2),
+            has_system: Some(true),
+            tool_count: Some(1),
         }
     }
 
@@ -3503,6 +3549,7 @@ mod tests {
             total_ms: Some(120),
             status: Some(200),
             error_kind: None,
+            resp_bytes: Some(4096),
         }
     }
 
@@ -3526,6 +3573,40 @@ mod tests {
         assert_eq!(item.pii_count, 2);
         assert_eq!(item.pii_kinds, vec![PiiKind::Email]);
         assert!(item.stream);
+        // G4 widened attributes.
+        assert_eq!(item.req_bytes, Some(256));
+        assert_eq!(item.user_agent.as_deref(), Some("zed/1.0"));
+        assert_eq!(item.content_type.as_deref(), Some("application/json"));
+        assert_eq!(item.temperature, Some(0.7));
+        assert_eq!(item.top_p, Some(0.9));
+        assert_eq!(item.max_tokens, Some(1024));
+        assert_eq!(item.msg_count, Some(2));
+        assert_eq!(item.has_system, Some(true));
+        assert_eq!(item.tool_count, Some(1));
+        assert_eq!(item.resp_bytes, Some(4096));
+        assert_eq!(item.total_ms, Some(120));
+        assert_eq!(item.finish_reason.as_deref(), Some("stop"));
+        // 99 tokens / 0.120 s = 825.0 tok/s, one decimal.
+        assert_eq!(item.tokens_per_sec, Some(825.0));
+        // Engine version is a detail-only enrichment: null from the projection.
+        assert_eq!(item.engine_version, None);
+    }
+
+    #[test]
+    fn tokens_per_sec_absent_without_inputs() {
+        // No response at all -> no rate.
+        let item = item_from_parts(&sample_request("r3", 1), None, 0, Vec::new());
+        assert_eq!(item.tokens_per_sec, None);
+        // total_ms == 0 -> no rate (never divide by zero).
+        let mut resp = sample_response("r4");
+        resp.total_ms = Some(0);
+        let item = item_from_parts(&sample_request("r4", 1), Some(&resp), 0, Vec::new());
+        assert_eq!(item.tokens_per_sec, None);
+        // Unknown output tokens -> no rate.
+        let mut resp = sample_response("r5");
+        resp.output_tokens = None;
+        let item = item_from_parts(&sample_request("r5", 1), Some(&resp), 0, Vec::new());
+        assert_eq!(item.tokens_per_sec, None);
     }
 
     #[test]

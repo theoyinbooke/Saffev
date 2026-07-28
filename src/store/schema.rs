@@ -244,6 +244,27 @@ pub const MIGRATIONS: &[&str] = &[
     );
     CREATE UNIQUE INDEX idx_engines_engine ON engines(engine);
     "#,
+    // --- v9: widen the per-request record (G4) ---
+    //
+    // The History detail should answer "what exactly was this call?" without
+    // ever storing content. These are METADATA-ONLY additions: body sizes,
+    // truncated identifying headers, the sampling params the app asked for, and
+    // shape counts of the request JSON (message/tool counts, system-prompt
+    // presence) — never the text itself. `resp_bytes` is the TOTAL bytes
+    // streamed to the client, counted per tee chunk, so it stays honest even
+    // when the logger's capped buffer truncates a big stream.
+    r#"
+    ALTER TABLE requests ADD COLUMN req_bytes INTEGER;
+    ALTER TABLE requests ADD COLUMN user_agent TEXT;
+    ALTER TABLE requests ADD COLUMN content_type TEXT;
+    ALTER TABLE requests ADD COLUMN temperature REAL;
+    ALTER TABLE requests ADD COLUMN top_p REAL;
+    ALTER TABLE requests ADD COLUMN max_tokens INTEGER;
+    ALTER TABLE requests ADD COLUMN msg_count INTEGER;
+    ALTER TABLE requests ADD COLUMN has_system INTEGER;
+    ALTER TABLE requests ADD COLUMN tool_count INTEGER;
+    ALTER TABLE responses ADD COLUMN resp_bytes INTEGER;
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

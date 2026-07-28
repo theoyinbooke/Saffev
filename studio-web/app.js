@@ -491,13 +491,29 @@
     kv('App', it.sourceApp || 'Unknown');
     kv('Confidence', it.sourceConfidence);
     kv('Engine', it.engine);
+    if (it.engineVersion) kv('Engine version', it.engineVersion);
     kv('Model', it.model || '·');
     kv('Endpoint', it.endpoint);
     kv('Streamed', it.stream ? 'yes' : 'no');
+    // Request shape (metadata-only; present when the proxy could sample them).
+    if (it.reqBytes != null) kv('Request size', fmtBytes(it.reqBytes));
+    if (it.userAgent) kv('User agent', it.userAgent);
+    if (it.contentType) kv('Content type', it.contentType);
+    if (it.temperature != null) kv('Temperature', String(it.temperature));
+    if (it.topP != null) kv('Top-p', String(it.topP));
+    if (it.maxTokens != null) kv('Max tokens', fmtNum(it.maxTokens));
+    if (it.msgCount != null) kv('Messages', fmtNum(it.msgCount));
+    if (it.hasSystem != null) kv('System prompt', it.hasSystem ? 'yes' : 'no');
+    if (it.toolCount != null) kv('Tools', fmtNum(it.toolCount));
     kv('Input tokens', it.inputTokens != null ? (it.inputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.inputTokens) : '·');
     kv('Output tokens', it.outputTokens != null ? (it.outputTokensSrc === 'estimated' ? '~' : '') + fmtNum(it.outputTokens) : '·');
     kv('Latency', it.latencyMs != null ? it.latencyMs + 'ms' : '·');
     kv('TTFT', it.ttftMs != null ? it.ttftMs + 'ms' : '·');
+    // Response outcome (present once the exchange finished).
+    if (it.totalMs != null) kv('Total time', it.totalMs + 'ms');
+    if (it.tokensPerSec != null) kv('Tokens/sec', it.tokensPerSec + ' tok/s');
+    if (it.respBytes != null) kv('Response size', fmtBytes(it.respBytes));
+    if (it.finishReason) kv('Finish reason', it.finishReason);
     kv('Status', it.status != null ? String(it.status) : (it.errorKind ? 'no response' : '·'));
     if (isFailed(it)) kv('Outcome', failLabel(it));
     kv('Time', new Date(it.ts).toLocaleString());

@@ -73,6 +73,51 @@ pub struct HistoryItem {
     /// via a `Safety` stream event after evaluation completes.
     #[serde(default)]
     pub safety_flagged: bool,
+    /// Request body size in bytes (metadata only — never the body).
+    #[serde(default)]
+    pub req_bytes: Option<u32>,
+    /// `User-Agent` header (truncated).
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// `Content-Type` header (truncated).
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Sampled `temperature` request param.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Sampled `top_p` request param.
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    /// Requested completion cap (`max_tokens` / Ollama `num_predict`).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Number of messages in the request (1 for a `prompt`-string body).
+    #[serde(default)]
+    pub msg_count: Option<u32>,
+    /// Whether a system prompt was present.
+    #[serde(default)]
+    pub has_system: Option<bool>,
+    /// Number of tools offered in the request, when a `tools` array was present.
+    #[serde(default)]
+    pub tool_count: Option<u32>,
+    /// TOTAL bytes streamed back to the client.
+    #[serde(default)]
+    pub resp_bytes: Option<u32>,
+    /// Total generation time (millis), as measured — distinct from `latency_ms`,
+    /// which falls back to this when the request row has no end-to-end value.
+    #[serde(default)]
+    pub total_ms: Option<u32>,
+    /// Finish reason reported by the engine (`stop`, `length`, ...).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    /// Decode throughput: `output_tokens / (total_ms / 1000)`, rounded to one
+    /// decimal. Present only when both inputs are known and `total_ms > 0`.
+    #[serde(default)]
+    pub tokens_per_sec: Option<f64>,
+    /// The serving engine's version. Populated ONLY on the detail path (it costs
+    /// an engines-table read); always null in list/live rows.
+    #[serde(default)]
+    pub engine_version: Option<String>,
 }
 
 /// One quality-judge score as shown in the History detail drawer.

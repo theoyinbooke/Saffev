@@ -180,6 +180,76 @@ fn group_thousands(n: u64) -> String {
 /// ~ 1,284 requests today · 38ms p50 · 6 PII findings
 /// ```
 /// Must work even when the proxy isn't running and downstream modules are stubs.
+/// `saffev report` — generate the local privacy report (G4). Reads the
+/// store + config + OS socket table; performs zero network calls.
+pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Result<()> {
+    let cfg = load_config(cli).await;
+    let now_ms = crate::agents::now_ms();
+    let since = now_ms - (days as i64) * 86_400_000;
+
+    let store = crate::store::Store::open(&cfg.db_path()).await?;
+    let mut history = store
+        .history(crate::store::HistoryQuery {
+            q: None,
+            pii_only: false,
+            failed_only: false,
+            limit: Some(100_000),
+            before_ts: None,
+        })
+        .await?;
+    history.retain(|r| r.request.ts >= since);
+    let ids: std::collections::HashSet<&str> =
+        history.iter().map(|r| r.request.id.as_str()).collect();
+    let findings: Vec<_> = store
+        .privacy_summary()
+        .await?
+        .into_iter()
+        .filter(|f| ids.contains(f.record_id.as_str()))
+        .collect();
+
+    let exposure = crate::exposure::check(cfg.ports.proxy).await;
+    let (exposure_line, exposure_known) = match &exposure {
+        Ok(e) => (e.detail.clone(), true),
+        Err(_) => (String::new(), false),
+    };
+    let (archive, archive_stats) = if cfg.archive.enabled {
+        (
+            store.verify_archive().await.ok(),
+            store.archive_stats().await.ok(),
+        )
+    } else {
+        (None, None)
+    };
+    let agent_tools = crate::agents::detected()
+        .into_iter()
+        .filter(|t| t.present)
+        .map(|t| (t.tool.label().to_string(), t.sessions))
+        .collect();
+
+    let inputs = crate::report::ReportInputs {
+        now_ms,
+        period_days: days,
+        version: crate::VERSION.to_string(),
+        history,
+        findings,
+        config: cfg,
+        exposure_line,
+        exposure_known,
+        archive,
+        archive_stats,
+        agent_tools,
+    };
+    let md = crate::report::render(&inputs);
+    match out {
+        Some(path) => {
+            std::fs::write(path, &md).map_err(crate::Error::Io)?;
+            println!("report written to {}", path.display());
+        }
+        None => println!("{md}"),
+    }
+    Ok(())
+}
+
 pub async fn status(cli: &Cli) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;

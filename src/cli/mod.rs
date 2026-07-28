@@ -83,6 +83,15 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = EngineArg::Ollama)]
         engine: EngineArg,
     },
+    /// Generate a local privacy report (Markdown; offline, zero network).
+    Report {
+        /// Covered period in days.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Write to this file (default: print to stdout).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Stream activity.
     Logs {
         /// Keep following new activity.
@@ -169,6 +178,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Stop => commands::stop(&cli).await,
         Command::Doctor => commands::doctor(&cli).await,
         Command::Revert { engine } => commands::revert(&cli, engine).await,
+        Command::Report { days, ref out } => {
+            let out = out.clone();
+            commands::report(&cli, days, out.as_deref()).await
+        }
         Command::Logs { follow } => commands::logs(&cli, follow).await,
         Command::Update { check } => commands::update(&cli, check).await,
         Command::Run {
