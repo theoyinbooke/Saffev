@@ -172,10 +172,11 @@ static RE_YAML_SECRET: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// TOML/INI candidate with spaces around `=` and a quoted value
-/// (`password = "hunter2"`). The space-less shell form is [`RE_ENV_ASSIGN`]'s.
-/// Capture 1 = key, 2 = value.
+/// (`password = "hunter2"`, single or double quotes). The space-less shell
+/// form is [`RE_ENV_ASSIGN`]'s. Capture 1 = key, 2 = value. The value class
+/// excludes both quote chars, so a mismatched-quote pair can't overrun.
 static RE_TOML_SECRET: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*"([^"\r\n]{4,})""#)
+    Regex::new(r#"(?m)^[ \t]*([A-Za-z0-9_.\-]+)[ \t]*=[ \t]*['"]([^'"\r\n]{4,})['"]"#)
         .expect("toml secret regex")
 });
 
@@ -347,22 +348,36 @@ impl Detector {
         }
         // JSON spans start at the whole match (the key's opening quote);
         // YAML/TOML spans start at the key so line indent stays unmasked.
-        for (re, from_key) in [
-            (&RE_JSON_SECRET, false),
-            (&RE_YAML_SECRET, true),
-            (&RE_TOML_SECRET, true),
+        for (re, from_key, prose_gate) in [
+            (&RE_JSON_SECRET, false, false),
+            (&RE_YAML_SECRET, true, true),
+            (&RE_TOML_SECRET, true, false),
         ] {
             for caps in re.captures_iter(text) {
                 let (Some(whole), Some(key), Some(value)) = (caps.get(0), caps.get(1), caps.get(2))
                 else {
                     continue;
                 };
+                // The YAML form is the only grammar whose value is unquoted
+                // free text, which makes line-start prose shape-legal
+                // ("token: expired yesterday" — G1 round-4 critic, three
+                // constructed FPs of exactly this class). A real YAML secret
+                // is a single token or a quoted string, so an unquoted value
+                // containing whitespace is prose, not material.
+                let val = value.as_str();
+                if prose_gate
+                    && !val.starts_with('"')
+                    && !val.starts_with('\'')
+                    && val.contains(char::is_whitespace)
+                {
+                    continue;
+                }
                 let start = if from_key { key.start() } else { whole.start() };
                 config_candidates.push((
                     start,
                     whole.end(),
                     key.as_str().to_string(),
-                    value.as_str().to_string(),
+                    val.to_string(),
                 ));
             }
         }
@@ -783,6 +798,7 @@ fn env_key_is_secret(key: &str) -> bool {
         "SECRET",
         "PASSWORD",
         "PASSWD",
+        "PASS", // DB_PASS et al. — segment match, so BYPASS never qualifies
         "PWD",
         "TOKEN",
         "APIKEY",
@@ -2152,6 +2168,45 @@ mod tests {
             let f = d.scan(Side::Request, benign);
             assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
         }
+    }
+
+    #[test]
+    fn yaml_prose_lines_are_not_secrets() {
+        // The round-4 critic's constructed FP class: line-start prose whose
+        // first word is a secret keyword. Unquoted multi-word values are
+        // prose, not material.
+        let d = det();
+        for benign in [
+            "token: expired yesterday",
+            "password: incorrect, try again",
+            "secret: the cake is a lie",
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+        }
+        // A QUOTED multi-word value is deliberate config, not prose.
+        let text = "password: \"correct horse battery staple\"";
+        let f = d.scan(Side::Request, text);
+        assert!(has_kind(&f, PiiKind::EnvAssignment), "quoted multi-word secret missed");
+    }
+
+    #[test]
+    fn detects_pass_abbreviation_and_single_quoted_toml() {
+        let d = det();
+        for (text, want) in [
+            ("DB_PASS=q9v2x7mplt44", "DB_PASS=q9v2x7mplt44"),
+            ("client_secret = 'cs_4f9a2b7c1d'", "client_secret = 'cs_4f9a2b7c1d'"),
+        ] {
+            let f = d.scan(Side::Request, text);
+            let m = f
+                .iter()
+                .find(|f| f.kind == PiiKind::EnvAssignment)
+                .unwrap_or_else(|| panic!("missed {text}"));
+            assert_eq!(&text[m.start..m.end], want);
+        }
+        // BYPASS must not qualify via its PASS substring — segments, not substrings.
+        let f = d.scan(Side::Request, "FEATURE_BYPASS=enabled99x");
+        assert!(!has_kind(&f, PiiKind::EnvAssignment));
     }
 
     #[test]

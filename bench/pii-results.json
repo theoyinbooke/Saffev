@@ -1,11 +1,11 @@
 {
   "command": "cargo test --test pii_bench -- --nocapture",
   "corpus": {
-    "cases": 130,
+    "cases": 137,
     "file": "tests/fixtures/pii/corpus.jsonl",
-    "scored": 129,
-    "sha256": "07cc81ef1b37296b51ea1264b18dbe87cf5a4c0856e029254f43bd1524254d2c",
-    "traps": 49,
+    "scored": 136,
+    "sha256": "455a08d087e99aaf59dcda8237c1b61bdd8c593bebc6d30f31ba396072de1fbd",
+    "traps": 53,
     "xfail": 1
   },
   "detector": "saffev::brain::pii::Detector, default set, no custom patterns",
@@ -51,7 +51,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 7
+      "tp": 10
     },
     "iban": {
       "fn": 0,
@@ -117,6 +117,6 @@
     "fp": 0,
     "precision": 1.0,
     "recall": 1.0,
-    "tp": 88
+    "tp": 91
   }
 }

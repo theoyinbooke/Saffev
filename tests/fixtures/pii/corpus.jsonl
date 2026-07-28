@@ -128,3 +128,10 @@
 {"id":"iban-005","text":"beneficiary FR1420041010050500013M02606 confirmed","expect":[{"kind":"iban","value":"FR1420041010050500013M02606"}],"note":"French IBAN, compact form"}
 {"id":"iban-006","text":"cuenta ES9121000418450200051332 activa","expect":[{"kind":"iban","value":"ES9121000418450200051332"}],"note":"Spanish IBAN — widens country coverage"}
 {"id":"jwt-004","text":"{\"access_token\": \"eyJhbGciOiJFUzI1NiJ9.eyJzY29wZSI6InJlYWQifQ.MEUCIQDx8v2mkKvta1u0eQ\"}","expect":[{"kind":"jwt","value":"eyJhbGciOiJFUzI1NiJ9.eyJzY29wZSI6InJlYWQifQ.MEUCIQDx8v2mkKvta1u0eQ"}],"note":"JWT as JSON value — config-secret grammar must defer to the JWT kind"}
+{"id":"env-t09","text":"token: expired yesterday","expect":[],"trap":"env_assignment","note":"round-4 critic FP — line-start prose with a secret-keyword first word"}
+{"id":"env-t10","text":"password: incorrect, try again","expect":[],"trap":"env_assignment","note":"round-4 critic FP — chat-shaped prose, not config"}
+{"id":"env-t11","text":"secret: the cake is a lie","expect":[],"trap":"env_assignment","note":"round-4 critic FP — unquoted multi-word value is prose"}
+{"id":"env-008","text":"DB_PASS=q9v2x7mplt44 exported","expect":[{"kind":"env_assignment","value":"DB_PASS=q9v2x7mplt44"}],"note":"round-4 critic miss — PASS abbreviation"}
+{"id":"env-009","text":"client_secret = 'cs_4f9a2b7c1d'","expect":[{"kind":"env_assignment","value":"client_secret = 'cs_4f9a2b7c1d'"}],"note":"round-4 critic miss — single-quoted TOML value"}
+{"id":"env-010","text":"password: \"correct horse battery staple\"","expect":[{"kind":"env_assignment","value":"password: \"correct horse battery staple\""}],"note":"quoted multi-word value is deliberate config, not prose"}
+{"id":"env-t12","text":"FEATURE_BYPASS=enabled99x rollout","expect":[],"trap":"env_assignment","note":"PASS inside BYPASS — segment match, not substring"}
