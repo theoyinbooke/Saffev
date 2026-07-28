@@ -1965,6 +1965,12 @@ fn pii_kind_str(k: PiiKind) -> &'static str {
         PiiKind::CreditCard => "credit_card",
         PiiKind::ApiKey => "api_key",
         PiiKind::IpAddress => "ip_address",
+        PiiKind::PrivateKey => "private_key",
+        PiiKind::Jwt => "jwt",
+        PiiKind::ConnectionString => "connection_string",
+        PiiKind::Ssn => "ssn",
+        PiiKind::Iban => "iban",
+        PiiKind::MacAddress => "mac_address",
         PiiKind::Custom => "custom",
     }
 }
@@ -1976,6 +1982,12 @@ fn parse_pii_kind(s: &str) -> PiiKind {
         "credit_card" => PiiKind::CreditCard,
         "api_key" => PiiKind::ApiKey,
         "ip_address" => PiiKind::IpAddress,
+        "private_key" => PiiKind::PrivateKey,
+        "jwt" => PiiKind::Jwt,
+        "connection_string" => PiiKind::ConnectionString,
+        "ssn" => PiiKind::Ssn,
+        "iban" => PiiKind::Iban,
+        "mac_address" => PiiKind::MacAddress,
         _ => PiiKind::Custom,
     }
 }

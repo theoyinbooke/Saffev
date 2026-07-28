@@ -1,0 +1,21 @@
+# G1 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G1).
+#
+# Two guards in one: the bench test enforces the per-kind precision/recall
+# floors and the corpus-shape floors (scores can only regress loudly), and the
+# git-diff step proves the committed bench/pii-results.json artifact matches
+# what the code at this commit actually produces — a stale baseline fails CI.
+name: pii-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Score the detector against the corpus (floors enforced)
+        run: cargo test --test pii_bench -- --nocapture
+      - name: Committed baseline must match the code (no stale artifact)
+        run: git diff --exit-code bench/pii-results.json

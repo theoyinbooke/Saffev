@@ -18,8 +18,9 @@
 //!   byte span slices to exactly `value` → true positive; unmatched expected →
 //!   false negative; any leftover finding → false positive charged to the kind
 //!   it CLAIMED (a version string flagged as an IP charges `ip_address`).
-//! - `xfail` cases are out of deterministic scope or future kinds: excluded
-//!   from precision/recall, reported as `known_gaps` instead. If a detector
+//! - `xfail` cases exempt only the MISS (the target kind has no detector yet);
+//!   anything that FIRES on an xfail case is real detector output on real text
+//!   and is charged as a false positive like anywhere else. If a detector
 //!   starts genuinely catching one, promote the case to a scored positive.
 
 use std::collections::BTreeMap;
@@ -87,8 +88,8 @@ fn pii_bench_scorecard() {
     let traps = cases.iter().filter(|c| c.trap.is_some()).count();
     let xfails = cases.iter().filter(|c| c.xfail.is_some()).count();
     let scored = cases.len() - xfails;
-    assert!(scored >= 55, "scored corpus shrank to {scored} cases");
-    assert!(traps >= 15, "adversarial trap count shrank to {traps}");
+    assert!(scored >= 80, "scored corpus shrank to {scored} cases");
+    assert!(traps >= 30, "adversarial trap count shrank to {traps}");
 
     let mut kinds: BTreeMap<String, Tally> = BTreeMap::new();
     let mut known_gaps: Vec<serde_json::Value> = Vec::new();
@@ -102,7 +103,12 @@ fn pii_bench_scorecard() {
             .collect();
 
         if let Some(target) = &case.xfail {
-            // Out of scope: report what fired (if anything), score nothing.
+            // The miss is exempt (no detector for the target kind yet), but
+            // anything that fired here is real output on real text — charge it.
+            for (k, v) in &found {
+                kinds.entry(k.clone()).or_default().fp += 1;
+                failures.push(format!("[{}] FALSE-POSITIVE {k} matched {v:?} (on xfail case)", case.id));
+            }
             known_gaps.push(serde_json::json!({
                 "id": case.id,
                 "target_kind": target,
@@ -204,9 +210,15 @@ fn pii_bench_scorecard() {
         assert!(p >= min_p, "{k} precision {p:.3} fell below floor {min_p:.3}");
         assert!(r >= min_r, "{k} recall {r:.3} fell below floor {min_r:.3}");
     };
-    assert_floor("email", 0.88, 1.0);
-    assert_floor("credit_card", 0.88, 1.0);
+    assert_floor("email", 1.0, 1.0);
+    assert_floor("credit_card", 1.0, 1.0);
     assert_floor("api_key", 1.0, 1.0);
-    assert_floor("ip_address", 0.66, 0.72);
-    assert_floor("phone", 1.0, 0.87);
+    assert_floor("ip_address", 0.91, 1.0);
+    assert_floor("phone", 1.0, 1.0);
+    assert_floor("private_key", 1.0, 1.0);
+    assert_floor("jwt", 1.0, 1.0);
+    assert_floor("connection_string", 1.0, 1.0);
+    assert_floor("ssn", 1.0, 1.0);
+    assert_floor("iban", 1.0, 1.0);
+    assert_floor("mac_address", 1.0, 1.0);
 }

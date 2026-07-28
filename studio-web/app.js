@@ -153,15 +153,23 @@
   const PII_LABEL = {
     email: 'Email address', phone: 'Phone number', credit_card: 'Credit card',
     api_key: 'API key / token', ip_address: 'IP address', custom: 'Custom pattern',
+    private_key: 'Private key block', jwt: 'JWT', connection_string: 'Connection string',
+    ssn: 'SSN', iban: 'IBAN', mac_address: 'MAC address',
   };
+  // Credential-bearing kinds — badge gold like api_key.
+  const PII_SECRET_KINDS = ['api_key', 'private_key', 'jwt', 'connection_string'];
   function piiLabel(kind, label) {
     if (kind === 'custom' && label) return label;
     return PII_LABEL[kind] || kind;
   }
-  // Map a PiiKind to a colour role (gold for keys, danger otherwise).
-  function piiRole(kind) { return kind === 'api_key' ? 'gold' : kind === 'ip_address' ? 'brand' : 'danger'; }
+  // Map a PiiKind to a colour role (gold for secrets, danger otherwise).
+  function piiRole(kind) { return PII_SECRET_KINDS.includes(kind) ? 'gold' : kind === 'ip_address' ? 'brand' : 'danger'; }
   function piiShort(kind) {
-    return { email: 'EMAIL', phone: 'PHONE', credit_card: 'CARD', api_key: 'API-KEY', ip_address: 'IP', custom: 'CUSTOM' }[kind] || String(kind).toUpperCase();
+    return {
+      email: 'EMAIL', phone: 'PHONE', credit_card: 'CARD', api_key: 'API-KEY', ip_address: 'IP',
+      private_key: 'PRIV-KEY', jwt: 'JWT', connection_string: 'CONN-STR', ssn: 'SSN', iban: 'IBAN',
+      mac_address: 'MAC', custom: 'CUSTOM',
+    }[kind] || String(kind).toUpperCase();
   }
 
   /* SVG icon helpers (token-coloured via currentColor) */
@@ -194,7 +202,10 @@
     sparkles: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v4M12 17v4M5 12H1M23 12h-4M6.3 6.3 3.5 3.5M20.5 20.5l-2.8-2.8M17.7 6.3l2.8-2.8M3.5 20.5l2.8-2.8"/></svg>',
   };
   function piiIcon(kind) {
-    return { email: ICON.mail, api_key: ICON.key, credit_card: ICON.card, phone: ICON.phone, ip_address: ICON.globe }[kind] || ICON.shieldAlert;
+    return {
+      email: ICON.mail, api_key: ICON.key, credit_card: ICON.card, phone: ICON.phone, ip_address: ICON.globe,
+      private_key: ICON.key, jwt: ICON.key, connection_string: ICON.plug, iban: ICON.card, mac_address: ICON.server,
+    }[kind] || ICON.shieldAlert;
   }
 
   /* -------------------------------------------------------------------------
@@ -402,7 +413,7 @@
       // Collapse multiple PII kinds to "first + N" to keep the column compact.
       const kinds = item.piiKinds || [];
       if (kinds.length) {
-        cell.appendChild(el('span', { class: 'piibadge' + (kinds[0] === 'api_key' ? ' key' : ''), 'data-k': kinds[0], text: piiShort(kinds[0]) }));
+        cell.appendChild(el('span', { class: 'piibadge' + (PII_SECRET_KINDS.includes(kinds[0]) ? ' key' : ''), 'data-k': kinds[0], text: piiShort(kinds[0]) }));
         if (kinds.length > 1) cell.appendChild(el('span', { class: 'piibadge more', title: kinds.slice(1).map(piiShort).join(', '), text: '+' + (kinds.length - 1) }));
       }
       // Safety flag (eval pipeline) shares this signals column.
@@ -506,7 +517,7 @@
       const list = el('div', { class: 'findlist' });
       detail.findings.forEach((f) => {
         const r = el('div', { class: 'find' });
-        r.appendChild(el('span', { class: 'piibadge' + (f.kind === 'api_key' ? ' key' : ''), text: piiShort(f.kind) }));
+        r.appendChild(el('span', { class: 'piibadge' + (PII_SECRET_KINDS.includes(f.kind) ? ' key' : ''), text: piiShort(f.kind) }));
         r.appendChild(el('span', { text: piiLabel(f.kind, f.label) + ' · ' + f.confidence + ' confidence' }));
         r.appendChild(el('span', { class: 'actchip act-' + (f.action || 'observed'), text: piiActionLabel(f.action) }));
         r.appendChild(el('span', { class: 'where', text: f.side + ' [' + f.start + '–' + f.end + ']' }));
@@ -3354,7 +3365,7 @@
         const list = el('div', { class: 'findlist' });
         Object.keys(byKind).sort((a, b) => byKind[b] - byKind[a]).forEach((k) => {
           list.appendChild(el('div', { class: 'find' }, [
-            el('span', { class: 'piibadge' + (k === 'api_key' ? ' key' : ''), text: piiShort(k) }),
+            el('span', { class: 'piibadge' + (PII_SECRET_KINDS.includes(k) ? ' key' : ''), text: piiShort(k) }),
             el('span', { text: piiLabel(k) }),
             el('span', { class: 'where', text: byKind[k] + '×' }),
           ]));

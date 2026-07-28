@@ -59,10 +59,29 @@
 {"id":"cross-003","text":"on 2026-06-06 call +1 (555) 123-4567 re: invoice 1234.56","expect":[{"kind":"phone","value":"+1 (555) 123-4567"}],"note":"real phone amid date and decimal noise"}
 {"id":"cross-004","text":"fax +1 555 010 2299 or card 5500 0055 5555 5559","expect":[{"kind":"phone","value":"+1 555 010 2299"},{"kind":"credit_card","value":"5500 0055 5555 5559"}],"note":"card must not be double-read as phone"}
 {"id":"cross-005","text":"admin@site.example.net at 172.16.254.3 logged 4111111111111111","expect":[{"kind":"email","value":"admin@site.example.net"},{"kind":"ip_address","value":"172.16.254.3"},{"kind":"credit_card","value":"4111111111111111"}],"note":"mixed kinds, tight spacing"}
+{"id":"ip-t05","text":"call std::vector now","expect":[],"trap":"ip_address","note":"C++ namespace fragment must not yield 'd::'"}
+{"id":"pkey-001","text":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----","expect":[{"kind":"private_key","value":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----"}],"note":"promoted from xfail-005 — whole block is the span"}
+{"id":"pkey-002","text":"paste: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXk","expect":[{"kind":"private_key","value":"-----BEGIN OPENSSH PRIVATE KEY-----"}],"note":"truncated paste — header alone is still a leak"}
+{"id":"pkey-t01","text":"-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----","expect":[],"trap":"private_key","note":"public keys are not secrets"}
+{"id":"jwt-001","text":"bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U sent","expect":[{"kind":"jwt","value":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"}],"note":"promoted from xfail-004"}
+{"id":"jwt-002","text":"{\"token\":\"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2V4YW1wbGUifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c\"}","expect":[{"kind":"jwt","value":"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2V4YW1wbGUifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"}],"note":"JWT inside JSON body"}
+{"id":"jwt-t01","text":"file config.prod.yaml loaded","expect":[],"trap":"jwt","note":"dotted filename is not a token"}
+{"id":"conn-001","text":"export DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod","expect":[{"kind":"connection_string","value":"postgres://admin:hunter2@db.internal:5432/prod"}],"note":"promoted from xfail-006 — must not half-match as email"}
+{"id":"conn-002","text":"try mongodb+srv://user:secret@cluster0.example.mongodb.net/db fast","expect":[{"kind":"connection_string","value":"mongodb+srv://user:secret@cluster0.example.mongodb.net/db"}],"note":"scheme with plus"}
+{"id":"conn-003","text":"cache at redis://default:changeme@10.0.0.5:6379/0 ready","expect":[{"kind":"connection_string","value":"redis://default:changeme@10.0.0.5:6379/0"}],"note":"claims the embedded IP too — one masked span"}
+{"id":"conn-t01","text":"fetch https://example.com/path?q=1 now","expect":[],"trap":"connection_string","note":"no credentials"}
+{"id":"conn-t02","text":"db at postgres://db.internal:5432/prod up","expect":[],"trap":"connection_string","note":"host:port is not user:pass"}
+{"id":"ssn-001","text":"applicant SSN 078-05-1120 on file","expect":[{"kind":"ssn","value":"078-05-1120"}],"note":"promoted from xfail-002 — was miscaught as phone"}
+{"id":"ssn-002","text":"verify 219-09-9999 against records","expect":[{"kind":"ssn","value":"219-09-9999"}],"note":"upper serial band"}
+{"id":"ssn-t01","text":"id 000-12-3456 noted","expect":[],"trap":"ssn","note":"area 000 never issued"}
+{"id":"ssn-t02","text":"id 978-05-1120 noted","expect":[],"trap":"ssn","note":"area 900+ never issued"}
+{"id":"ssn-t03","text":"id 123-45-0000 noted","expect":[],"trap":"ssn","note":"serial 0000 never issued"}
+{"id":"iban-001","text":"wire to DE89 3704 0044 0532 0130 00 ref 7","expect":[{"kind":"iban","value":"DE89 3704 0044 0532 0130 00"}],"note":"promoted from xfail-003 — canonical DE example"}
+{"id":"iban-002","text":"pay GB82 WEST 1234 5698 7654 32 today","expect":[{"kind":"iban","value":"GB82 WEST 1234 5698 7654 32"}],"note":"canonical GB example, alpha bank code"}
+{"id":"iban-003","text":"acct NL91ABNA0417164300 listed","expect":[{"kind":"iban","value":"NL91ABNA0417164300"}],"note":"compact form"}
+{"id":"iban-t01","text":"wire to DE89 3704 0044 0532 0130 01 ref 7","expect":[],"trap":"iban","note":"checksum off by one — mod-97 must gate"}
+{"id":"mac-001","text":"mac 00:1a:2b:3c:4d:5e on nic0","expect":[{"kind":"mac_address","value":"00:1a:2b:3c:4d:5e"}],"note":"promoted from xfail-007"}
+{"id":"mac-002","text":"arp says 00-1A-2B-3C-4D-5E there","expect":[{"kind":"mac_address","value":"00-1A-2B-3C-4D-5E"}],"note":"hyphen form, uppercase"}
+{"id":"mac-t01","text":"vlan 00:1a:2b:3c:4d short","expect":[],"trap":"mac_address","note":"five groups is not a MAC"}
+{"id":"cross-006","text":"env: TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a DB=mysql://root:p4ss@10.1.2.3:3306/app MAC=00:1a:2b:3c:4d:5e","expect":[{"kind":"api_key","value":"ghp_16C7e42F292c6912E7710c838347Ae178B4a"},{"kind":"connection_string","value":"mysql://root:p4ss@10.1.2.3:3306/app"},{"kind":"mac_address","value":"00:1a:2b:3c:4d:5e"}],"note":"env dump with three secret/identifier kinds"}
 {"id":"xfail-001","text":"write to jane at example dot com","expect":[],"xfail":"email","note":"obfuscated email — outside deterministic v0 scope by design"}
-{"id":"xfail-002","text":"applicant SSN 078-05-1120 on file","expect":[],"xfail":"ssn","note":"US SSN — no detector yet; currently miscaught as phone"}
-{"id":"xfail-003","text":"wire to DE89 3704 0044 0532 0130 00 ref 7","expect":[],"xfail":"iban","note":"canonical DE example IBAN — no detector yet"}
-{"id":"xfail-004","text":"bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U sent","expect":[],"xfail":"jwt","note":"JWT — no detector yet"}
-{"id":"xfail-005","text":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----","expect":[],"xfail":"private_key","note":"PEM private key block — no detector yet"}
-{"id":"xfail-006","text":"export DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod","expect":[],"xfail":"connection_string","note":"credentialed connection string — no detector yet; local-part may miscatch as email"}
-{"id":"xfail-007","text":"mac 00:1a:2b:3c:4d:5e on nic0","expect":[],"xfail":"mac_address","note":"MAC address — no detector yet"}

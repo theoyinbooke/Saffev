@@ -33,6 +33,18 @@ pub enum PiiKind {
     ApiKey,
     /// IPv4 or IPv6 address.
     IpAddress,
+    /// PEM private-key block (`-----BEGIN … PRIVATE KEY-----`).
+    PrivateKey,
+    /// JSON Web Token (three dot-joined base64url segments).
+    Jwt,
+    /// Connection string / URL with embedded credentials (`scheme://user:pass@…`).
+    ConnectionString,
+    /// US Social Security Number (dashed form, structurally validated).
+    Ssn,
+    /// IBAN (ISO 7064 mod-97 validated).
+    Iban,
+    /// MAC address (colon or hyphen form).
+    MacAddress,
     /// A user-defined custom pattern (carries its label).
     Custom,
 }

@@ -116,6 +116,12 @@ fn kind_name(kind: PiiKind, label: Option<&str>) -> String {
         PiiKind::CreditCard => "Card",
         PiiKind::ApiKey => "API key",
         PiiKind::IpAddress => "IP address",
+        PiiKind::PrivateKey => "Private key",
+        PiiKind::Jwt => "JWT",
+        PiiKind::ConnectionString => "Connection string",
+        PiiKind::Ssn => "SSN",
+        PiiKind::Iban => "IBAN",
+        PiiKind::MacAddress => "MAC address",
         PiiKind::Custom => "Custom",
     }
     .to_string()

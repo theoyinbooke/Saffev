@@ -77,13 +77,78 @@ static RE_IPV4: Lazy<Regex> = Lazy::new(|| {
     .expect("ipv4 regex")
 });
 
-/// IPv6 — full, compressed (`::`), and IPv4-mapped tails. Word-boundaried.
+/// IPv6 — full, compressed (`::`), and IPv4-mapped tails.
+///
+/// Branch ORDER matters for scanning: `find_iter` takes the first branch that
+/// matches at a position, so the most-specific / longest-reaching shapes come
+/// first. The old grammar put the bare `(?:h:){1,7}:` branch ahead of the
+/// compressed head::tail forms and truncated `2001:db8::8a2e:370:7334` to
+/// `2001:db8::` — masking that span would leak the rest of the address
+/// (caught by the G1 bench corpus, round 1).
 static RE_IPV6: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}|:(?::[0-9a-f]{1,4}){1,7}|::(?:ffff(?::0{1,4})?:)?(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)|(?:[0-9a-f]{1,4}:){1,4}:(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)",
+        r"(?i)::(?:ffff(?::0{1,4})?:)?(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)|(?:[0-9a-f]{1,4}:){1,4}:(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)|(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?|:(?::[0-9a-f]{1,4}){1,7}",
     )
     .expect("ipv6 regex")
 });
+
+/// PEM private-key block — header through the matching footer when present,
+/// else the header line alone (a truncated paste is still a leak). The WHOLE
+/// block is the finding so masking removes the key material, not just the
+/// banner. `PUBLIC KEY` / `CERTIFICATE` blocks intentionally do not match.
+static RE_PRIVATE_KEY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?s:.)*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
+    )
+    .expect("private key regex")
+});
+
+/// JWT: three dot-joined base64url segments whose header starts with `eyJ`
+/// (base64url of `{"`). The strong prefix makes this deterministic without an
+/// entropy gate.
+static RE_JWT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}")
+        .expect("jwt regex")
+});
+
+/// Connection string with embedded credentials: `scheme://user:password@rest`.
+/// The whole URL is the finding so masking removes the credential pair AND the
+/// host it unlocks. A URL without a `user:pass@` section never matches.
+static RE_CONN_STRING: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:@/]+:[^\s@/]+@[^\s"']+"#)
+        .expect("connection string regex")
+});
+
+/// US SSN, dashed form only (`AAA-GG-SSSS`). The bare 9-digit form is far too
+/// FP-prone for a deterministic v0 detector. Candidates are structurally
+/// validated by [`ssn_valid`] before a finding is emitted.
+static RE_SSN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn regex"));
+
+/// IBAN candidate: country code + 2 check digits + grouped body, spaced or
+/// compact. Validated by ISO 7064 mod-97 ([`iban_valid`]) before emission, so
+/// a random uppercase/digit run has a 1-in-97 chance of surviving the gate.
+static RE_IBAN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b")
+        .expect("iban regex")
+});
+
+/// MAC address — six colon- or hyphen-separated hex pairs. (The regex crate
+/// has no backreferences, hence the two spelled-out branches.)
+static RE_MAC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b|(?i)\b(?:[0-9a-f]{2}-){5}[0-9a-f]{2}\b",
+    )
+    .expect("mac regex")
+});
+
+/// File extensions that shape like a TLD but are unambiguous asset suffixes
+/// (`image@2x.png`), so an email hit ending in one is a filename, not an
+/// address. Deliberately excludes every real ccTLD (`.md`, `.sh`, `.rs`, …).
+const NON_TLD_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif", "tiff", "mp3", "mp4",
+    "mov", "avi", "wav", "woff", "woff2", "ttf", "eot", "otf",
+];
 
 /// A compiled, ready-to-run set of detectors.
 ///
@@ -137,8 +202,56 @@ impl Detector {
             claimed.iter().any(|&(cs, ce)| s < ce && cs < e)
         };
 
-        // 1. Email (high-precision structure).
+        // Detector order = claim precedence: the most specific, highest-severity
+        // spans claim first so a looser detector can never relabel (or split) a
+        // secret. Secrets → identifiers → the loose phone pattern last.
+
+        // 1. Private-key blocks (largest, most catastrophic spans claim first).
+        for m in RE_PRIVATE_KEY.find_iter(text) {
+            out.push(make_finding(
+                PiiKind::PrivateKey,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 2. Credentialed connection strings — before email, or the
+        //    `user:pass@host` section reads as an address.
+        for m in RE_CONN_STRING.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::ConnectionString,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 3. Email (high-precision structure; filename guard for `img@2x.png`).
         for m in RE_EMAIL.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            let tld = m
+                .as_str()
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if NON_TLD_EXTENSIONS.contains(&tld.as_str()) {
+                continue;
+            }
             out.push(make_finding(
                 PiiKind::Email,
                 None,
@@ -151,7 +264,7 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 2. API keys (prefix + entropy gate). High precision; claim early so a
+        // 4. API keys (prefix + entropy gate). High precision; claim early so a
         //    key body is never re-read as a phone/card.
         for m in RE_API_KEY.find_iter(text) {
             let token = m.as_str();
@@ -177,9 +290,70 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 3. Credit cards (Luhn-validated to cut false positives).
+        // 5. JWTs (strong `eyJ` prefix, no entropy gate needed).
+        for m in RE_JWT.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::Jwt,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 6. IBAN (mod-97 gated) — before cards, whose Luhn gate an IBAN's
+        //    digit tail could coincidentally pass.
+        for m in RE_IBAN.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            if !iban_valid(m.as_str()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::Iban,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 7. Credit cards (Luhn-validated to cut false positives).
         for m in RE_CARD.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            // A digit run written with a leading `+` is an international phone
+            // number, never a card — 13–15 digit phones pass Luhn by luck ~10%
+            // of the time (caught by the G1 bench corpus, round 1).
+            if text[..m.start()].chars().next_back() == Some('+') {
+                continue;
+            }
+            // A digit run right after an IBAN-style prefix (`DE89 …`) is a bank
+            // account tail — a typo'd IBAN fails mod-97 upstream, but its tail
+            // can still pass Luhn by luck (caught by the G1 corpus, round 2).
+            let head = text[..m.start()].trim_end_matches(' ');
+            let iban_prefixed = head
+                .as_bytes()
+                .get(head.len().wrapping_sub(4)..)
+                .is_some_and(|t| {
+                    t.len() == 4
+                        && t[0].is_ascii_uppercase()
+                        && t[1].is_ascii_uppercase()
+                        && t[2].is_ascii_digit()
+                        && t[3].is_ascii_digit()
+                });
+            if iban_prefixed {
                 continue;
             }
             let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
@@ -201,11 +375,37 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 4. IPv6 before IPv4 (the v6 grammar may embed a v4 tail).
+        // 8. SSN (dashed, structurally validated) — before phone, which would
+        //    otherwise catch the same span and mislabel it.
+        for m in RE_SSN.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            if !ssn_valid(m.as_str()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::Ssn,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 9. IPv6 before IPv4 (the v6 grammar may embed a v4 tail). The regex
+        //    cannot use \b (':' splits words), so reject matches glued to
+        //    alphanumeric neighbors — `std::vector` must not yield `d::`.
         for m in RE_IPV6.find_iter(text) {
             // Require at least one colon — guards the alternation against a lone
             // bare token sneaking through on degenerate inputs.
             if !m.as_str().contains(':') {
+                continue;
+            }
+            if !ipv6_boundaries_clean(text, &m) {
                 continue;
             }
             if overlaps(&claimed, m.start(), m.end()) {
@@ -223,7 +423,7 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 5. IPv4.
+        // 10. IPv4.
         for m in RE_IPV4.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
                 continue;
@@ -240,7 +440,25 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 6. Phone (loosest builtin — runs last, never re-claims a card/IP/key).
+        // 11. MAC addresses (after IP: the v6 grammar never matches six hex
+        //     pairs with single colons, but keep the claim order explicit).
+        for m in RE_MAC.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::MacAddress,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 12. Phone (loosest builtin — runs last, never re-claims a card/IP/key).
         for m in RE_PHONE.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
                 continue;
@@ -260,7 +478,7 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 7. Custom user patterns (carry their label + configured confidence).
+        // 13. Custom user patterns (carry their label + configured confidence).
         for (label, re, conf) in &self.custom {
             for m in re.find_iter(text) {
                 if overlaps(&claimed, m.start(), m.end()) {
@@ -283,6 +501,65 @@ impl Detector {
         out.sort_by_key(|f| (f.start, f.end));
         out
     }
+}
+
+/// Structural validation for a dashed SSN candidate: area 001–899 excluding
+/// 666, group 01–99, serial 0001–9999 (the SSA's never-issued ranges).
+fn ssn_valid(s: &str) -> bool {
+    let (Some(area), Some(group), Some(serial)) = (s.get(0..3), s.get(4..6), s.get(7..11)) else {
+        return false;
+    };
+    let Ok(area_n) = area.parse::<u32>() else {
+        return false;
+    };
+    area_n != 0 && area_n != 666 && area_n < 900 && group != "00" && serial != "0000"
+}
+
+/// ISO 7064 mod-97 validation for an IBAN candidate (spaces allowed): move the
+/// first four chars to the end, map A–Z to 10–35, and the resulting number
+/// must be ≡ 1 (mod 97). Computed as a streaming remainder — no bignum.
+fn iban_valid(candidate: &str) -> bool {
+    let compact: String = candidate.chars().filter(|c| !c.is_whitespace()).collect();
+    if !(15..=34).contains(&compact.len()) {
+        return false;
+    }
+    let rearranged = compact[4..].chars().chain(compact[..4].chars());
+    let mut rem: u32 = 0;
+    for c in rearranged {
+        let v = match c {
+            '0'..='9' => c as u32 - '0' as u32,
+            'A'..='Z' => c as u32 - 'A' as u32 + 10,
+            _ => return false,
+        };
+        rem = if v < 10 {
+            (rem * 10 + v) % 97
+        } else {
+            (rem * 100 + v) % 97
+        };
+    }
+    rem == 1
+}
+
+/// The IPv6 regex cannot anchor on \b (':' is a non-word char), so a candidate
+/// glued to an alphanumeric neighbor is a fragment of something else —
+/// `std::vector` would otherwise yield `d::`. A following '.' only disqualifies
+/// when it starts a decimal continuation (digit after), so a sentence-final
+/// `…::1.` still counts.
+fn ipv6_boundaries_clean(text: &str, m: &regex::Match) -> bool {
+    let before_ok = text[..m.start()]
+        .chars()
+        .next_back()
+        .map_or(true, |c| !c.is_ascii_alphanumeric() && c != ':');
+    let after_ok = {
+        let mut it = text[m.end()..].chars();
+        match it.next() {
+            None => true,
+            Some(c) if c.is_ascii_alphanumeric() || c == ':' => false,
+            Some('.') => !it.next().is_some_and(|c| c.is_ascii_digit()),
+            Some(_) => true,
+        }
+    };
+    before_ok && after_ok
 }
 
 /// Luhn checksum validation for candidate credit-card digit strings.
@@ -393,8 +670,20 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
     }
 
     // (d) Not a date the loose pattern would otherwise swallow.
-    !RE_DATE.is_match(s)
+    if RE_DATE.is_match(s) {
+        return false;
+    }
+
+    // (e) Not SSN-shaped. A 3-2-4 dashed group is an SSN (valid or garbage),
+    // never a real phone format — NANP is 3-3-4. Structurally valid SSNs are
+    // claimed by the SSN detector before phone runs; this rejects the invalid
+    // remainder instead of mislabeling it.
+    !RE_SSN_SHAPE.is_match(s)
 }
+
+/// Anchored SSN shape used by [`looks_like_phone`] to reject 3-2-4 dashed runs.
+static RE_SSN_SHAPE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\d{3}-\d{2}-\d{4}$").expect("ssn shape regex"));
 
 /// The typed placeholder a masked span of `kind` is replaced with (04 §7.6).
 ///
@@ -411,6 +700,12 @@ pub fn placeholder(kind: PiiKind) -> &'static str {
         PiiKind::ApiKey => "[API_KEY]",
         PiiKind::IpAddress => "[IP]",
         PiiKind::Phone => "[PHONE]",
+        PiiKind::PrivateKey => "[PRIVATE_KEY]",
+        PiiKind::Jwt => "[JWT]",
+        PiiKind::ConnectionString => "[CONNECTION_STRING]",
+        PiiKind::Ssn => "[SSN]",
+        PiiKind::Iban => "[IBAN]",
+        PiiKind::MacAddress => "[MAC]",
         PiiKind::Custom => "[REDACTED]",
     }
 }
@@ -427,6 +722,12 @@ pub fn kind_key(kind: &PiiKind) -> &'static str {
         PiiKind::ApiKey => "api_key",
         PiiKind::IpAddress => "ip_address",
         PiiKind::Phone => "phone",
+        PiiKind::PrivateKey => "private_key",
+        PiiKind::Jwt => "jwt",
+        PiiKind::ConnectionString => "connection_string",
+        PiiKind::Ssn => "ssn",
+        PiiKind::Iban => "iban",
+        PiiKind::MacAddress => "mac_address",
         PiiKind::Custom => "custom",
     }
 }
@@ -803,6 +1104,224 @@ mod tests {
             let f = d.scan(Side::Request, t);
             assert!(has_kind(&f, PiiKind::Phone), "missed phone in {t:?}");
         }
+    }
+
+    // --- Private-key blocks ---------------------------------------------------
+
+    #[test]
+    fn detects_private_key_block_whole_span() {
+        let d = det();
+        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----";
+        let f = d.scan(Side::Request, text);
+        let k = f
+            .iter()
+            .find(|f| f.kind == PiiKind::PrivateKey)
+            .expect("private key");
+        // The WHOLE block must be the span — masking only the banner would
+        // leave the key material in place.
+        assert_eq!(&text[k.start..k.end], text);
+    }
+
+    #[test]
+    fn detects_truncated_private_key_header() {
+        let d = det();
+        let f = d.scan(Side::Request, "paste: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNz");
+        assert!(has_kind(&f, PiiKind::PrivateKey), "header alone is a leak");
+    }
+
+    #[test]
+    fn ignores_public_key_blocks() {
+        let d = det();
+        let f = d.scan(
+            Side::Request,
+            "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
+        );
+        assert!(!has_kind(&f, PiiKind::PrivateKey), "public keys are not secrets");
+    }
+
+    // --- JWT -------------------------------------------------------------------
+
+    #[test]
+    fn detects_jwt() {
+        let d = det();
+        let text = "bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U sent";
+        let f = d.scan(Side::Request, text);
+        let j = f.iter().find(|f| f.kind == PiiKind::Jwt).expect("jwt");
+        assert!(&text[j.start..j.end].starts_with("eyJhbGciOi"));
+        assert!(&text[j.start..j.end].ends_with("THsR8U"), "full three-part span");
+    }
+
+    #[test]
+    fn ignores_dotted_filenames_as_jwt() {
+        let d = det();
+        let f = d.scan(Side::Request, "file config.prod.yaml loaded");
+        assert!(!has_kind(&f, PiiKind::Jwt));
+    }
+
+    // --- Connection strings ------------------------------------------------------
+
+    #[test]
+    fn detects_credentialed_connection_strings() {
+        let d = det();
+        for cs in [
+            "postgres://admin:hunter2@db.internal:5432/prod",
+            "mysql://root:p4ssw0rd@localhost:3306/app",
+            "mongodb+srv://user:secret@cluster0.example.mongodb.net/db",
+            "redis://default:changeme@10.0.0.5:6379/0",
+        ] {
+            let f = d.scan(Side::Request, &format!("export URL={cs} done"));
+            let hit = f
+                .iter()
+                .find(|f| f.kind == PiiKind::ConnectionString)
+                .unwrap_or_else(|| panic!("missed connection string {cs}"));
+            let text = format!("export URL={cs} done");
+            assert_eq!(&text[hit.start..hit.end], cs, "whole URL is the span");
+            // The credential local-part must NOT also be read as an email.
+            assert!(!has_kind(&f, PiiKind::Email), "claimed before email: {cs}");
+        }
+    }
+
+    #[test]
+    fn ignores_credentialless_urls() {
+        let d = det();
+        for url in [
+            "https://example.com/path?q=1",
+            "postgres://db.internal:5432/prod",
+        ] {
+            let f = d.scan(Side::Request, &format!("fetch {url} now"));
+            assert!(
+                !has_kind(&f, PiiKind::ConnectionString),
+                "no credentials in {url}"
+            );
+        }
+    }
+
+    // --- SSN ---------------------------------------------------------------------
+
+    #[test]
+    fn detects_valid_ssn_and_claims_before_phone() {
+        let d = det();
+        let f = d.scan(Side::Request, "applicant SSN 078-05-1120 on file");
+        assert!(has_kind(&f, PiiKind::Ssn));
+        // The old behavior mislabeled this span as a phone number.
+        assert!(!has_kind(&f, PiiKind::Phone));
+    }
+
+    #[test]
+    fn rejects_never_issued_ssn_ranges() {
+        let d = det();
+        for bad in [
+            "000-12-3456", // area 000
+            "666-12-3456", // area 666
+            "978-05-1120", // area 900+
+            "123-00-4567", // group 00
+            "123-45-0000", // serial 0000
+        ] {
+            let f = d.scan(Side::Request, &format!("id {bad} noted"));
+            assert!(!has_kind(&f, PiiKind::Ssn), "must reject {bad}");
+            // …and the rejected 3-2-4 run must not fall through to phone.
+            assert!(!has_kind(&f, PiiKind::Phone), "SSN shape mislabeled as phone: {bad}");
+        }
+    }
+
+    // --- IBAN ----------------------------------------------------------------------
+
+    #[test]
+    fn detects_valid_ibans_spaced_and_compact() {
+        let d = det();
+        for iban in [
+            "DE89 3704 0044 0532 0130 00",
+            "GB82 WEST 1234 5698 7654 32",
+            "NL91ABNA0417164300",
+            "FR14 2004 1010 0505 0001 3M02 606",
+        ] {
+            let f = d.scan(Side::Request, &format!("wire to {iban} ref 7"));
+            assert!(has_kind(&f, PiiKind::Iban), "missed IBAN {iban}");
+        }
+    }
+
+    #[test]
+    fn rejects_checksum_invalid_iban() {
+        let d = det();
+        let f = d.scan(Side::Request, "wire to DE89 3704 0044 0532 0130 01 ref 7");
+        assert!(!has_kind(&f, PiiKind::Iban), "mod-97 must gate candidates");
+        // The typo'd IBAN's digit tail passes Luhn by luck — it must not be
+        // relabeled as a credit card either.
+        assert!(!has_kind(&f, PiiKind::CreditCard), "IBAN tail is not a card");
+    }
+
+    // --- MAC ---------------------------------------------------------------------
+
+    #[test]
+    fn detects_mac_colon_and_hyphen_forms() {
+        let d = det();
+        for mac in ["00:1a:2b:3c:4d:5e", "00-1A-2B-3C-4D-5E"] {
+            let f = d.scan(Side::Request, &format!("nic at {mac} up"));
+            assert!(has_kind(&f, PiiKind::MacAddress), "missed MAC {mac}");
+        }
+    }
+
+    #[test]
+    fn rejects_short_mac_and_times() {
+        let d = det();
+        for neg in ["00:1a:2b:3c:4d", "time 12:30:45 logged"] {
+            let f = d.scan(Side::Request, neg);
+            assert!(!has_kind(&f, PiiKind::MacAddress), "must reject {neg:?}");
+        }
+    }
+
+    // --- Round-1 bench regressions (G1) ------------------------------------------
+
+    #[test]
+    fn ipv6_compressed_forms_match_full_span() {
+        // Round 1 truncated these at the '::' — masking the truncated span
+        // would leak the remainder of the address.
+        let d = det();
+        for ip in [
+            "2001:db8::8a2e:370:7334",
+            "fe80::1ff:fe23:4567:890a",
+            "::ffff:192.0.2.128",
+        ] {
+            let text = format!("addr {ip} end");
+            let f = d.scan(Side::Request, &text);
+            let hit = f
+                .iter()
+                .find(|f| f.kind == PiiKind::IpAddress)
+                .unwrap_or_else(|| panic!("missed {ip}"));
+            assert_eq!(&text[hit.start..hit.end], ip, "full span for {ip}");
+        }
+    }
+
+    #[test]
+    fn ipv6_ignores_cpp_namespace_fragments() {
+        let d = det();
+        for neg in ["call std::vector now", "use std::cafe here"] {
+            let f = d.scan(Side::Request, neg);
+            assert!(
+                !has_kind(&f, PiiKind::IpAddress),
+                "namespace fragment flagged in {neg:?}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plus_prefixed_luhn_valid_run_is_phone_not_card() {
+        // +234 803 555 1234 is 13 digits and Luhn-valid by coincidence; the
+        // leading '+' says international phone, never a card.
+        let d = det();
+        let f = d.scan(Side::Request, "+234 803 555 1234 is my number");
+        assert!(has_kind(&f, PiiKind::Phone));
+        assert!(!has_kind(&f, PiiKind::CreditCard));
+    }
+
+    #[test]
+    fn email_ignores_asset_filenames() {
+        let d = det();
+        let f = d.scan(Side::Request, "see file image@2x.png here");
+        assert!(!has_kind(&f, PiiKind::Email));
+        // …but a real ccTLD that doubles as an extension-looking suffix stays.
+        let f = d.scan(Side::Request, "mail me at info@example.md soon");
+        assert!(has_kind(&f, PiiKind::Email), ".md is Moldova, keep it");
     }
 
     // --- Custom patterns ----------------------------------------------------
