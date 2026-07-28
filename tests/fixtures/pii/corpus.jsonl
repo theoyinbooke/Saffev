@@ -167,3 +167,6 @@
 {"id":"env-t23","text":"token: unauthorized","expect":[],"trap":"env_assignment","note":"round-9 critic — status-vocab synonym"}
 {"id":"iban-007","text":"iban de89370400440532013000 on the invoice","expect":[{"kind":"iban","value":"de89370400440532013000"}],"note":"round-9 critic — lowercase paste of a valid IBAN"}
 {"id":"phone-009","text":"call +7 777 777 7777 today","expect":[{"kind":"phone","value":"+7 777 777 7777"}],"note":"round-9 critic over-kill — '+' country prefix exempts degenerate-looking real numbers"}
+{"id":"mac-t02","text":"octets 00:11:22:33:44:55:66 raw","expect":[],"trap":"mac_address","note":"round-10 critic FP — seven-group run must not yield its first six pairs"}
+{"id":"conn-006","text":"cache at redis://:p4ssw0rd@cache.internal:6379/0 ready","expect":[{"kind":"connection_string","value":"redis://:p4ssw0rd@cache.internal:6379/0"}],"note":"round-10 critic FN — standard Redis AUTH URL has an empty user"}
+{"id":"cross-007","text":"leaked SECRET=4242424242424242 in the diff","expect":[{"kind":"credit_card","value":"4242424242424242"}],"note":"round-10 critic — pins claim precedence: a card number under a secret key stays a card (env's entropy gate passes on pure digits)"}

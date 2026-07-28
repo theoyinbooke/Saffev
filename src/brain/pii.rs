@@ -118,7 +118,10 @@ static RE_JWT: Lazy<Regex> = Lazy::new(|| {
 /// The whole URL is the finding so masking removes the credential pair AND the
 /// host it unlocks. A URL without a `user:pass@` section never matches.
 static RE_CONN_STRING: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:@/]+:[^\s@/]+@[^\s"']+"#)
+    // The user part is `*`, not `+`: `redis://:p4ssw0rd@cache:6379/0` — the
+    // standard Redis AUTH form — has an EMPTY user before the password
+    // (G1 round-10 critic's FN). The password stays `+`.
+    Regex::new(r#"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s:@/]*:[^\s@/]+@[^\s"']+"#)
         .expect("connection string regex")
 });
 
@@ -722,7 +725,14 @@ impl Detector {
 
         // 11. MAC addresses (after IP: the v6 grammar never matches six hex
         //     pairs with single colons, but keep the claim order explicit).
+        //     A candidate glued to a further `:`/`-` hex group on either side
+        //     is a fragment of a longer run (`00:11:22:33:44:55:66`), not an
+        //     address — the same glue standard the IBAN fix set (G1 round-10
+        //     critic).
         for m in RE_MAC.find_iter(text) {
+            if !mac_boundaries_clean(text, &m) {
+                continue;
+            }
             if overlaps(&claimed, m.start(), m.end()) {
                 continue;
             }
@@ -804,6 +814,20 @@ impl Detector {
         out.sort_by_key(|f| (f.start, f.end));
         out
     }
+}
+
+/// A MAC match glued to a further separator-plus-hex-pair on either side is a
+/// fragment of a longer group run (`00:11:22:33:44:55:66` would otherwise
+/// yield its first six pairs), not an address.
+fn mac_boundaries_clean(text: &str, m: &regex::Match) -> bool {
+    let after = text[m.end()..].as_bytes();
+    let before = text[..m.start()].as_bytes();
+    let glued_after = matches!(after.first(), Some(b':') | Some(b'-'))
+        && after.get(1).is_some_and(u8::is_ascii_hexdigit);
+    let glued_before = matches!(before.last(), Some(b':') | Some(b'-'))
+        && before.len() >= 2
+        && before[before.len() - 2].is_ascii_hexdigit();
+    !glued_after && !glued_before
 }
 
 /// Would the API-key detector claim this exact token? Shared by the scan
@@ -2651,6 +2675,40 @@ mod tests {
             let f = d.scan(Side::Request, benign);
             assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
         }
+    }
+
+    #[test]
+    fn mac_fragments_of_longer_runs_do_not_fire() {
+        // Round-10 critic: a 7-group run must not yield its first six pairs.
+        let d = det();
+        for benign in [
+            "octets 00:11:22:33:44:55:66 raw",
+            "run aa:00:11:22:33:44:55 dump",
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::MacAddress), "must reject {benign:?}");
+        }
+        // A clean six-pair MAC still fires, colon or hyphen.
+        for hit in ["iface 00:1a:2b:3c:4d:5e up", "hw AA-BB-CC-DD-EE-FF ok"] {
+            let f = d.scan(Side::Request, hit);
+            assert!(has_kind(&f, PiiKind::MacAddress), "missed {hit:?}");
+        }
+    }
+
+    #[test]
+    fn detects_empty_user_url_credentials() {
+        // Round-10 critic: the standard Redis AUTH form has an empty user.
+        let d = det();
+        let text = "cache at redis://:p4ssw0rd@cache.internal:6379/0 ready";
+        let f = d.scan(Side::Request, text);
+        let c = f
+            .iter()
+            .find(|f| f.kind == PiiKind::ConnectionString)
+            .expect("empty-user conn string");
+        assert_eq!(
+            &text[c.start..c.end],
+            "redis://:p4ssw0rd@cache.internal:6379/0"
+        );
     }
 
     #[test]

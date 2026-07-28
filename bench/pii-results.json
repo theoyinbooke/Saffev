@@ -1,11 +1,11 @@
 {
   "command": "cargo test --test pii_bench -- --nocapture",
   "corpus": {
-    "cases": 169,
+    "cases": 172,
     "file": "tests/fixtures/pii/corpus.jsonl",
-    "scored": 168,
-    "sha256": "015c75bfd7854cd42a8ea397eec4a64022f315b79adc6006493f3cafea554ae8",
-    "traps": 68,
+    "scored": 171,
+    "sha256": "448059c9dc8361a369ae938fcccb69fe9915e237bc8bd127d6e1eb3ebf7652f9",
+    "traps": 69,
     "xfail": 1
   },
   "detector": "saffev::brain::pii::Detector, default set, no custom patterns",
@@ -23,14 +23,14 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 6
+      "tp": 7
     },
     "credit_card": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 8
+      "tp": 9
     },
     "crypto_wallet": {
       "fn": 0,
@@ -117,6 +117,6 @@
     "fp": 0,
     "precision": 1.0,
     "recall": 1.0,
-    "tp": 108
+    "tp": 110
   }
 }

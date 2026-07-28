@@ -4,7 +4,7 @@
  "scope": "overlapping kinds only \u2014 kinds Presidio lacks are the moat, not a score",
  "kinds": {
   "credit_card": {
-   "tp": 8,
+   "tp": 9,
    "fn": 0,
    "fp": 0,
    "recall": 1.0,
