@@ -32,6 +32,20 @@
       "notes": [],
       "sessions_found": 2
     },
+    "copilot": {
+      "corrupted_nonfatal": true,
+      "fields": {
+        "model": true,
+        "per_message_roles": true,
+        "project": true,
+        "session_id": true,
+        "timestamps": true,
+        "title": true,
+        "token_counts": true
+      },
+      "notes": [],
+      "sessions_found": 3
+    },
     "cursor": {
       "corrupted_nonfatal": true,
       "fields": {
@@ -93,5 +107,5 @@
       "sessions_found": 2
     }
   },
-  "tools_covered": 6
+  "tools_covered": 7
 }

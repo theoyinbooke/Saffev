@@ -1,0 +1,6 @@
+{"type":"session.start","id":"e1","timestamp":"2026-07-02T09:00:00.000Z","data":{"sessionId":"1c7d3b0f-4a52-4e8b-8d2f-9b3c6e5a7f81","context":{"cwd":"/home/dev/fixture-proj"}}}
+this line is not JSON at all {{{
+{"type":"user.message","id":"e2","timestamp":"2026-07-02T09:00:01.000Z","data":{"content":"survives the garbage"}}
+{"type":"assistant.message","id":"e3","timestamp":"2026-07-02T09:00:02.000Z","data":{"content":"noted","model":"gpt-5.2","outputTokens":7}}
+{"type":"assistant.message","id":"e4","timestamp":
+�binary�garbage�

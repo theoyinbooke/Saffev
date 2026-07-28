@@ -23,6 +23,7 @@ pub mod archive;
 pub mod claude_code;
 pub mod codex;
 pub mod codex_server;
+pub mod copilot;
 pub mod cursor;
 pub mod export;
 pub mod gemini;
@@ -48,6 +49,8 @@ pub enum AgentTool {
     VsCode,
     /// Google Gemini CLI (`~/.gemini/tmp/<project>/chats/session-*.jsonl`).
     Gemini,
+    /// GitHub Copilot CLI (`~/.copilot/session-state/<id>/events.jsonl`).
+    Copilot,
 }
 
 impl AgentTool {
@@ -60,6 +63,7 @@ impl AgentTool {
             AgentTool::Cursor => "cursor",
             AgentTool::VsCode => "vscode",
             AgentTool::Gemini => "gemini",
+            AgentTool::Copilot => "copilot",
         }
     }
     /// Human label for the UI.
@@ -71,6 +75,7 @@ impl AgentTool {
             AgentTool::Cursor => "Cursor",
             AgentTool::VsCode => "VS Code",
             AgentTool::Gemini => "Gemini CLI",
+            AgentTool::Copilot => "Copilot CLI",
         }
     }
 }
@@ -172,6 +177,7 @@ pub fn split_id(id: &str) -> Option<(AgentTool, &str)> {
         "cursor" => AgentTool::Cursor,
         "vscode" => AgentTool::VsCode,
         "gemini" => AgentTool::Gemini,
+        "copilot" => AgentTool::Copilot,
         _ => return None,
     };
     Some((tool, raw))
@@ -353,6 +359,7 @@ pub fn readers() -> Vec<Box<dyn AgentReader>> {
         Box::new(cursor::CursorReader::new()),
         Box::new(vscode::VsCodeReader::new()),
         Box::new(gemini::GeminiReader::new()),
+        Box::new(copilot::CopilotReader::new()),
     ]
 }
 

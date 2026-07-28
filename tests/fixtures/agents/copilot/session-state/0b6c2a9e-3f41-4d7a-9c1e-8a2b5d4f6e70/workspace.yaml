@@ -1,0 +1,12 @@
+id: 0b6c2a9e-3f41-4d7a-9c1e-8a2b5d4f6e70
+cwd: /home/dev/fixture-proj
+git_root: /home/dev/fixture-proj
+repository: dev/fixture-proj
+host_type: github
+branch: main
+client_name: github/cli
+name: Add healthcheck endpoint
+user_named: false
+summary_count: 0
+created_at: 2026-07-01T14:28:54.677Z
+updated_at: 2026-07-01T14:31:30.280Z

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use saffev::agents::claude_code::ClaudeCodeReader;
 use saffev::agents::codex::CodexReader;
+use saffev::agents::copilot::CopilotReader;
 use saffev::agents::cursor::CursorReader;
 use saffev::agents::gemini::GeminiReader;
 use saffev::agents::opencode::OpenCodeReader;
@@ -352,6 +353,60 @@ fn agents_fixture_coverage() {
         complete += usize::from(cov.complete());
     }
 
+    // ---- Copilot CLI (round 5 — both store generations) ---------------------
+    {
+        let reader = CopilotReader::with_root(fixture("copilot"));
+        let sessions = reader.list_sessions();
+        let mut cov = Coverage {
+            sessions_found: sessions.len(),
+            ..Default::default()
+        };
+        let good = sessions
+            .iter()
+            .find(|s| s.id.ends_with("8a2b5d4f6e70"))
+            .expect("copilot: good session listed");
+        check_common(&mut cov, &reader, good, "copilot");
+        // Shutdown totals: separate buckets, `input` is non-cached.
+        cov.token_counts = TokenCoverage::Proven(
+            good.input_tokens == 15230
+                && good.output_tokens == 42
+                && good.cache_tokens == 12000 + 2100,
+        );
+        assert_eq!(good.title.as_deref(), Some("Add healthcheck endpoint"));
+        assert_eq!(good.git_branch.as_deref(), Some("main"));
+        // The migrated legacy twin of the good session must dedupe away —
+        // modern wins; and the pre-migration copy must not surface.
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|s| s.id.ends_with("8a2b5d4f6e70"))
+                .count(),
+            1,
+            "copilot: migration twin double-listed"
+        );
+        assert!(good.source_path.contains("session-state"));
+        // Legacy-only session still parses (no tokens exist in that era).
+        let legacy = sessions
+            .iter()
+            .find(|s| s.id.ends_with("000000000001"))
+            .expect("copilot: legacy session listed");
+        assert_eq!(legacy.model.as_deref(), Some("gpt-5"));
+        assert_eq!(legacy.tool_call_count, 1);
+        // Corrupted modern session (hard-killed, garbage + binary lines):
+        // valid records survive; without a shutdown record input is honestly
+        // 0 and output comes from per-message outputTokens.
+        let hurt = sessions
+            .iter()
+            .find(|s| s.id.ends_with("9b3c6e5a7f81"))
+            .expect("copilot: corrupted session still listed");
+        cov.corrupted_nonfatal = hurt.message_count == 2
+            && hurt.started_ts > 0
+            && hurt.input_tokens == 0
+            && hurt.output_tokens == 7;
+        table.insert("copilot".into(), cov.to_json());
+        complete += usize::from(cov.complete());
+    }
+
     // ---- SQLite binary-failure path (round-1 critic's blind spot) ----------
     // The .sql fixtures exercise blob-level corruption only; the snapshot
     // machinery's real hazards are a truncated database and a non-SQLite
@@ -399,7 +454,7 @@ fn agents_fixture_coverage() {
     // Raising this floor is progress (new adapters); lowering it is a
     // regression the harness refuses.
     assert!(
-        complete >= 6,
-        "adapter coverage regressed: {complete} of 6 complete"
+        complete >= 7,
+        "adapter coverage regressed: {complete} of 7 complete"
     );
 }
