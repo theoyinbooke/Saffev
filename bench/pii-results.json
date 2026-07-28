@@ -1,11 +1,11 @@
 {
   "command": "cargo test --test pii_bench -- --nocapture",
   "corpus": {
-    "cases": 87,
+    "cases": 119,
     "file": "tests/fixtures/pii/corpus.jsonl",
-    "scored": 86,
-    "sha256": "e83be5363378c9b4c41acbcb66c48dc9ab60cc1064bc79dafa2c3af769694aaa",
-    "traps": 34,
+    "scored": 118,
+    "sha256": "a2a5430cd7ea418034430fd78df652e910a2992bddccab0324b5497c4fd5a652",
+    "traps": 45,
     "xfail": 1
   },
   "detector": "saffev::brain::pii::Detector, default set, no custom patterns",
@@ -23,7 +23,7 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 4
+      "tp": 6
     },
     "credit_card": {
       "fn": 0,
@@ -32,6 +32,13 @@
       "recall": 1.0,
       "tp": 8
     },
+    "crypto_wallet": {
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 5
+    },
     "email": {
       "fn": 0,
       "fp": 0,
@@ -39,17 +46,24 @@
       "recall": 1.0,
       "tp": 8
     },
+    "env_assignment": {
+      "fn": 0,
+      "fp": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "tp": 4
+    },
     "iban": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 3
+      "tp": 4
     },
     "ip_address": {
       "fn": 0,
-      "fp": 1,
-      "precision": 0.9166666666666666,
+      "fp": 0,
+      "precision": 1.0,
       "recall": 1.0,
       "tp": 11
     },
@@ -58,35 +72,35 @@
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 2
+      "tp": 3
     },
     "mac_address": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 3
+      "tp": 4
     },
     "phone": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 8
+      "tp": 10
     },
     "private_key": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 2
+      "tp": 4
     },
     "ssn": {
       "fn": 0,
       "fp": 0,
       "precision": 1.0,
       "recall": 1.0,
-      "tp": 2
+      "tp": 5
     }
   },
   "known_gaps": [
@@ -100,9 +114,9 @@
   "measurement_boundary": "Detector::scan on corpus text only — no proxy, no store, no masking",
   "overall": {
     "fn": 0,
-    "fp": 1,
-    "precision": 0.9836065573770492,
+    "fp": 0,
+    "precision": 1.0,
     "recall": 1.0,
-    "tp": 60
+    "tp": 81
   }
 }

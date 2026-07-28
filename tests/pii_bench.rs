@@ -88,8 +88,8 @@ fn pii_bench_scorecard() {
     let traps = cases.iter().filter(|c| c.trap.is_some()).count();
     let xfails = cases.iter().filter(|c| c.xfail.is_some()).count();
     let scored = cases.len() - xfails;
-    assert!(scored >= 80, "scored corpus shrank to {scored} cases");
-    assert!(traps >= 30, "adversarial trap count shrank to {traps}");
+    assert!(scored >= 110, "scored corpus shrank to {scored} cases");
+    assert!(traps >= 40, "adversarial trap count shrank to {traps}");
 
     let mut kinds: BTreeMap<String, Tally> = BTreeMap::new();
     let mut known_gaps: Vec<serde_json::Value> = Vec::new();
@@ -213,7 +213,7 @@ fn pii_bench_scorecard() {
     assert_floor("email", 1.0, 1.0);
     assert_floor("credit_card", 1.0, 1.0);
     assert_floor("api_key", 1.0, 1.0);
-    assert_floor("ip_address", 0.91, 1.0);
+    assert_floor("ip_address", 1.0, 1.0);
     assert_floor("phone", 1.0, 1.0);
     assert_floor("private_key", 1.0, 1.0);
     assert_floor("jwt", 1.0, 1.0);
@@ -221,4 +221,6 @@ fn pii_bench_scorecard() {
     assert_floor("ssn", 1.0, 1.0);
     assert_floor("iban", 1.0, 1.0);
     assert_floor("mac_address", 1.0, 1.0);
+    assert_floor("env_assignment", 1.0, 1.0);
+    assert_floor("crypto_wallet", 1.0, 1.0);
 }

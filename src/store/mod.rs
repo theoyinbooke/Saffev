@@ -1971,6 +1971,8 @@ fn pii_kind_str(k: PiiKind) -> &'static str {
         PiiKind::Ssn => "ssn",
         PiiKind::Iban => "iban",
         PiiKind::MacAddress => "mac_address",
+        PiiKind::EnvAssignment => "env_assignment",
+        PiiKind::CryptoWallet => "crypto_wallet",
         PiiKind::Custom => "custom",
     }
 }
@@ -1988,6 +1990,8 @@ fn parse_pii_kind(s: &str) -> PiiKind {
         "ssn" => PiiKind::Ssn,
         "iban" => PiiKind::Iban,
         "mac_address" => PiiKind::MacAddress,
+        "env_assignment" => PiiKind::EnvAssignment,
+        "crypto_wallet" => PiiKind::CryptoWallet,
         _ => PiiKind::Custom,
     }
 }

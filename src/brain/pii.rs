@@ -39,11 +39,14 @@ static RE_EMAIL: Lazy<Regex> = Lazy::new(|| {
         .expect("email regex")
 });
 
-/// Phone numbers: optional country code, common separators, 7–14 significant
-/// digits. Tightened to avoid swallowing arbitrary digit runs / card numbers.
+/// Phone numbers: spaceless E.164 (`+15551234567`), or optional country code,
+/// common separators, 7–14 significant digits. Tightened to avoid swallowing
+/// arbitrary digit runs / card numbers.
 static RE_PHONE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:\+?\d{1,3}[ .\-]?)?(?:\(\d{1,4}\)[ .\-]?)?\d{2,4}(?:[ .\-]\d{2,4}){1,3}")
-        .expect("phone regex")
+    Regex::new(
+        r"\+[1-9]\d{6,14}\b|(?:\+?\d{1,3}[ .\-]?)?(?:\(\d{1,4}\)[ .\-]?)?\d{2,4}(?:[ .\-]\d{2,4}){1,3}",
+    )
+    .expect("phone regex")
 });
 
 /// Date shapes the loose phone candidate would otherwise swallow (ISO
@@ -142,6 +145,50 @@ static RE_MAC: Lazy<Regex> = Lazy::new(|| {
     .expect("mac regex")
 });
 
+/// `.env`-style assignment candidate (`KEY=value`, `KEY="value"`). The regex
+/// only proposes; [`env_key_is_secret`] must accept the key (it names a
+/// credential) and [`env_value_is_real`] the value (placeholders and
+/// interpolations don't count) before a finding is emitted. The whole
+/// assignment is the finding so masking removes the value, not just part.
+static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\b[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\r\n]{4,}"|'[^'\r\n]{4,}'|[^\s"';]{6,})"#)
+        .expect("env assignment regex")
+});
+
+/// `Key=Value;`-style connection string (ODBC / ADO.NET / JDBC properties)
+/// carrying a `Password=`/`Pwd=` pair among other pairs. Mirrors the URL form:
+/// the whole property run is the finding, so the credential AND the
+/// coordinates it unlocks are masked together. A lone `PASSWORD=…` with no
+/// sibling pairs is not a connection string — the env-assignment detector
+/// owns that shape.
+static RE_CONN_KV: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(?:[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};\s*){1,10}(?:password|pwd) ?= ?[^;\r\n]{1,128};?(?: ?[a-z][a-z0-9 _]{1,24}=[^;\r\n]{1,128};?){0,10}",
+    )
+    .expect("kv connection string regex")
+});
+
+/// Cryptocurrency wallet candidates: legacy base58 BTC (`1…`/`3…`), bech32
+/// (`bc1…`), EVM `0x` + 40 hex. Base58 candidates are verified with the real
+/// base58check double-SHA-256 checksum and bech32 with the BIP-173/350
+/// polymod, so lookalike alphanumeric tokens die at validation, not in the
+/// regex. An EVM address is accepted on shape alone (EIP-55 needs keccak,
+/// which we don't ship) — the mandatory `0x` prefix and exact 40-hex length
+/// already exclude bare git SHAs and 64-hex tx hashes.
+static RE_WALLET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"\b(?:[13][1-9A-HJ-NP-Za-km-z]{25,34}|bc1[02-9ac-hj-np-z]{11,87}|0x[0-9a-fA-F]{40})\b",
+    )
+    .expect("wallet regex")
+});
+
+/// SSN in dash-less or spaced form (`078051120`, `078 05 1120`) — claimed only
+/// inside explicit SSN context ([`ssn_context`]): a bare nine-digit run is far
+/// too common to claim deterministically without it. The dashed form needs no
+/// context and is handled by [`RE_SSN`].
+static RE_SSN_LOOSE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{3} ?\d{2} ?\d{4}\b").expect("ssn loose regex"));
+
 /// File extensions that shape like a TLD but are unambiguous asset suffixes
 /// (`image@2x.png`), so an email hit ending in one is a filename, not an
 /// address. Deliberately excludes every real ccTLD (`.md`, `.sh`, `.rs`, …).
@@ -174,6 +221,10 @@ impl Detector {
         Lazy::force(&RE_API_KEY);
         Lazy::force(&RE_IPV4);
         Lazy::force(&RE_IPV6);
+        Lazy::force(&RE_ENV_ASSIGN);
+        Lazy::force(&RE_CONN_KV);
+        Lazy::force(&RE_WALLET);
+        Lazy::force(&RE_SSN_LOOSE);
 
         let mut compiled = Vec::with_capacity(custom.len());
         for pat in custom {
@@ -221,13 +272,61 @@ impl Detector {
         }
 
         // 2. Credentialed connection strings — before email, or the
-        //    `user:pass@host` section reads as an address.
+        //    `user:pass@host` section reads as an address. URL form first,
+        //    then the `Key=Value;` property form (ODBC / ADO.NET / JDBC).
         for m in RE_CONN_STRING.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
                 continue;
             }
             out.push(make_finding(
                 PiiKind::ConnectionString,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+        for m in RE_CONN_KV.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::ConnectionString,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 2b. `.env`-style credential assignments — before email so an
+        //     address-shaped value (`SMTP_PASSWORD=p@ss.example`) is claimed
+        //     whole, and after connection strings so a `DATABASE_URL=…` value
+        //     stays a connection string, not two halves.
+        for m in RE_ENV_ASSIGN.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            let (key, value) = m.as_str().split_once('=').unwrap_or(("", ""));
+            if !env_key_is_secret(key) || !env_value_is_real(value) {
+                continue;
+            }
+            // Defer to the more specific secret detectors: a value that is
+            // itself a known-prefix API key or a JWT gets claimed by those
+            // steps instead — their kind label carries more signal than
+            // "env credential".
+            let v = value.trim_matches(|c| c == '"' || c == '\'');
+            if v.starts_with("eyJ") || RE_API_KEY.is_match(v) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::EnvAssignment,
                 None,
                 side,
                 m.start(),
@@ -376,12 +475,35 @@ impl Detector {
         }
 
         // 8. SSN (dashed, structurally validated) — before phone, which would
-        //    otherwise catch the same span and mislabel it.
+        //    otherwise catch the same span and mislabel it. The dash-less and
+        //    spaced forms additionally require explicit SSN context.
         for m in RE_SSN.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
                 continue;
             }
             if !ssn_valid(m.as_str()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::Ssn,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+        for m in RE_SSN_LOOSE.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            if !ssn_context(text, m.start()) {
+                continue;
+            }
+            let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
+            if !ssn_digits_valid(&digits) {
                 continue;
             }
             out.push(make_finding(
@@ -423,9 +545,16 @@ impl Detector {
             claimed.push((m.start(), m.end()));
         }
 
-        // 10. IPv4.
+        // 10. IPv4. A dotted quad right after version-context wording
+        //     ("build 1.2.3.4", "version 1.2.3.4") is a version string, not an
+        //     address (G1 corpus, ip-t04) — the only shipped detector FP of
+        //     round 2. The gate fires on those exact preceding tokens only, so
+        //     addresses in prose ("ping 1.2.3.4", "from 1.2.3.4") are untouched.
         for m in RE_IPV4.find_iter(text) {
             if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            if version_context(text, m.start()) {
                 continue;
             }
             out.push(make_finding(
@@ -448,6 +577,29 @@ impl Detector {
             }
             out.push(make_finding(
                 PiiKind::MacAddress,
+                None,
+                side,
+                m.start(),
+                m.end(),
+                Confidence::High,
+                m.as_str(),
+            ));
+            claimed.push((m.start(), m.end()));
+        }
+
+        // 11b. Crypto wallets — checksum-validated (base58check / bech32
+        //      polymod), so this runs on shape candidates only. After MAC/IP
+        //      (no shape overlap, keep the order explicit), before the loose
+        //      phone pattern.
+        for m in RE_WALLET.find_iter(text) {
+            if overlaps(&claimed, m.start(), m.end()) {
+                continue;
+            }
+            if !wallet_valid(m.as_str()) {
+                continue;
+            }
+            out.push(make_finding(
+                PiiKind::CryptoWallet,
                 None,
                 side,
                 m.start(),
@@ -506,13 +658,200 @@ impl Detector {
 /// Structural validation for a dashed SSN candidate: area 001–899 excluding
 /// 666, group 01–99, serial 0001–9999 (the SSA's never-issued ranges).
 fn ssn_valid(s: &str) -> bool {
-    let (Some(area), Some(group), Some(serial)) = (s.get(0..3), s.get(4..6), s.get(7..11)) else {
+    let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+    ssn_digits_valid(&digits)
+}
+
+/// The same SSA never-issued-range check on a bare nine-digit string
+/// (area-group-serial as 3-2-4).
+fn ssn_digits_valid(digits: &str) -> bool {
+    let (Some(area), Some(group), Some(serial)) =
+        (digits.get(0..3), digits.get(3..5), digits.get(5..9))
+    else {
         return false;
     };
+    if digits.len() != 9 {
+        return false;
+    }
     let Ok(area_n) = area.parse::<u32>() else {
         return false;
     };
     area_n != 0 && area_n != 666 && area_n < 900 && group != "00" && serial != "0000"
+}
+
+/// Dash-less / spaced SSN candidates only count inside explicit SSN context:
+/// "ssn" or "social security" within the preceding few words. Presidio's
+/// recognizer leans on the same context signal — a bare nine-digit run has no
+/// deterministic claim to being an SSN.
+fn ssn_context(text: &str, start: usize) -> bool {
+    let from = text[..start]
+        .char_indices()
+        .rev()
+        .nth(31)
+        .map_or(0, |(i, _)| i);
+    let head = text[from..start].to_ascii_lowercase();
+    head.contains("ssn") || head.contains("social security")
+}
+
+/// A dotted quad immediately after version-context wording is a version
+/// string, not an address (G1 corpus, ip-t04). Only these exact preceding
+/// tokens gate.
+fn version_context(text: &str, start: usize) -> bool {
+    let head = text[..start].trim_end();
+    let last = head
+        .rsplit(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("");
+    matches!(
+        last.to_ascii_lowercase().as_str(),
+        "build" | "version" | "release" | "ver" | "rev"
+    )
+}
+
+/// Does an assignment KEY name a credential? Segment-based so `AUTHOR` never
+/// matches on its `AUTH` substring: the key is split on `_` and a segment must
+/// equal a credential word, or an `X_KEY` pair must qualify (so `PUBLIC_KEY`
+/// and `CACHE_KEY` stay out while `API_KEY` / `SIGNING_KEY` are in).
+fn env_key_is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    let segments: Vec<&str> = upper.split('_').filter(|s| !s.is_empty()).collect();
+    const SECRET_WORDS: &[&str] = &[
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PWD",
+        "TOKEN",
+        "APIKEY",
+        "CREDENTIAL",
+        "CREDENTIALS",
+    ];
+    const KEY_QUALIFIERS: &[&str] = &[
+        "API", "ACCESS", "PRIVATE", "SIGNING", "ENCRYPTION", "MASTER", "LICENSE", "SSH",
+    ];
+    if segments.iter().any(|s| SECRET_WORDS.contains(s)) {
+        return true;
+    }
+    segments
+        .windows(2)
+        .any(|w| w[1] == "KEY" && KEY_QUALIFIERS.contains(&w[0]))
+}
+
+/// Is an assignment VALUE real secret material rather than a placeholder?
+/// Rejects interpolations (`$VAR`, `${VAR}`, `{{tpl}}`, `%VAR%`), angle-bracket
+/// placeholders, well-known placeholder words, and low-entropy runs
+/// (`xxxxxxxx`) that a template would use where a secret goes.
+fn env_value_is_real(value: &str) -> bool {
+    let v = value
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    if v.len() < 4 {
+        return false;
+    }
+    if v.starts_with('$') || v.starts_with('<') || v.starts_with("{{") || v.starts_with('%') {
+        return false;
+    }
+    const PLACEHOLDERS: &[&str] = &[
+        "changeme",
+        "change_me",
+        "change-me",
+        "placeholder",
+        "example",
+        "your-key-here",
+        "redacted",
+        "true",
+        "false",
+        "none",
+        "null",
+    ];
+    if PLACEHOLDERS.contains(&v.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    shannon_entropy(v) >= 2.0
+}
+
+/// Wallet candidate dispatch: base58check for legacy BTC, BIP-173/350 polymod
+/// for bech32, shape-only for EVM `0x` hex (already fully constrained by the
+/// regex).
+fn wallet_valid(s: &str) -> bool {
+    if s.starts_with("0x") {
+        true
+    } else if s.starts_with("bc1") {
+        bech32_valid(s)
+    } else {
+        base58check_valid(s)
+    }
+}
+
+/// Real base58check validation: decode, require the 25-byte
+/// version+hash160+checksum layout, and verify the double-SHA-256 checksum. A
+/// random base58-alphabet string has a ~2⁻³² chance of surviving.
+fn base58check_valid(s: &str) -> bool {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut payload: Vec<u8> = Vec::with_capacity(25);
+    for c in s.bytes() {
+        let Some(digit) = ALPHABET.iter().position(|&a| a == c) else {
+            return false;
+        };
+        let mut carry = digit as u32;
+        for byte in payload.iter_mut().rev() {
+            carry += *byte as u32 * 58;
+            *byte = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 {
+            payload.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    // Leading '1's encode leading zero bytes.
+    let zeros = s.bytes().take_while(|&b| b == b'1').count();
+    let mut full = vec![0u8; zeros];
+    full.extend_from_slice(&payload);
+    if full.len() != 25 {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+    let once = Sha256::digest(&full[..21]);
+    let twice = Sha256::digest(once);
+    twice[..4] == full[21..25]
+}
+
+/// BIP-173 (bech32) / BIP-350 (bech32m) checksum verification for a `bc1…`
+/// candidate. Accepts either constant so both segwit v0 and taproot addresses
+/// validate.
+fn bech32_valid(s: &str) -> bool {
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let Some((hrp, data)) = s.rsplit_once('1') else {
+        return false;
+    };
+    if hrp.is_empty() || data.len() < 6 {
+        return false;
+    }
+    let mut chk: u32 = 1;
+    let mut polymod = |v: u32| {
+        let top = chk >> 25;
+        chk = ((chk & 0x1ff_ffff) << 5) ^ v;
+        for (i, g) in GEN.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    };
+    for b in hrp.bytes() {
+        polymod((b >> 5) as u32);
+    }
+    polymod(0);
+    for b in hrp.bytes() {
+        polymod((b & 0x1f) as u32);
+    }
+    for c in data.bytes() {
+        let Some(v) = CHARSET.iter().position(|&a| a == c) else {
+            return false;
+        };
+        polymod(v as u32);
+    }
+    chk == 1 || chk == 0x2bc8_30a3
 }
 
 /// ISO 7064 mod-97 validation for an IBAN candidate (spaces allowed): move the
@@ -656,10 +995,21 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
         return false;
     }
 
-    // (b) Must look like a phone, not a dot-grouped number / version / IP-ish run.
+    // (b) Must look like a phone, not a dot-grouped number / version / IP-ish
+    // run. Dot separators only qualify in the unambiguous NANP 3.3.4 shape
+    // (`555.123.4567`) — never the 1.2.3.4 shapes versions use.
     let has_plus = s.trim_start().starts_with('+');
     let has_space_or_dash = s.bytes().any(|b| b == b' ' || b == b'-');
-    if !has_plus && !has_space_or_dash {
+    let nanp_dots = {
+        let groups: Vec<&str> = s.split('.').collect();
+        groups.len() == 3
+            && [3, 3, 4]
+                == [groups[0].len(), groups[1].len(), groups[2].len()]
+            && groups
+                .iter()
+                .all(|g| g.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !has_plus && !has_space_or_dash && !nanp_dots {
         return false;
     }
 
@@ -706,6 +1056,8 @@ pub fn placeholder(kind: PiiKind) -> &'static str {
         PiiKind::Ssn => "[SSN]",
         PiiKind::Iban => "[IBAN]",
         PiiKind::MacAddress => "[MAC]",
+        PiiKind::EnvAssignment => "[ENV_SECRET]",
+        PiiKind::CryptoWallet => "[WALLET]",
         PiiKind::Custom => "[REDACTED]",
     }
 }
@@ -728,6 +1080,8 @@ pub fn kind_key(kind: &PiiKind) -> &'static str {
         PiiKind::Ssn => "ssn",
         PiiKind::Iban => "iban",
         PiiKind::MacAddress => "mac_address",
+        PiiKind::EnvAssignment => "env_assignment",
+        PiiKind::CryptoWallet => "crypto_wallet",
         PiiKind::Custom => "custom",
     }
 }
@@ -1501,6 +1855,155 @@ mod tests {
             // Offsets must index valid UTF-8 boundaries.
             assert!(text.is_char_boundary(finding.start));
             assert!(text.is_char_boundary(finding.end));
+        }
+    }
+
+    // --- env credential assignments (G1 round 3) ----------------------------
+
+    #[test]
+    fn detects_env_credential_assignments() {
+        let d = det();
+        let text = "DB_PASSWORD=hunter2secret AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let f = d.scan(Side::Request, text);
+        let spans: Vec<&str> = f
+            .iter()
+            .filter(|f| f.kind == PiiKind::EnvAssignment)
+            .map(|f| &text[f.start..f.end])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "DB_PASSWORD=hunter2secret",
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            ],
+            "the whole assignment is the finding"
+        );
+    }
+
+    #[test]
+    fn env_assignment_rejects_config_and_placeholders() {
+        let d = det();
+        for benign in [
+            "DEBUG=true",                    // key names no credential
+            "PORT=8080",                     // ditto
+            "PASSWORD=changeme",             // placeholder value
+            "API_TOKEN=${VAULT_TOKEN}",      // interpolation, not a secret
+            "AUTHOR=JohnSmith99",            // AUTH must not match inside AUTHOR
+            "PUBLIC_KEY=abcdef1234567890",   // public halves are not secrets
+            "SECRET_KEY=xxxxxxxxxxxxxxxx",   // zero-entropy template filler
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign}");
+        }
+    }
+
+    #[test]
+    fn env_assignment_defers_to_specific_secret_kinds() {
+        // A value that is itself a prefixed API key keeps its specific label.
+        let d = det();
+        let text = "GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a";
+        let f = d.scan(Side::Request, text);
+        assert!(has_kind(&f, PiiKind::ApiKey));
+        assert!(!has_kind(&f, PiiKind::EnvAssignment));
+    }
+
+    // --- Key=Value; connection strings (G1 round 3) -------------------------
+
+    #[test]
+    fn detects_kv_connection_string_whole_span() {
+        let d = det();
+        let text = "Server=db.internal;Database=app;User Id=svc;Password=Hunter2!;Encrypt=true";
+        let f = d.scan(Side::Request, text);
+        let c = f
+            .iter()
+            .find(|f| f.kind == PiiKind::ConnectionString)
+            .expect("kv connection string");
+        assert_eq!(&text[c.start..c.end], text, "whole property run claimed");
+    }
+
+    #[test]
+    fn kv_pairs_without_password_are_not_a_connection_string() {
+        let d = det();
+        let f = d.scan(Side::Request, "Server=db.internal;Database=app;Encrypt=true");
+        assert!(!has_kind(&f, PiiKind::ConnectionString));
+    }
+
+    // --- version-context gate (G1 round 3, ip-t04) --------------------------
+
+    #[test]
+    fn version_strings_are_not_ip_addresses() {
+        let d = det();
+        for benign in ["build 1.2.3.4 shipped", "upgraded to version 2.14.0.1"] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::IpAddress), "must reject {benign}");
+        }
+        // The gate is token-exact: an address in plain prose is untouched.
+        let f = d.scan(Side::Request, "ping 1.2.3.4 from the gateway");
+        assert!(has_kind(&f, PiiKind::IpAddress));
+    }
+
+    // --- SSN context forms (G1 round 3) -------------------------------------
+
+    #[test]
+    fn ssn_dashless_and_spaced_need_context() {
+        let d = det();
+        for hit in ["SSN: 078051120", "her social security number is 078 05 1120"] {
+            let f = d.scan(Side::Request, hit);
+            assert!(has_kind(&f, PiiKind::Ssn), "missed {hit:?}");
+        }
+        for benign in [
+            "invoice 078051120 attached", // no SSN context
+            "SSN: 000051120",             // context, but never-issued area
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::Ssn), "must reject {benign:?}");
+        }
+    }
+
+    // --- phone shapes (G1 round 3) ------------------------------------------
+
+    #[test]
+    fn detects_spaceless_e164_and_nanp_dots() {
+        let d = det();
+        for hit in ["call +15551234567 today", "fax 555.123.4567 available"] {
+            let f = d.scan(Side::Request, hit);
+            assert!(has_kind(&f, PiiKind::Phone), "missed {hit:?}");
+        }
+    }
+
+    // --- crypto wallets (G1 round 3) ----------------------------------------
+
+    #[test]
+    fn detects_checksum_valid_wallets() {
+        let d = det();
+        for wallet in [
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", // legacy P2PKH (genesis), base58check
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", // P2SH, base58check
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", // segwit v0, BIP-173
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0", // taproot, BIP-350
+            "0x52908400098527886E0F7030069857D2E4169EE7", // EVM hex
+        ] {
+            let text = format!("refund to {wallet} please");
+            let f = d.scan(Side::Request, &text);
+            let m = f
+                .iter()
+                .find(|f| f.kind == PiiKind::CryptoWallet)
+                .unwrap_or_else(|| panic!("missed {wallet}"));
+            assert_eq!(&text[m.start..m.end], wallet);
+        }
+    }
+
+    #[test]
+    fn rejects_checksum_invalid_wallets_and_hash_lookalikes() {
+        let d = det();
+        for benign in [
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", // base58check checksum broken
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdx", // bech32 checksum broken
+            "e83be5363378c9b4c41acbcb66c48dc9ab60cc10", // bare 40-hex (git SHA), no 0x
+            "0xe83be5363378c9b4c41acbcb66c48dc9ab60cc1064bc79dafa2c3af769694aaa", // 64-hex tx hash
+        ] {
+            let f = d.scan(Side::Request, benign);
+            assert!(!has_kind(&f, PiiKind::CryptoWallet), "must reject {benign}");
         }
     }
 }

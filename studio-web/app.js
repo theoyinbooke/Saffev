@@ -155,9 +155,10 @@
     api_key: 'API key / token', ip_address: 'IP address', custom: 'Custom pattern',
     private_key: 'Private key block', jwt: 'JWT', connection_string: 'Connection string',
     ssn: 'SSN', iban: 'IBAN', mac_address: 'MAC address',
+    env_assignment: 'Env credential', crypto_wallet: 'Crypto wallet',
   };
   // Credential-bearing kinds — badge gold like api_key.
-  const PII_SECRET_KINDS = ['api_key', 'private_key', 'jwt', 'connection_string'];
+  const PII_SECRET_KINDS = ['api_key', 'private_key', 'jwt', 'connection_string', 'env_assignment'];
   function piiLabel(kind, label) {
     if (kind === 'custom' && label) return label;
     return PII_LABEL[kind] || kind;
@@ -168,7 +169,7 @@
     return {
       email: 'EMAIL', phone: 'PHONE', credit_card: 'CARD', api_key: 'API-KEY', ip_address: 'IP',
       private_key: 'PRIV-KEY', jwt: 'JWT', connection_string: 'CONN-STR', ssn: 'SSN', iban: 'IBAN',
-      mac_address: 'MAC', custom: 'CUSTOM',
+      mac_address: 'MAC', env_assignment: 'ENV-SECRET', crypto_wallet: 'WALLET', custom: 'CUSTOM',
     }[kind] || String(kind).toUpperCase();
   }
 
@@ -205,6 +206,7 @@
     return {
       email: ICON.mail, api_key: ICON.key, credit_card: ICON.card, phone: ICON.phone, ip_address: ICON.globe,
       private_key: ICON.key, jwt: ICON.key, connection_string: ICON.plug, iban: ICON.card, mac_address: ICON.server,
+      env_assignment: ICON.key, crypto_wallet: ICON.card,
     }[kind] || ICON.shieldAlert;
   }
 

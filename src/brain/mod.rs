@@ -45,6 +45,10 @@ pub enum PiiKind {
     Iban,
     /// MAC address (colon or hyphen form).
     MacAddress,
+    /// `.env`-style credential assignment (`DB_PASSWORD=…`, `API_TOKEN=…`).
+    EnvAssignment,
+    /// Cryptocurrency wallet address (base58check / bech32 / EVM hex).
+    CryptoWallet,
     /// A user-defined custom pattern (carries its label).
     Custom,
 }
