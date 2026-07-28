@@ -345,6 +345,7 @@ impl CodexReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: 0, // Codex reports cached (read) only
             source_path: path.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })

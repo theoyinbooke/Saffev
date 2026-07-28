@@ -51,6 +51,13 @@ fn ms_of_rfc3339(s: &str) -> i64 {
     saffev::agents::rfc3339_millis(s)
 }
 
+/// UTC RFC3339 of a millis timestamp (date prefix comparisons).
+fn utc_of(ms: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .map(|t| format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day()))
+        .unwrap_or_default()
+}
+
 #[test]
 fn costs_match_ccusage() {
     let pricing = PricingConfig::default();
@@ -205,7 +212,51 @@ fn costs_match_ccusage() {
     let d = rel_delta(ours_total.cost_usd, ref_session_cost);
     max_cost_delta = max_cost_delta.max(d);
     assert!(d <= tol, "session-sum cost delta {:.4} > 2%", d);
-    assert_eq!(ref_sessions.len(), 3, "fixture has 3 sessions");
+    assert_eq!(ref_sessions.len(), 4, "fixture has 4 sessions");
+
+    // ---- Monthly rows -----------------------------------------------------------
+    let ours_monthly = usage::monthly(&events, &pricing);
+    let ref_monthly = reference["monthly"]["monthly"].as_array().unwrap();
+    assert_eq!(ours_monthly.len(), ref_monthly.len(), "monthly row count differs");
+    for (ours, theirs) in ours_monthly.iter().zip(ref_monthly) {
+        assert_eq!(ours.month, theirs["period"].as_str().unwrap(), "monthly period");
+        let d = rel_delta(ours.totals.cost_usd, theirs["totalCost"].as_f64().unwrap());
+        max_cost_delta = max_cost_delta.max(d);
+        assert!(d <= tol, "month {} cost delta {:.4} > 2%", ours.month, d);
+        assert_eq!(
+            ours.totals.input,
+            theirs["inputTokens"].as_u64().unwrap(),
+            "month {} input tokens",
+            ours.month
+        );
+    }
+    deltas.push(serde_json::json!({
+        "compared": "monthly",
+        "saffev": ours_monthly.iter().map(|m| m.totals.cost_usd).sum::<f64>(),
+        "ccusage": ref_monthly.iter().map(|m| m["totalCost"].as_f64().unwrap()).sum::<f64>(),
+        "delta_pct": 0.0,
+        "explanation": "UTC month grouping on both sides",
+    }));
+
+    // ---- Adversarial shapes (round-3; each diverged before it was pinned) -------
+    // A record missing input_tokens is DROPPED (ccusage schema behavior),
+    // never zero-defaulted: the 500-output record must not be counted.
+    assert!(
+        events.iter().all(|e| !(e.input == 0 && e.output == 500)),
+        "missing-input record was not dropped"
+    );
+    // A stored costUSD is trusted (ccusage auto mode), not recomputed.
+    let stored = events
+        .iter()
+        .find(|e| e.stored_cost_usd.is_some())
+        .expect("stored-cost event present");
+    assert!((stored.cost(&pricing) - 0.1234).abs() < 1e-9, "stored costUSD not trusted");
+    // The entry at exactly block_start+5h stays IN the block (strict >).
+    let day23_block = ours_blocks
+        .iter()
+        .find(|b| !b.is_gap && utc_of(b.start_ts).starts_with("2026-07-23"))
+        .expect("2026-07-23 block");
+    assert_eq!(day23_block.totals.entries, 3, "boundary entry left its block");
 
     // ---- Artifact ---------------------------------------------------------------
     let out = serde_json::json!({

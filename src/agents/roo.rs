@@ -76,11 +76,14 @@ impl RooReader {
 
     /// Read one task's `history_item.json`. Returns
     /// `(ts, task, non_cached_in, out, cache, workspace)`.
-    fn history_item(task_dir: &Path) -> Option<(i64, Option<String>, u64, u64, u64, Option<String>)> {
+    #[allow(clippy::type_complexity)]
+    fn history_item(
+        task_dir: &Path,
+    ) -> Option<(i64, Option<String>, u64, u64, u64, u64, Option<String>)> {
         let text = fs::read_to_string(task_dir.join("history_item.json")).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
-        let cache = v.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0)
-            + v.get("cacheReads").and_then(Value::as_u64).unwrap_or(0);
+        let cache_w = v.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0);
+        let cache = cache_w + v.get("cacheReads").and_then(Value::as_u64).unwrap_or(0);
         // Roo convention: tokensIn INCLUDES cache tokens — subtract, or the
         // cached portion is counted (and priced) twice.
         let total_in = v.get("tokensIn").and_then(Value::as_u64).unwrap_or(0);
@@ -93,6 +96,7 @@ impl RooReader {
             total_in.saturating_sub(cache),
             v.get("tokensOut").and_then(Value::as_u64).unwrap_or(0),
             cache,
+            cache_w,
             v.get("workspace").and_then(Value::as_str).map(String::from),
         ))
     }
@@ -114,22 +118,23 @@ impl RooReader {
         let task_dir = root.join("tasks").join(task_id);
         let (messages, msg_count, tool_count, _tmodel, tlast, tfirst) =
             ClineReader::transcript(&task_dir, with_messages);
-        let (ui_title, ui_in_total, ui_out, ui_cache, ui_last) =
+        let (ui_title, ui_in_total, ui_out, ui_cache, ui_cache_w, ui_last) =
             ClineReader::ui_fallback(&task_dir);
         let item = Self::history_item(&task_dir);
         if msg_count == 0 && item.is_none() && ui_title.is_none() {
             return None;
         }
-        let (hist_ts, hist_task, hist_in, hist_out, hist_cache, workspace) =
-            item.unwrap_or((0, None, 0, 0, 0, None));
-        let (inp, outp, cache) = if hist_in + hist_out + hist_cache > 0 {
-            (hist_in, hist_out, hist_cache)
+        let (hist_ts, hist_task, hist_in, hist_out, hist_cache, hist_cache_w, workspace) =
+            item.unwrap_or((0, None, 0, 0, 0, 0, None));
+        let (inp, outp, cache, cache_w) = if hist_in + hist_out + hist_cache > 0 {
+            (hist_in, hist_out, hist_cache, hist_cache_w)
         } else {
             // Same total-includes-cache convention in the ui payloads.
             (
                 ui_in_total.saturating_sub(ui_cache),
                 ui_out,
                 ui_cache,
+                ui_cache_w,
             )
         };
         // Roo task dirs are uuidv7 in current versions (epoch-ms names are
@@ -156,6 +161,7 @@ impl RooReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: cache_w,
             source_path: task_dir.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })

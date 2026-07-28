@@ -131,6 +131,7 @@ impl GooseReader {
             input_tokens: row.inp.max(0) as u64,
             output_tokens: row.outp.max(0) as u64,
             cache_tokens: row.cache.max(0) as u64,
+            cache_write_tokens: row.cache_w.max(0) as u64,
             source_path: "sessions.db".to_string(),
         }
     }
@@ -148,6 +149,7 @@ struct SessionRow {
     inp: i64,
     outp: i64,
     cache: i64,
+    cache_w: i64,
 }
 
 /// `SELECT` list shared by list/detail. Accumulated totals are the real
@@ -160,7 +162,10 @@ const SESSION_COLS: &str = "id, name, working_dir, created_at, updated_at, provi
           THEN COALESCE(accumulated_output_tokens,0) ELSE COALESCE(output_tokens,0) END, \
      CASE WHEN COALESCE(accumulated_input_tokens,0) + COALESCE(accumulated_output_tokens,0) > 0 \
           THEN COALESCE(accumulated_cache_read_tokens,0) + COALESCE(accumulated_cache_write_tokens,0) \
-          ELSE COALESCE(cache_read_tokens,0) + COALESCE(cache_write_tokens,0) END";
+          ELSE COALESCE(cache_read_tokens,0) + COALESCE(cache_write_tokens,0) END, \
+     CASE WHEN COALESCE(accumulated_input_tokens,0) + COALESCE(accumulated_output_tokens,0) > 0 \
+          THEN COALESCE(accumulated_cache_write_tokens,0) \
+          ELSE COALESCE(cache_write_tokens,0) END";
 
 fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
@@ -174,6 +179,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         inp: r.get(7).unwrap_or(0),
         outp: r.get(8).unwrap_or(0),
         cache: r.get(9).unwrap_or(0),
+        cache_w: r.get(10).unwrap_or(0),
     })
 }
 

@@ -50,11 +50,20 @@ pub struct UsageEvent {
     pub cache_write: u64,
     pub session_id: String,
     pub project: Option<String>,
+    /// A cost the writing tool precomputed (`costUSD` — older Claude Code
+    /// versions wrote it). ccusage's default `auto` mode TRUSTS this value
+    /// when present; recomputing from tokens instead diverged unboundedly on
+    /// real pre-existing histories (G3 round-1 critic, P9).
+    pub stored_cost_usd: Option<f64>,
 }
 
 impl UsageEvent {
-    /// Price this event with read/write cache rates.
+    /// Price this event: the stored cost when the record carries one
+    /// (ccusage `auto` mode), else computed with read/write cache rates.
     pub fn cost(&self, pricing: &PricingConfig) -> f64 {
+        if let Some(c) = self.stored_cost_usd {
+            return c;
+        }
         let (pin, pout, pread, pwrite) = pricing.lookup_split(&self.model);
         (self.input as f64 * pin
             + self.output as f64 * pout
@@ -116,6 +125,16 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
                         continue; // retried/re-streamed duplicate
                     }
                 }
+                // ccusage's schema requires input_tokens AND output_tokens;
+                // a record missing either is dropped entirely, not defaulted
+                // to zero (G3 round-1 critic, P3) — matching that keeps the
+                // two tools counting the same records.
+                let (Some(input), Some(output)) = (
+                    usage.get("input_tokens").and_then(Value::as_u64),
+                    usage.get("output_tokens").and_then(Value::as_u64),
+                ) else {
+                    continue;
+                };
                 let g = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
                 out.push(UsageEvent {
                     ts,
@@ -124,12 +143,13 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
-                    input: g("input_tokens"),
-                    output: g("output_tokens"),
+                    input,
+                    output,
                     cache_read: g("cache_read_input_tokens"),
                     cache_write: g("cache_creation_input_tokens"),
                     session_id: session_id.clone(),
                     project: project.clone(),
+                    stored_cost_usd: v.get("costUSD").and_then(Value::as_f64),
                 });
             }
         }
@@ -172,6 +192,9 @@ pub struct DailyRow {
     pub date: String,
     pub totals: Tally,
     pub by_model: BTreeMap<String, Tally>,
+    /// $ per project per day (the Build list's third dimension). Projects
+    /// come from the transcript's `cwd`; "unknown" when absent.
+    pub by_project: BTreeMap<String, Tally>,
 }
 
 /// UTC calendar date of a unix-millis timestamp.
@@ -190,11 +213,43 @@ pub fn daily(events: &[UsageEvent], pricing: &PricingConfig) -> Vec<DailyRow> {
             date,
             totals: Tally::default(),
             by_model: BTreeMap::new(),
+            by_project: BTreeMap::new(),
+        });
+        row.totals.add(e, pricing);
+        row.by_model.entry(e.model.clone()).or_default().add(e, pricing);
+        row.by_project
+            .entry(e.project.clone().unwrap_or_else(|| "unknown".into()))
+            .or_default()
+            .add(e, pricing);
+    }
+    days.into_values().collect()
+}
+
+/// One month's usage (`YYYY-MM`, UTC), with per-model breakdown
+/// (ccusage `monthly --timezone UTC`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthlyRow {
+    /// `YYYY-MM` (UTC).
+    pub month: String,
+    pub totals: Tally,
+    pub by_model: BTreeMap<String, Tally>,
+}
+
+/// Group events into UTC monthly rows.
+pub fn monthly(events: &[UsageEvent], pricing: &PricingConfig) -> Vec<MonthlyRow> {
+    let mut months: BTreeMap<String, MonthlyRow> = BTreeMap::new();
+    for e in events {
+        let month = utc_date(e.ts)[..7].to_string();
+        let row = months.entry(month.clone()).or_insert_with(|| MonthlyRow {
+            month,
+            totals: Tally::default(),
+            by_model: BTreeMap::new(),
         });
         row.totals.add(e, pricing);
         row.by_model.entry(e.model.clone()).or_default().add(e, pricing);
     }
-    days.into_values().collect()
+    months.into_values().collect()
 }
 
 /// Live-burn figures for the active block.
@@ -250,7 +305,10 @@ pub fn blocks(events: &[UsageEvent], pricing: &PricingConfig, now_ms: i64) -> Ve
     for e in events {
         let needs_new = match &cur {
             None => true,
-            Some(b) => e.ts >= b.start_ts + BLOCK_MS || e.ts - last_entry_ts >= BLOCK_MS,
+            // STRICT >: an entry landing exactly on the boundary stays in
+            // the block (empirically matched against ccusage 20.0.19 —
+            // G3 round-1 critic, P4).
+            Some(b) => e.ts > b.start_ts + BLOCK_MS || e.ts - last_entry_ts > BLOCK_MS,
         };
         if needs_new {
             let prev_end = cur.as_ref().map(|_| last_entry_ts);
@@ -346,6 +404,7 @@ mod tests {
             cache_write: cw,
             session_id: "s".into(),
             project: None,
+            stored_cost_usd: None,
         }
     }
 

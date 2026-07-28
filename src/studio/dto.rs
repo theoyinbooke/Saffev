@@ -770,6 +770,8 @@ pub struct UsageReport {
     pub pricing_as_of: String,
     /// Recent UTC days (capped), newest last.
     pub daily: Vec<crate::agents::usage::DailyRow>,
+    /// UTC months, newest last (small — one row per month of history).
+    pub monthly: Vec<crate::agents::usage::MonthlyRow>,
     /// Recent 5-hour billing blocks (capped), gaps included, newest last.
     pub blocks: Vec<crate::agents::usage::Block>,
     /// Overall totals across all events.

@@ -105,7 +105,7 @@ impl AmpReader {
 
         let mut updated = created;
         let mut model: Option<String> = None;
-        let (mut inp, mut outp, mut cache) = (0u64, 0u64, 0u64);
+        let (mut inp, mut outp, mut cache, mut cache_w) = (0u64, 0u64, 0u64, 0u64);
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
         let mut first_user: Option<String> = None;
         let mut messages: Vec<AgentMessage> = Vec::new();
@@ -139,13 +139,15 @@ impl AmpReader {
                 if let Some(u) = m.get("usage") {
                     inp += u.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
                     outp += u.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
-                    cache += u
+                    let cw = u
                         .get("cacheCreationInputTokens")
                         .and_then(Value::as_u64)
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+                    cache += cw
                         + u.get("cacheReadInputTokens")
                             .and_then(Value::as_u64)
                             .unwrap_or(0);
+                    cache_w += cw;
                     if let Some(mdl) = u.get("model").and_then(Value::as_str) {
                         model = Some(mdl.to_string()); // last wins
                     }
@@ -273,6 +275,7 @@ impl AmpReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: cache_w,
             source_path: path.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })

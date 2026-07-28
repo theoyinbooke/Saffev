@@ -27,4 +27,4 @@ data/
 # Local AI-agent guidance (not for the public repo)
 CLAUDE.md
 AGENTS.md
-.claude/
+/.claude/

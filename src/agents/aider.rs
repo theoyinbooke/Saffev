@@ -270,6 +270,7 @@ impl AiderReader {
                 input_tokens: inp,
                 output_tokens: outp,
                 cache_tokens: 0, // never reported by the format
+            cache_write_tokens: 0,
                 source_path: path.to_string_lossy().to_string(),
             };
             let _ = count;

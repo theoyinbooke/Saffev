@@ -174,6 +174,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_tokens: 0,
+                cache_write_tokens: 0,
                 source_path: String::new(),
             },
             messages: vec![

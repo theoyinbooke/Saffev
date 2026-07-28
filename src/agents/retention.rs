@@ -147,6 +147,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cache_tokens: 0,
+            cache_write_tokens: 0,
             source_path: String::new(),
         }
     }

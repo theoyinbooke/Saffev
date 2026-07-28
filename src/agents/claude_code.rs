@@ -77,7 +77,7 @@ impl ClaudeCodeReader {
         let mut title: Option<String> = None;
         let mut first_user: Option<String> = None;
         let mut model_counts: std::collections::HashMap<String, u32> = Default::default();
-        let (mut inp, mut outp, mut cache) = (0u64, 0u64, 0u64);
+        let (mut inp, mut outp, mut cache, mut cache_w) = (0u64, 0u64, 0u64, 0u64);
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
         let mut first_ts = i64::MAX;
         let mut last_ts = 0i64;
@@ -143,13 +143,16 @@ impl ClaudeCodeReader {
                             if let Some(u) = m.get("usage") {
                                 inp += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
                                 outp += u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                                cache += u
+                                let cr = u
                                     .get("cache_read_input_tokens")
                                     .and_then(Value::as_u64)
-                                    .unwrap_or(0)
-                                    + u.get("cache_creation_input_tokens")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(0);
+                                    .unwrap_or(0);
+                                let cw = u
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                cache += cr + cw;
+                                cache_w += cw;
                             }
                         }
                     }
@@ -207,6 +210,7 @@ impl ClaudeCodeReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: cache_w,
             source_path: path.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })

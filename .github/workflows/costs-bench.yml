@@ -1,0 +1,23 @@
+# G3 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G3).
+#
+# Mirrors pii-bench.yml/agents-bench.yml: the bench enforces ccusage parity
+# (±2% floors, exact token sums and block boundaries) against the COMMITTED
+# reference, and the git-diff step proves the committed side-by-side artifact
+# matches what the code at this commit actually produces. This is also the
+# guard the G3 round-1 critic showed was missing: a clean-clone CI run would
+# have caught the fixture being swallowed by .gitignore.
+name: costs-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove ccusage parity from committed fixtures (floors enforced)
+        run: cargo test --test costs_bench -- --nocapture
+      - name: Committed side-by-side artifact must match the code
+        run: git diff --exit-code bench/costs-results.json

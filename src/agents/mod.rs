@@ -182,6 +182,12 @@ pub struct AgentSession {
     /// Summed cache read/creation tokens, 0 if the tool does not report them.
     /// Disjoint from [`Self::input_tokens`].
     pub cache_tokens: u64,
+    /// The cache-WRITE (creation) subset of [`Self::cache_tokens`], for
+    /// adapters whose format splits them (Anthropic-family). Writes are
+    /// billed at 1.25 × input vs 0.1 × for reads — merging them understated
+    /// real histories (G3). 0 when the tool doesn't split; the whole cache
+    /// sum is then priced at the read rate, documented.
+    pub cache_write_tokens: u64,
     /// The file/db this session was read from (the source tag).
     pub source_path: String,
 }
@@ -498,11 +504,12 @@ pub fn tool_stats(sessions: &[AgentSession]) -> Vec<ToolStat> {
             let cost_usd = mine
                 .iter()
                 .map(|s| {
-                    cost_usd(
+                    cost_usd_split(
                         s.model.as_deref(),
                         s.input_tokens,
                         s.output_tokens,
                         s.cache_tokens,
+                        s.cache_write_tokens,
                     )
                 })
                 .sum();
@@ -524,7 +531,8 @@ pub fn tool_stats(sessions: &[AgentSession]) -> Vec<ToolStat> {
 ///
 /// `input` must be the **non-cached** input count (see [`AgentSession::input_tokens`]);
 /// pricing cached tokens at full input rate is exactly the mistake that inflated
-/// a real history's estimate more than tenfold.
+/// a real history's estimate more than tenfold. The whole `cache` sum is priced
+/// at the READ rate — call [`cost_usd_split`] when the write subset is known.
 pub fn cost_usd(model: Option<&str>, input: u64, output: u64, cache: u64) -> f64 {
     cost_usd_with(
         &crate::config::PricingConfig::default(),
@@ -546,6 +554,29 @@ pub fn cost_usd_with(
     let Some(model) = model else { return 0.0 };
     let (pin, pout, pcache) = pricing.lookup(model);
     (input as f64 * pin + output as f64 * pout + cache as f64 * pcache) / 1_000_000.0
+}
+
+/// As [`cost_usd`], with the cache-WRITE subset priced at the write rate
+/// (1.25 × input, Anthropic convention) instead of the read rate — the
+/// single pricing formula the usage engine and the session views now share
+/// (G3: two diverging paths showed different dollars for the same activity).
+/// `cache` is the TOTAL cache sum; `cache_write` its write subset.
+pub fn cost_usd_split(
+    model: Option<&str>,
+    input: u64,
+    output: u64,
+    cache: u64,
+    cache_write: u64,
+) -> f64 {
+    let Some(model) = model else { return 0.0 };
+    let pricing = crate::config::PricingConfig::default();
+    let (pin, pout, pread, pwrite) = pricing.lookup_split(model);
+    let reads = cache.saturating_sub(cache_write);
+    (input as f64 * pin
+        + output as f64 * pout
+        + reads as f64 * pread
+        + cache_write as f64 * pwrite)
+        / 1_000_000.0
 }
 
 /// Read a possibly-live SQLite DB safely: copy it (plus any `-wal`/`-shm`) to a
@@ -838,6 +869,7 @@ mod perf {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cache_write_tokens: 0,
                 source_path: String::new(),
             };
             Some(s)

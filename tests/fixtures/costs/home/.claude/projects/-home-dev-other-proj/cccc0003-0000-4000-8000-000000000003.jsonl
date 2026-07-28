@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-07-22T11:00:00.000Z","cwd":"/home/dev/other-proj","sessionId":"cccc0003-0000-4000-8000-000000000003","message":{"role":"user","content":"summarize the readme"}}
+{"type":"assistant","timestamp":"2026-07-22T11:00:15.000Z","requestId":"req_006","message":{"id":"msg_006","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"text","text":"Summary."}],"usage":{"input_tokens":3000,"output_tokens":400,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}

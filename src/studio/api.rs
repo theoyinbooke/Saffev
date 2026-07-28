@@ -1816,11 +1816,12 @@ fn agent_session_view(s: &crate::agents::AgentSession, pii_count: u32) -> dto::A
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cache_tokens: s.cache_tokens,
-        cost_usd: crate::agents::cost_usd(
+        cost_usd: crate::agents::cost_usd_split(
             s.model.as_deref(),
             s.input_tokens,
             s.output_tokens,
             s.cache_tokens,
+            s.cache_write_tokens,
         ),
         pii_count,
         source_path: s.source_path.clone(),
@@ -1852,6 +1853,9 @@ fn archived_session_view(a: &crate::store::ArchivedSession) -> dto::AgentSession
         input_tokens: a.input_tokens,
         output_tokens: a.output_tokens,
         cache_tokens: a.cache_tokens,
+        // The archive predates the read/write split: the whole cache sum is
+        // priced at the read rate (a documented under-estimate for archived
+        // Anthropic sessions).
         cost_usd: crate::agents::cost_usd(
             a.model.as_deref(),
             a.input_tokens,
@@ -2208,6 +2212,9 @@ fn archived_to_detail(a: crate::store::ArchivedSession) -> crate::agents::AgentS
         input_tokens: a.input_tokens,
         output_tokens: a.output_tokens,
         cache_tokens: a.cache_tokens,
+        // The archive predates the read/write split; a resurrected session's
+        // whole cache sum is priced at the read rate (documented estimate).
+        cache_write_tokens: 0,
         source_path: a.source_path.unwrap_or_default(),
     };
     let messages = a
@@ -2932,11 +2939,12 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
         let e = models.entry(name).or_insert((0, 0, 0.0));
         e.0 += 1;
         e.1 += s.input_tokens + s.output_tokens;
-        e.2 += crate::agents::cost_usd(
+        e.2 += crate::agents::cost_usd_split(
             s.model.as_deref(),
             s.input_tokens,
             s.output_tokens,
             s.cache_tokens,
+            s.cache_write_tokens,
         );
     }
     let mut by_model: Vec<dto::AgentModelStat> = models
@@ -3004,6 +3012,7 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
             }
             Some(dto::UsageReport {
                 pricing_as_of: pricing.as_of.clone(),
+                monthly: crate::agents::usage::monthly(&events, pricing),
                 daily,
                 blocks,
                 totals: crate::agents::usage::totals(&events, pricing),

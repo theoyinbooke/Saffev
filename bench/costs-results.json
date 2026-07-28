@@ -1,20 +1,20 @@
 {
   "ccusage_totals": {
-    "cacheCreationTokens": 17000,
-    "cacheReadTokens": 162000,
-    "inputTokens": 9000,
-    "outputTokens": 4800,
-    "totalCost": 0.84785,
-    "totalTokens": 192800
+    "cacheCreationTokens": 17200,
+    "cacheReadTokens": 163000,
+    "inputTokens": 9800,
+    "outputTokens": 5030,
+    "totalCost": 0.9771,
+    "totalTokens": 195030
   },
   "command": "cargo test --test costs_bench -- --nocapture",
   "comparisons": [
     {
-      "ccusage": 0.84785,
+      "ccusage": 0.9771,
       "compared": "totals.cost",
       "delta_pct": 0.0,
       "explanation": "same per-event pricing formula; both price cache write at 1.25x input for Anthropic models",
-      "saffev": 0.84785
+      "saffev": 0.9771
     },
     {
       "ccusage": 0.463125,
@@ -38,14 +38,28 @@
       "saffev": 0.005
     },
     {
+      "ccusage": 0.12924999999999998,
+      "compared": "daily.2026-07-23",
+      "delta_pct": 0.0,
+      "explanation": "UTC date grouping on both sides",
+      "saffev": 0.12924999999999998
+    },
+    {
       "ccusage": "reference blocks --json",
       "compared": "blocks (9: 5 usage + 4 gaps)",
       "delta_pct": 0.0,
       "explanation": "block = entry ts floored to UTC hour + 5h; new block on window edge or 5h entry gap; synthetic gap from last entry + 5h to next entry",
       "saffev": "boundaries, gap-ness, entry counts EXACT; costs within tolerance"
+    },
+    {
+      "ccusage": 0.9771,
+      "compared": "monthly",
+      "delta_pct": 0.0,
+      "explanation": "UTC month grouping on both sides",
+      "saffev": 0.9771
     }
   ],
-  "events": 6,
+  "events": 9,
   "fixture": "tests/fixtures/costs/home/.claude",
   "harness": "costs_bench v1 (G3 loop 1 — docs/gauntlets/GAUNTLETS.md)",
   "largest_unexplained_delta": "none — costs match to full float precision on this fixture",
@@ -54,12 +68,12 @@
   "pricing_table_as_of": "2026-07-28",
   "reference": "ccusage 20.0.19 (npx, --offline bundled pricing, --timezone UTC)",
   "saffev_totals": {
-    "cacheRead": 162000,
-    "cacheWrite": 17000,
-    "costUsd": 0.84785,
-    "entries": 6,
-    "input": 9000,
-    "output": 4800
+    "cacheRead": 163000,
+    "cacheWrite": 17200,
+    "costUsd": 0.9771,
+    "entries": 9,
+    "input": 9800,
+    "output": 5030
   },
   "tolerance_pct": 2.0
 }

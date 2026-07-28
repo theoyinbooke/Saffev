@@ -139,7 +139,7 @@ impl CopilotReader {
         let mut session_id: Option<String> = None;
         let mut git_branch: Option<String> = None;
         let mut model: Option<String> = None; // last model_change / message wins
-        let (mut inp, mut outp, mut cache) = (0u64, 0u64, 0u64);
+        let (mut inp, mut outp, mut cache, mut cache_w) = (0u64, 0u64, 0u64, 0u64);
         let mut per_msg_out = 0u64; // fallback when no shutdown record exists
         let mut saw_shutdown = false;
         let (mut msg_count, mut tool_count) = (0u32, 0u32);
@@ -317,7 +317,8 @@ impl CopilotReader {
                                 .unwrap_or(0)
                         };
                         inp = bucket("input");
-                        cache = bucket("cache_read") + bucket("cache_write");
+                        cache_w = bucket("cache_write");
+                        cache = bucket("cache_read") + cache_w;
                         outp = bucket("output");
                         saw_shutdown = true;
                     }
@@ -365,6 +366,7 @@ impl CopilotReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: cache_w,
             source_path: path.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })
@@ -504,6 +506,7 @@ impl CopilotReader {
             input_tokens: 0,
             output_tokens: 0,
             cache_tokens: 0,
+            cache_write_tokens: 0,
             source_path: path.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })

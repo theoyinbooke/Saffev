@@ -59,17 +59,25 @@ impl OpenCodeReader {
         updated: i64,
     ) -> AgentSession {
         // Tokens: sum assistant message token fields (final per-message totals).
-        let (inp, outp, cache) = conn
+        let (inp, outp, cache, cache_w) = conn
             .query_row(
                 "SELECT \
                    COALESCE(SUM(json_extract(data,'$.tokens.input')),0), \
                    COALESCE(SUM(json_extract(data,'$.tokens.output')),0), \
-                   COALESCE(SUM(json_extract(data,'$.tokens.cache.read')),0) + COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0) \
+                   COALESCE(SUM(json_extract(data,'$.tokens.cache.read')),0) + COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0), \
+                   COALESCE(SUM(json_extract(data,'$.tokens.cache.write')),0) \
                  FROM message WHERE session_id=?1 AND json_extract(data,'$.role')='assistant'",
                 [id],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
             )
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
         let msg_count = conn
             .query_row(
                 "SELECT count(*) FROM message WHERE session_id=?1",
@@ -111,6 +119,7 @@ impl OpenCodeReader {
             input_tokens: inp.max(0) as u64,
             output_tokens: outp.max(0) as u64,
             cache_tokens: cache.max(0) as u64,
+            cache_write_tokens: cache_w.max(0) as u64,
             source_path: "opencode.db".to_string(),
         }
     }

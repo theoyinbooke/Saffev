@@ -46,6 +46,7 @@ struct HistoryRow {
     tokens_in: u64,
     tokens_out: u64,
     cache: u64,
+    cache_write: u64,
     cwd: Option<String>,
     model: Option<String>,
 }
@@ -112,6 +113,7 @@ impl ClineReader {
                     tokens_out: item.get("tokensOut").and_then(Value::as_u64).unwrap_or(0),
                     cache: item.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0)
                         + item.get("cacheReads").and_then(Value::as_u64).unwrap_or(0),
+                    cache_write: item.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0),
                     cwd: item
                         .get("cwdOnTaskInitialization")
                         .and_then(Value::as_str)
@@ -129,13 +131,16 @@ impl ClineReader {
     /// Fallbacks from `ui_messages.json`: title (first `say:"task"`), token
     /// sums (`api_req_started` JSON payloads), and last activity ts. Shared
     /// with the Roo Code reader (same file heritage).
-    pub(super) fn ui_fallback(task_dir: &Path) -> (Option<String>, u64, u64, u64, i64) {
-        let (mut title, mut inp, mut outp, mut cache, mut last_ts) = (None, 0u64, 0u64, 0u64, 0i64);
+    pub(super) fn ui_fallback(
+        task_dir: &Path,
+    ) -> (Option<String>, u64, u64, u64, u64, i64) {
+        let (mut title, mut inp, mut outp, mut cache, mut cache_w, mut last_ts) =
+            (None, 0u64, 0u64, 0u64, 0u64, 0i64);
         let Ok(text) = fs::read_to_string(task_dir.join("ui_messages.json")) else {
-            return (title, inp, outp, cache, last_ts);
+            return (title, inp, outp, cache, cache_w, last_ts);
         };
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            return (title, inp, outp, cache, last_ts);
+            return (title, inp, outp, cache, cache_w, last_ts);
         };
         for m in v.as_array().map(|a| a.as_slice()).unwrap_or_default() {
             if let Some(ts) = m.get("ts").and_then(Value::as_i64) {
@@ -151,12 +156,13 @@ impl ClineReader {
                 if let Ok(info) = serde_json::from_str::<Value>(text) {
                     inp += info.get("tokensIn").and_then(Value::as_u64).unwrap_or(0);
                     outp += info.get("tokensOut").and_then(Value::as_u64).unwrap_or(0);
-                    cache += info.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0)
-                        + info.get("cacheReads").and_then(Value::as_u64).unwrap_or(0);
+                    let cw = info.get("cacheWrites").and_then(Value::as_u64).unwrap_or(0);
+                    cache += cw + info.get("cacheReads").and_then(Value::as_u64).unwrap_or(0);
+                    cache_w += cw;
                 }
             }
         }
-        (title, inp, outp, cache, last_ts)
+        (title, inp, outp, cache, cache_w, last_ts)
     }
 
     /// Parse the transcript. Returns `(messages, msg_count, tool_count,
@@ -301,7 +307,8 @@ impl ClineReader {
         let task_dir = root.join("tasks").join(task_id);
         let (messages, msg_count, tool_count, tmodel, tlast, tfirst) =
             Self::transcript(&task_dir, with_messages);
-        let (ui_title, ui_in, ui_out, ui_cache, ui_last) = Self::ui_fallback(&task_dir);
+        let (ui_title, ui_in, ui_out, ui_cache, ui_cache_w, ui_last) =
+            Self::ui_fallback(&task_dir);
         // A task with a corrupt transcript still lists via its history row /
         // ui stream; a task with neither transcript nor metadata is nothing.
         if msg_count == 0 && row.is_none() && ui_title.is_none() {
@@ -312,10 +319,10 @@ impl ClineReader {
         let started_ts = task_id.parse::<i64>().unwrap_or(tfirst);
         let row_default = HistoryRow::default();
         let row = row.unwrap_or(&row_default);
-        let (inp, outp, cache) = if row.tokens_in + row.tokens_out + row.cache > 0 {
-            (row.tokens_in, row.tokens_out, row.cache)
+        let (inp, outp, cache, cache_w) = if row.tokens_in + row.tokens_out + row.cache > 0 {
+            (row.tokens_in, row.tokens_out, row.cache, row.cache_write)
         } else {
-            (ui_in, ui_out, ui_cache)
+            (ui_in, ui_out, ui_cache, ui_cache_w)
         };
         let updated_ts = row.ts.max(tlast).max(ui_last).max(started_ts);
         let title = row
@@ -337,6 +344,7 @@ impl ClineReader {
             input_tokens: inp,
             output_tokens: outp,
             cache_tokens: cache,
+            cache_write_tokens: cache_w,
             source_path: task_dir.to_string_lossy().to_string(),
         };
         Some(AgentSessionDetail { session, messages })
