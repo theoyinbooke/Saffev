@@ -717,6 +717,14 @@ impl Store {
         self.read(move |conn| query_history(conn, &query)).await
     }
 
+    /// Fetch one history row by record id (History detail). An indexed point
+    /// read — unlike paging `history()` and matching, it finds a record no
+    /// matter how far back it sits.
+    pub async fn history_by_id(&self, id: &str) -> Result<Option<HistoryRow>> {
+        let id = id.to_string();
+        self.read(move |conn| query_history_by_id(conn, &id)).await
+    }
+
     /// Total number of requests ever recorded. Cheap `COUNT(*)`; used by the
     /// Studio to distinguish "no traffic captured yet" (show onboarding) from a
     /// merely empty recent window.
@@ -749,31 +757,70 @@ impl Store {
         .await
     }
 
-    /// Aggregate PII findings for the Privacy page. Returns every finding row;
-    /// the Studio layer buckets them by kind/side/app/model.
-    pub async fn privacy_summary(&self) -> Result<Vec<PiiFindingRecord>> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, record_id, side, type, label, start_off, end_off, \
-                 confidence, action, value_hash FROM pii_findings",
-            )?;
+    /// Aggregate PII findings; the Studio layer buckets them by kind/side/app/
+    /// model. `since_ts` bounds the read to findings whose parent request is at
+    /// least that recent (pushed into SQL — the table grows for the life of the
+    /// install, and most callers only need the page/window they are rendering).
+    /// `None` = every finding row (the Privacy page's all-time view).
+    pub async fn privacy_summary(&self, since_ts: Option<i64>) -> Result<Vec<PiiFindingRecord>> {
+        self.read(move |conn| {
+            // pii_findings has no ts column, so the window joins through the
+            // parent request. The unbounded branch skips the join: it must also
+            // return orphaned findings on pre-cleanup databases.
+            let (sql, params): (&str, Vec<i64>) = match since_ts {
+                Some(ts) => (
+                    "SELECT pf.id, pf.record_id, pf.side, pf.type, pf.label, pf.start_off, \
+                     pf.end_off, pf.confidence, pf.action, pf.value_hash \
+                     FROM pii_findings pf \
+                     JOIN requests r ON r.id = pf.record_id WHERE r.ts >= ?1",
+                    vec![ts],
+                ),
+                None => (
+                    "SELECT id, record_id, side, type, label, start_off, end_off, \
+                     confidence, action, value_hash FROM pii_findings",
+                    Vec::new(),
+                ),
+            };
+            let mut stmt = conn.prepare(sql)?;
             let rows = stmt
-                .query_map([], row_to_pii_finding)?
+                .query_map(rusqlite::params_from_iter(params), row_to_pii_finding)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .await
     }
 
-    /// All safety findings (eval pipeline). The Studio buckets them by category.
-    pub async fn safety_findings(&self) -> Result<Vec<SafetyFindingRecord>> {
-        self.read(|conn| {
+    /// PII findings for one exchange (History detail) — an indexed point read,
+    /// not a scan-everything-and-filter.
+    pub async fn pii_for(&self, record_id: &str) -> Result<Vec<PiiFindingRecord>> {
+        let record_id = record_id.to_string();
+        self.read(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT record_id, guard_model, category, verdict, score, ts \
-                 FROM safety_findings",
+                "SELECT id, record_id, side, type, label, start_off, end_off, \
+                 confidence, action, value_hash FROM pii_findings WHERE record_id = ?1",
             )?;
             let rows = stmt
-                .query_map([], row_to_safety)?
+                .query_map([&record_id], row_to_pii_finding)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Safety findings (eval pipeline), bounded to `ts >= since_ts` when given
+    /// (`None` = all). The Studio buckets them by category.
+    pub async fn safety_findings(
+        &self,
+        since_ts: Option<i64>,
+    ) -> Result<Vec<SafetyFindingRecord>> {
+        self.read(move |conn| {
+            let since = since_ts.unwrap_or(i64::MIN);
+            let mut stmt = conn.prepare(
+                "SELECT record_id, guard_model, category, verdict, score, ts \
+                 FROM safety_findings WHERE ts >= ?1",
+            )?;
+            let rows = stmt
+                .query_map([since], row_to_safety)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -796,15 +843,17 @@ impl Store {
         .await
     }
 
-    /// All eval scores (eval pipeline). The Studio buckets them by metric/band.
-    pub async fn eval_scores(&self) -> Result<Vec<EvalScoreRecord>> {
-        self.read(|conn| {
+    /// Eval scores (eval pipeline), bounded to `ts >= since_ts` when given
+    /// (`None` = all). The Studio buckets them by metric/band.
+    pub async fn eval_scores(&self, since_ts: Option<i64>) -> Result<Vec<EvalScoreRecord>> {
+        self.read(move |conn| {
+            let since = since_ts.unwrap_or(i64::MIN);
             let mut stmt = conn.prepare(
                 "SELECT record_id, judge_model, metric, band, rationale, sampled, ts \
-                 FROM eval_scores",
+                 FROM eval_scores WHERE ts >= ?1",
             )?;
             let rows = stmt
-                .query_map([], row_to_eval)?
+                .query_map([since], row_to_eval)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -1657,7 +1706,7 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
 /// Build + run the history query with optional free-text + pii-only filters and
 /// `before_ts` cursor paging. Joins responses + a per-request finding count.
 fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryRow>> {
-    let limit = query.limit.unwrap_or(100).min(1000) as i64;
+    let limit = query.limit.unwrap_or(100).min(MAX_HISTORY_QUERY_LIMIT) as i64;
 
     // Dynamic WHERE assembled with bound params (never string-interpolated user
     // input — SQL injection safe).
@@ -1727,6 +1776,26 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
         .query_map(param_refs.as_slice(), row_to_history)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Point read of one joined history row by primary key. Same projection and
+/// mapper as [`query_history`], so the two can never drift apart in shape.
+fn query_history_by_id(conn: &Connection, id: &str) -> Result<Option<HistoryRow>> {
+    let sql = "SELECT \
+           r.id, r.ts, r.source_app, r.source_confidence, r.engine, r.model, r.endpoint, \
+           r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
+           r.req_bytes, r.user_agent, r.content_type, r.temperature, r.top_p, r.max_tokens, \
+           r.msg_count, r.has_system, r.tool_count, \
+           resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
+           resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, resp.resp_bytes, \
+           (SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) AS pii_count, \
+           (SELECT count(*) FROM safety_findings sf WHERE sf.record_id = r.id) AS safety_count \
+         FROM requests r \
+         LEFT JOIN responses resp ON resp.request_id = r.id \
+         WHERE r.id = ?1";
+    conn.query_row(sql, [id], row_to_history)
+        .optional()
+        .map_err(Error::from)
 }
 
 /// Map a joined history row.
@@ -1889,6 +1958,16 @@ fn purge_requests_before(conn: &Connection, cutoff_ms: i64) -> Result<()> {
          (SELECT id FROM requests WHERE ts < ?1)",
         [cutoff_ms],
     )?;
+    tx.execute(
+        "DELETE FROM safety_findings WHERE record_id IN \
+         (SELECT id FROM requests WHERE ts < ?1)",
+        [cutoff_ms],
+    )?;
+    tx.execute(
+        "DELETE FROM eval_scores WHERE record_id IN \
+         (SELECT id FROM requests WHERE ts < ?1)",
+        [cutoff_ms],
+    )?;
     tx.execute("DELETE FROM requests WHERE ts < ?1", [cutoff_ms])?;
     tx.commit()?;
     Ok(())
@@ -1918,6 +1997,8 @@ fn purge_to_size(conn: &Connection, target_bytes: i64) -> Result<()> {
                 tx.execute("DELETE FROM responses", [])?;
                 tx.execute("DELETE FROM payloads", [])?;
                 tx.execute("DELETE FROM pii_findings", [])?;
+                tx.execute("DELETE FROM safety_findings", [])?;
+                tx.execute("DELETE FROM eval_scores", [])?;
                 tx.execute("DELETE FROM requests", [])?;
                 tx.commit()?;
                 break;
@@ -2085,6 +2166,13 @@ fn now_millis() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+/// Hard ceiling `query_history` clamps any requested `limit` to. Public so
+/// callers that size their scans to a constant (the monitor loop's
+/// `HISTORY_SCAN_LIMIT`) can assert against it instead of being silently cut —
+/// which is exactly what happened when this was a buried `.min(1000)` and the
+/// monitor asked for 2000.
+pub const MAX_HISTORY_QUERY_LIMIT: u32 = 2000;
 
 /// Filter/paging for [`Store::history`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2762,7 +2850,7 @@ mod tests {
         let rows = store.history(HistoryQuery::default()).await.unwrap();
         assert_eq!(rows[0].pii_count, 1);
 
-        let summary = store.privacy_summary().await.unwrap();
+        let summary = store.privacy_summary(None).await.unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].kind, PiiKind::Email);
         assert_eq!(summary[0].side, Side::Request);
@@ -2804,7 +2892,7 @@ mod tests {
         assert_eq!(rows[0].pii_count, 0);
 
         // Aggregate + per-record reads.
-        let all_safety = store.safety_findings().await.unwrap();
+        let all_safety = store.safety_findings(None).await.unwrap();
         assert_eq!(all_safety.len(), 1);
         assert_eq!(all_safety[0].category, "self_harm");
         assert_eq!(all_safety[0].verdict, "flagged");
@@ -2813,7 +2901,7 @@ mod tests {
         assert_eq!(for_r1.len(), 1);
         assert!(store.safety_for("nope").await.unwrap().is_empty());
 
-        let evals = store.eval_scores().await.unwrap();
+        let evals = store.eval_scores(None).await.unwrap();
         assert_eq!(evals.len(), 1);
         assert_eq!(evals[0].metric, "relevance");
         assert_eq!(evals[0].band, "good");
@@ -2976,13 +3064,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The windowed read paths: `privacy_summary(Some(ts))` bounds findings by
+    /// their parent request's ts (the findings table has no ts of its own),
+    /// `safety_findings`/`eval_scores` bound by their own ts, `pii_for` is a
+    /// per-record point read, and `None` still returns everything.
+    #[tokio::test]
+    async fn windowed_reads_bound_by_ts_and_pii_for_is_a_point_read() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        let finding = |record_id: &str| {
+            PiiFindingRecord::from_finding(
+                record_id,
+                &Finding {
+                    kind: PiiKind::Email,
+                    label: None,
+                    side: Side::Request,
+                    start: 0,
+                    end: 5,
+                    confidence: Confidence::High,
+                    value_hash: "h".into(),
+                },
+                PiiAction::Observed,
+            )
+        };
+        let safety = |record_id: &str, ts: i64| SafetyFindingRecord {
+            record_id: record_id.into(),
+            guard_model: "deterministic:v1".into(),
+            category: "self_harm".into(),
+            verdict: "flagged".into(),
+            score: None,
+            ts,
+        };
+        let score = |record_id: &str, ts: i64| EvalScoreRecord {
+            record_id: record_id.into(),
+            judge_model: "j".into(),
+            metric: "relevance".into(),
+            band: "good".into(),
+            rationale: None,
+            sampled: true,
+            ts,
+        };
+        store.enqueue(WriteOp::Request(req("old", 1000)));
+        store.enqueue(WriteOp::Request(req("new", 5000)));
+        store.enqueue(WriteOp::PiiFindings(vec![finding("old"), finding("new")]));
+        store.enqueue(WriteOp::SafetyFindings(vec![
+            safety("old", 1000),
+            safety("new", 5000),
+        ]));
+        store.enqueue(WriteOp::EvalScores(vec![
+            score("old", 1000),
+            score("new", 5000),
+        ]));
+        store.flush().await.unwrap();
+
+        // Windowed: only the finding whose parent request is recent enough.
+        let recent = store.privacy_summary(Some(2000)).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].record_id, "new");
+        // Unbounded: everything.
+        assert_eq!(store.privacy_summary(None).await.unwrap().len(), 2);
+
+        assert_eq!(store.safety_findings(Some(2000)).await.unwrap().len(), 1);
+        assert_eq!(store.safety_findings(None).await.unwrap().len(), 2);
+        assert_eq!(store.eval_scores(Some(2000)).await.unwrap().len(), 1);
+        assert_eq!(store.eval_scores(None).await.unwrap().len(), 2);
+
+        // Point read returns exactly one record's findings.
+        let one = store.pii_for("old").await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].record_id, "old");
+        assert!(store.pii_for("nope").await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `history_by_id` is a point read: it finds a record even when it is far
+    /// outside the newest page (the History-detail 404 bug), returns the same
+    /// joined shape as `history()`, and yields None for an unknown id.
+    #[tokio::test]
+    async fn history_by_id_finds_records_beyond_the_page_window() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+
+        // One old record, then enough newer ones to push it past a LIMIT-3 page.
+        store.enqueue(WriteOp::Request(req("ancient", 1000)));
+        for i in 0..5 {
+            store.enqueue(WriteOp::Request(req(&format!("newer-{i}"), 2000 + i)));
+        }
+        store.flush().await.unwrap();
+
+        // Sanity: a small page does NOT contain the old record…
+        let page = store
+            .history(HistoryQuery {
+                limit: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(page.iter().all(|r| r.request.id != "ancient"));
+
+        // …but the point read finds it regardless.
+        let row = store.history_by_id("ancient").await.unwrap();
+        assert_eq!(row.expect("found").request.id, "ancient");
+        assert!(store.history_by_id("nope").await.unwrap().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn enforce_retention_by_age_purges_old_rows() {
         let path = tmp_db();
         let store = Store::open(&path).await.unwrap();
 
         let now = now_millis();
-        // Old request (40 days ago) + a fresh one.
+        // Old request (40 days ago) + a fresh one. The old one carries every
+        // kind of dependent row so the purge is proven to take them all.
         let old_ts = now - 40 * 86_400_000;
         store.enqueue(WriteOp::Request(req("old", old_ts)));
         store.enqueue(WriteOp::Payload(Payload {
@@ -2990,6 +3187,23 @@ mod tests {
             prompt: Some("x".into()),
             response: None,
         }));
+        store.enqueue(WriteOp::SafetyFindings(vec![SafetyFindingRecord {
+            record_id: "old".into(),
+            guard_model: "deterministic:v1".into(),
+            category: "self_harm".into(),
+            verdict: "flagged".into(),
+            score: None,
+            ts: old_ts,
+        }]));
+        store.enqueue(WriteOp::EvalScores(vec![EvalScoreRecord {
+            record_id: "old".into(),
+            judge_model: "qwen3.5:2b".into(),
+            metric: "relevance".into(),
+            band: "good".into(),
+            rationale: None,
+            sampled: true,
+            ts: old_ts,
+        }]));
         store.enqueue(WriteOp::Request(req("new", now)));
         store.flush().await.unwrap();
 
@@ -3001,8 +3215,12 @@ mod tests {
         let rows = store.history(HistoryQuery::default()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request.id, "new");
-        // Dependent payload of the purged request is gone too.
+        // Dependent rows of the purged request are gone too — a purge that
+        // leaves orphaned safety/eval rows grows the DB forever and skews the
+        // quality page's aggregate counts.
         assert!(store.payload("old").await.unwrap().is_none());
+        assert!(store.safety_for("old").await.unwrap().is_empty());
+        assert!(store.eval_for("old").await.unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
     }

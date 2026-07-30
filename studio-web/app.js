@@ -2164,6 +2164,15 @@
       sysCard.appendChild(setRow('Studio port', 'This control plane.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: ':' + s.studioPort })])));
       const patterns = (s.customPatterns && s.customPatterns.length) ? s.customPatterns.join(', ') : 'none';
       sysCard.appendChild(setRow('Custom PII patterns', 'User-defined detectors (configured in the config file).', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: patterns })])));
+      // Export destination — editable so exports can land on removable storage
+      // (SD card / USB) instead of the system disk. Saved on change, not per
+      // keystroke: a half-typed path would just bounce off server validation.
+      const expInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. /media/you/SDCARD', value: s.exportDir || '' });
+      expInput.addEventListener('change', () => this.save(view, { exportDir: expInput.value.trim() }));
+      const expHint = s.exportDir
+        ? ('Export folders are created here. Currently: ' + s.exportDirEffective + '. Must be mounted and writable · leave blank for your home folder.')
+        : ('Where “Export all” and audit bundles are written. Blank = your home folder (' + s.exportDirEffective + '). Point it at a mounted SD card or USB drive to keep exports off the system disk.');
+      sysCard.appendChild(setRow('Export destination', expHint, el('div', { class: 'ctl' }, [expInput])));
       panel.appendChild(sysCard);
     },
 

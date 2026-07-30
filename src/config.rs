@@ -688,6 +688,16 @@ pub struct Config {
     /// behaviour change for anyone working alone. A leading `~` is expanded.
     #[serde(default)]
     pub policy_file: Option<PathBuf>,
+
+    /// Where on-disk exports are written (session bundles, audit bundles).
+    ///
+    /// `None` (default) = the user's home folder, the historical behaviour. Set
+    /// it to keep exports off the system disk entirely — e.g. a mounted SD card
+    /// or USB drive (`/media/you/SDCARD`). Export folders (`Saffev-Export`,
+    /// `Saffev-Audit-<ts>`) are created *inside* this directory. A leading `~`
+    /// is expanded. Hot-reloadable via Studio Settings.
+    #[serde(default)]
+    pub export_dir: Option<PathBuf>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -709,6 +719,7 @@ impl Default for Config {
             analysis: AnalysisConfig::default(),
             pricing: PricingConfig::default(),
             policy_file: None,
+            export_dir: None,
             archive: ArchiveConfig::default(),
             monitors: MonitorsConfig::default(),
         }
@@ -757,6 +768,24 @@ impl Config {
     /// The Studio web UI URL — `http://host:studio`.
     pub fn studio_url(&self) -> String {
         format!("http://{}:{}", self.display_host(), self.ports.studio)
+    }
+
+    /// Base directory export folders are created inside.
+    ///
+    /// The configured [`Config::export_dir`] when set (leading `~` expanded),
+    /// else the user's home folder — the historical default. Callers join their
+    /// own subfolder (`Saffev-Export`, `Saffev-Audit-<ts>`) onto this.
+    pub fn export_base(&self) -> PathBuf {
+        match &self.export_dir {
+            Some(dir) => {
+                let s = dir.to_string_lossy();
+                match s.strip_prefix("~/") {
+                    Some(rest) => crate::agents::home().join(rest),
+                    None => dir.clone(),
+                }
+            }
+            None => crate::agents::home(),
+        }
     }
 
     /// Load config from the default data dir, creating defaults if absent.
@@ -1343,6 +1372,34 @@ days = 14
             cfg.validate().is_err(),
             "stock cooperative defaults collide proxy == upstream"
         );
+    }
+
+    /// `export_base` falls back to the home folder when unset, honors an
+    /// explicit directory, and expands a leading `~/`.
+    #[test]
+    fn export_base_defaults_honors_and_expands() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.export_base(), crate::agents::home(), "unset = home");
+
+        cfg.export_dir = Some(PathBuf::from("/media/user/SDCARD"));
+        assert_eq!(cfg.export_base(), PathBuf::from("/media/user/SDCARD"));
+
+        cfg.export_dir = Some(PathBuf::from("~/exports"));
+        assert_eq!(cfg.export_base(), crate::agents::home().join("exports"));
+    }
+
+    /// A config with `export_dir` set round-trips through TOML, and older
+    /// configs without the field load with it unset.
+    #[test]
+    fn export_dir_round_trips_and_defaults_off() {
+        let mut cfg = Config::default();
+        cfg.export_dir = Some(PathBuf::from("/media/user/SDCARD"));
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let loaded: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(loaded.export_dir, cfg.export_dir);
+
+        let older: Config = toml::from_str("mode = \"cooperative\"").expect("older config loads");
+        assert!(older.export_dir.is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -58,6 +58,9 @@ const FIRED_TTL_MS: i64 = 7 * 24 * HOUR_MS;
 
 /// How many recent history rows one evaluation reads. Generous for an hour of
 /// local traffic; bounded so a tick can never drag the whole table into memory.
+/// Must not exceed [`crate::store::MAX_HISTORY_QUERY_LIMIT`] — the store clamps
+/// silently, and a clamp below this constant would shrink the monitor's window
+/// without anyone noticing (a test pins the relationship).
 const HISTORY_SCAN_LIMIT: u32 = 2000;
 
 /// The five monitor rule classes.
@@ -349,6 +352,21 @@ mod tests {
     use crate::store::{
         PiiAction, PiiFindingRecord, RequestMeta, SourceConfidence, TokenSource, WriteOp,
     };
+
+    /// The monitor's scan size must survive the store's silent limit clamp —
+    /// when the clamp was a buried `.min(1000)`, every tick quietly read half
+    /// the window this module believes it reads.
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // pinning cross-module drift is the point
+    fn history_scan_limit_is_within_the_store_clamp() {
+        assert!(
+            HISTORY_SCAN_LIMIT <= crate::store::MAX_HISTORY_QUERY_LIMIT,
+            "HISTORY_SCAN_LIMIT ({}) exceeds the store's query clamp ({}) — \
+             the monitor would silently scan fewer rows than documented",
+            HISTORY_SCAN_LIMIT,
+            crate::store::MAX_HISTORY_QUERY_LIMIT
+        );
+    }
 
     /// Pin a DB key so `Store::open` never touches the OS keyring in tests
     /// (same pattern as `store::tests::ensure_test_db_key`).

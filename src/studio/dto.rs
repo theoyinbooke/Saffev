@@ -458,6 +458,15 @@ pub struct SettingsView {
     /// Replace detected secrets with a placeholder before archiving (opt-in, lossy).
     #[serde(default)]
     pub archive_redact: bool,
+    /// Configured export destination (`None` = home folder default). Export
+    /// folders (`Saffev-Export`, `Saffev-Audit-<ts>`) are created inside it.
+    #[serde(default)]
+    pub export_dir: Option<String>,
+    /// The directory exports actually land in right now (the configured
+    /// destination, or the home folder when none is set) — display-only, so the
+    /// UI can always show a concrete path.
+    #[serde(default)]
+    pub export_dir_effective: String,
     /// Fields whose new value was persisted to TOML but is **not** applied to the
     /// running process because it cannot be safely changed at runtime — `mode` and
     /// the ports rebind the listeners / re-adopt the engine. Empty when the last
@@ -510,6 +519,11 @@ pub struct SettingsUpdate {
     pub archive_auto: Option<bool>,
     #[serde(default)]
     pub archive_redact: Option<bool>,
+    /// Set the export destination directory. Must exist, be a directory, and be
+    /// writable (so a mounted SD card / USB path is accepted and a typo is
+    /// rejected). Empty string clears it back to the home-folder default.
+    #[serde(default)]
+    pub export_dir: Option<String>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.

@@ -201,7 +201,7 @@ pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Resu
     let ids: std::collections::HashSet<&str> =
         history.iter().map(|r| r.request.id.as_str()).collect();
     let findings: Vec<_> = store
-        .privacy_summary()
+        .privacy_summary(Some(since))
         .await?
         .into_iter()
         .filter(|f| ids.contains(f.record_id.as_str()))

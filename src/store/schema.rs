@@ -265,6 +265,16 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE requests ADD COLUMN tool_count INTEGER;
     ALTER TABLE responses ADD COLUMN resp_bytes INTEGER;
     "#,
+    // --- v10: ts indexes for the eval read paths ---
+    //
+    // `safety_findings` / `eval_scores` reads are now time-windowed (`ts >= ?`)
+    // so the Quality/Analytics pages stop loading whole tables that grow for
+    // the life of the install. Index the column the window filters on —
+    // mirrors `idx_requests_ts`.
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_safety_ts ON safety_findings(ts);
+    CREATE INDEX IF NOT EXISTS idx_eval_ts ON eval_scores(ts);
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.

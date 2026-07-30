@@ -227,8 +227,24 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         .await
         .map_err(internal)?;
 
+    // KPIs computed off the privacy/finding + history reads. "Today" is the
+    // trailing 24h window relative to the newest row's clock (server now).
+    let now = now_millis();
+    let cutoff = now - TODAY_WINDOW_MS;
+
+    // ONE windowed findings read serves both the per-row badges and the
+    // findings-today KPI (this handler is the most-polled endpoint, and it used
+    // to full-scan the findings table twice per refresh). Bound: old enough to
+    // cover the oldest row on the page AND the 24h KPI window.
+    let oldest_row_ts = rows.last().map(|r| r.request.ts).unwrap_or(cutoff);
+    let findings = state
+        .store
+        .privacy_summary(Some(oldest_row_ts.min(cutoff)))
+        .await
+        .map_err(internal)?;
+
     // Populate PII kinds per row so badges show on seeded rows too (not just live).
-    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    let kinds = kinds_by_record(&findings);
     let recent: Vec<dto::HistoryItem> = rows
         .iter()
         .map(|r| {
@@ -241,11 +257,6 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
             )
         })
         .collect();
-
-    // KPIs computed off the privacy/finding + history reads. "Today" is the
-    // trailing 24h window relative to the newest row's clock (server now).
-    let now = now_millis();
-    let cutoff = now - TODAY_WINDOW_MS;
 
     // requests_today + p50 latency over a wider recent window.
     let window = state
@@ -273,7 +284,6 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
     let p50_latency_ms = median(&mut latencies);
 
     // PII findings today: count findings whose parent request is within window.
-    let findings = state.store.privacy_summary().await.map_err(internal)?;
     let recent_ids: std::collections::HashSet<&str> = window
         .iter()
         .filter(|r| r.request.ts >= cutoff)
@@ -319,7 +329,18 @@ pub async fn history(
         .await
         .map_err(internal)?;
 
-    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    // Badges need findings for this page only — window the read to the page's
+    // own oldest row instead of scanning the whole findings table.
+    let kinds = match rows.last() {
+        Some(oldest) => kinds_by_record(
+            &state
+                .store
+                .privacy_summary(Some(oldest.request.ts))
+                .await
+                .unwrap_or_default(),
+        ),
+        None => Default::default(),
+    };
     let items: Vec<dto::HistoryItem> = rows
         .iter()
         .map(|r| {
@@ -340,33 +361,21 @@ pub async fn history_detail(
     State(state): State<StudioState>,
     Path(id): Path<String>,
 ) -> Result<Json<dto::HistoryDetail>, Response> {
-    // Find the matching row. The store has no by-id read in the contract, so we
-    // page recent history and match; cheap for the single-user local case.
-    let rows = state
+    // Indexed point read — a record stays reachable no matter how far back it
+    // sits (the old page-recent-and-match approach 404'd anything older than
+    // the newest 500 rows).
+    let row = state
         .store
-        .history(HistoryQuery {
-            q: None,
-            pii_only: false,
-            failed_only: false,
-            limit: Some(MAX_HISTORY_LIMIT),
-            before_ts: None,
-        })
+        .history_by_id(&id)
         .await
-        .map_err(internal)?;
-
-    let row = rows
-        .into_iter()
-        .find(|r| r.request.id == id)
+        .map_err(internal)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "not_found", "unknown record id"))?;
 
-    // Findings for this record, projected to views.
-    let all_findings = state.store.privacy_summary().await.map_err(internal)?;
-    let findings: Vec<dto::PiiFindingView> = all_findings
-        .iter()
-        .filter(|f| f.record_id == id)
-        .map(finding_view)
-        .collect();
-    let kinds = distinct_kinds(&all_findings, &id);
+    // Findings for this record, projected to views — a per-record point read,
+    // not a full findings scan.
+    let record_findings = state.store.pii_for(&id).await.map_err(internal)?;
+    let findings: Vec<dto::PiiFindingView> = record_findings.iter().map(finding_view).collect();
+    let kinds = distinct_kinds(&record_findings, &id);
 
     let mut item = history_item(&row, kinds);
 
@@ -438,7 +447,8 @@ pub async fn history_detail(
 pub async fn privacy(
     State(state): State<StudioState>,
 ) -> Result<Json<dto::PrivacySummary>, Response> {
-    let findings = state.store.privacy_summary().await.map_err(internal)?;
+    // All-time on purpose: this page's headline is the lifetime distribution.
+    let findings = state.store.privacy_summary(None).await.map_err(internal)?;
 
     // by_kind: bucket per PII kind with request/response split.
     let mut by_kind_map: BTreeMap<String, dto::PrivacyBucket> = BTreeMap::new();
@@ -531,7 +541,11 @@ pub async fn quality(
         |ts: i64| -> usize { (((ts - start) / bucket_ms).max(0) as usize).min(n_buckets - 1) };
 
     // Safety findings in the window → by category + per-bucket distinct-flagged.
-    let safety = state.store.safety_findings().await.map_err(internal)?;
+    let safety = state
+        .store
+        .safety_findings(Some(start))
+        .await
+        .map_err(internal)?;
     let mut by_cat: BTreeMap<String, u64> = BTreeMap::new();
     let mut flagged: BTreeSet<String> = BTreeSet::new();
     // Track (bucket, record) pairs so a record with 2 categories counts once.
@@ -548,7 +562,7 @@ pub async fn quality(
     let total_flagged = flagged.len() as u64;
 
     // Eval scores in the window → per-metric good/weak + per-bucket good/weak.
-    let evals = state.store.eval_scores().await.map_err(internal)?;
+    let evals = state.store.eval_scores(Some(start)).await.map_err(internal)?;
     let mut judged: BTreeSet<String> = BTreeSet::new();
     let mut metric_bands: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut bkt_good = vec![0u64; n_buckets];
@@ -594,7 +608,17 @@ pub async fn quality(
         .await
         .map_err(internal)?;
     let requests_in_window = rows.iter().filter(|r| r.request.ts >= start).count() as u64;
-    let kinds = kinds_by_record(&state.store.privacy_summary().await.unwrap_or_default());
+    // Badge kinds for the page rows only — window to the oldest fetched row.
+    let kinds = match rows.last() {
+        Some(oldest) => kinds_by_record(
+            &state
+                .store
+                .privacy_summary(Some(oldest.request.ts))
+                .await
+                .unwrap_or_default(),
+        ),
+        None => Default::default(),
+    };
     let recent_flagged: Vec<dto::HistoryItem> = rows
         .iter()
         .filter(|r| r.safety_count > 0)
@@ -705,7 +729,12 @@ pub async fn analytics(
         }
     }
 
-    let findings = state.store.privacy_summary().await.unwrap_or_default();
+    // The report only joins findings against rows in `prev_start..now`.
+    let findings = state
+        .store
+        .privacy_summary(Some(prev_start))
+        .await
+        .unwrap_or_default();
 
     // Latency: request value or response total_ms (mirrors the table/p50).
     let lat = |r: &HistoryRow| -> Option<u32> {
@@ -2669,7 +2698,11 @@ pub async fn archive_audit(
     let sessions = state.store.archived_sessions().await.map_err(internal)?;
 
     let stamp = crate::agents::now_ms();
-    let dir = crate::agents::home().join(format!("Saffev-Audit-{stamp}"));
+    let dir = state
+        .config
+        .load()
+        .export_base()
+        .join(format!("Saffev-Audit-{stamp}"));
     let transcripts = dir.join("transcripts");
     std::fs::create_dir_all(&transcripts).map_err(|e| {
         api_error(
@@ -2874,7 +2907,8 @@ pub struct ExportAllBody {
     pub format: Option<String>,
     /// Restrict to one tool key.
     pub tool: Option<String>,
-    /// Destination directory (default `~/Saffev-Export`).
+    /// Destination directory. Default: `Saffev-Export` inside the configured
+    /// export destination ([`crate::config::Config::export_base`]).
     pub dest: Option<String>,
 }
 
@@ -2913,7 +2947,7 @@ pub async fn archive_export(
         .dest
         .filter(|d| !d.trim().is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::agents::home().join("Saffev-Export"));
+        .unwrap_or_else(|| state.config.load().export_base().join("Saffev-Export"));
     std::fs::create_dir_all(&dir).map_err(internal)?;
     let tool = body.tool.filter(|t| !t.is_empty());
 
@@ -3381,6 +3415,61 @@ pub async fn settings_put(
         live.archive.auto = v;
     }
 
+    // export_dir — HOT-RELOADABLE. Validated here rather than at export time:
+    // a user pointing exports at an SD card wants to find out about a typo (or
+    // an unmounted card) when they hit Save, not when tonight's export silently
+    // lands somewhere else. Empty string clears back to the home-folder default.
+    if let Some(v) = body.export_dir {
+        let trimmed = v.trim();
+        let val = if trimmed.is_empty() {
+            None
+        } else {
+            let path = match trimmed.strip_prefix("~/") {
+                Some(rest) => crate::agents::home().join(rest),
+                None => std::path::PathBuf::from(trimmed),
+            };
+            if !path.is_absolute() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_export_dir",
+                    "export destination must be an absolute path (or start with ~/)",
+                ));
+            }
+            if !path.is_dir() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_export_dir",
+                    &format!(
+                        "{} does not exist or is not a directory — if it is a \
+                         removable drive, check it is mounted",
+                        path.display()
+                    ),
+                ));
+            }
+            // Writability probe: create-and-remove a marker. A read-only mount
+            // (or a card mounted for another user) fails here, at Save time.
+            let probe = path.join(".saffev-write-check");
+            if let Err(e) = std::fs::write(&probe, b"") {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_export_dir",
+                    &format!("{} is not writable: {e}", path.display()),
+                ));
+            }
+            let _ = std::fs::remove_file(&probe);
+            Some(std::path::PathBuf::from(trimmed))
+        };
+        persisted.export_dir = val.clone();
+        live.export_dir = val.clone();
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "export_dir".to_string(),
+            value: val
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        });
+    }
+
     // Persist the full config (write-through to TOML). The token is never touched.
     persisted.save().map_err(internal)?;
 
@@ -3471,6 +3560,11 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         archive_enabled: cfg.archive.enabled,
         archive_auto: cfg.archive.auto,
         archive_redact: cfg.archive.redact,
+        export_dir: cfg
+            .export_dir
+            .as_deref()
+            .map(|p| p.display().to_string()),
+        export_dir_effective: cfg.export_base().display().to_string(),
         restart_required: Vec::new(),
         restart_note: None,
     }
@@ -3966,6 +4060,62 @@ mod tests {
         let live = handle.load();
         assert!(live.payload_storage, "payload_storage applies live");
         assert_eq!(live.retention, crate::config::Retention::Age { days: 7 });
+    }
+
+    /// export_dir applies live: a valid, writable directory is accepted, swapped
+    /// into the shared handle, and reflected by both the PUT response and the
+    /// effective-path view. An empty string clears it back to the home default.
+    #[tokio::test]
+    async fn settings_put_export_dir_applies_live_and_clears() {
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        assert!(handle.load().export_dir.is_none(), "precondition: unset");
+
+        // A real, writable directory (the test's own temp data dir qualifies).
+        let dest = handle.load().data_dir.clone();
+        let update = dto::SettingsUpdate {
+            export_dir: Some(dest.display().to_string()),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state.clone()), Json(update))
+            .await
+            .expect("valid export_dir accepted");
+        assert_eq!(resp.0.export_dir.as_deref(), Some(&*dest.display().to_string()));
+        assert_eq!(resp.0.export_dir_effective, dest.display().to_string());
+        assert!(resp.0.restart_required.is_empty(), "applies live");
+        assert_eq!(handle.load().export_dir.as_deref(), Some(&*dest));
+        assert_eq!(handle.load().export_base(), dest);
+
+        // Empty string clears back to the home-folder default.
+        let clear = dto::SettingsUpdate {
+            export_dir: Some(String::new()),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state), Json(clear))
+            .await
+            .expect("clearing export_dir ok");
+        assert!(resp.0.export_dir.is_none());
+        assert!(handle.load().export_dir.is_none());
+        assert_eq!(handle.load().export_base(), crate::agents::home());
+    }
+
+    /// A destination that does not exist (an unmounted card, a typo) or is not
+    /// absolute is rejected at Save time — and the live config stays untouched.
+    #[tokio::test]
+    async fn settings_put_export_dir_rejects_missing_and_relative_paths() {
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+
+        for bad in ["/definitely/not/mounted/anywhere", "relative/path"] {
+            let update = dto::SettingsUpdate {
+                export_dir: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let err = settings_put(State(state.clone()), Json(update)).await;
+            assert!(err.is_err(), "{bad:?} must be rejected");
+            assert!(
+                handle.load().export_dir.is_none(),
+                "a rejected path must not leak into the live config"
+            );
+        }
     }
 
     /// mode is NOT runtime-changeable: it is persisted but NOT swapped into the
