@@ -45,6 +45,9 @@ pub enum EngineKind {
     Ollama,
     /// LM Studio (Cooperative only, v2+).
     LmStudio,
+    /// llama.cpp's `llama-server` (Cooperative only; identified via `/props`).
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
     /// An unidentified engine answering on a known port.
     Unknown,
 }

@@ -357,6 +357,14 @@ pub struct ArchiveConfig {
     /// user explicitly wants us to prune — we never do so on our own.
     #[serde(default)]
     pub retention_days: Option<u32>,
+    /// Also write each preserved session as Markdown into the git repository
+    /// it belongs to (`<repo>/.saffev/sessions/`), so transcripts live next to
+    /// the code. **Off by default** — writing into the user's repos is only
+    /// ever an explicit choice. Conservative by construction: only absolute,
+    /// existing project directories containing `.git` are written to, and the
+    /// archive's redaction posture applies to the mirror too.
+    #[serde(default)]
+    pub mirror_repos: bool,
     /// Replace detected secrets with a typed placeholder before writing a session
     /// into the archive.
     ///
@@ -381,6 +389,7 @@ impl Default for ArchiveConfig {
             auto: false,
             interval_minutes: default_archive_interval_minutes(),
             retention_days: None,
+            mirror_repos: false,
             redact: false,
         }
     }
@@ -421,6 +430,13 @@ pub struct MonitorsConfig {
     /// (estimated with [`PricingConfig`], same figures as the analytics page).
     #[serde(default = "default_spend_per_day_usd")]
     pub spend_per_day_usd: f64,
+    /// Fire when more than this many coding-agent sessions are at (or past)
+    /// their tool's deletion line and NOT preserved in the archive. `0`
+    /// (default) = any unpreserved at-risk session fires; a healthy
+    /// auto-archive keeps the count at zero, so this rule is silent unless
+    /// preservation is off or failing.
+    #[serde(default)]
+    pub sessions_at_risk: u32,
     /// Send a desktop notification for each signal (in addition to the log
     /// line + SSE event). Fail-soft: a missing notifier is a debug log, never
     /// an error.
@@ -445,6 +461,7 @@ impl Default for MonitorsConfig {
             pii_spike_per_hour: default_pii_spike_per_hour(),
             latency_p95_ms: default_latency_p95_ms(),
             spend_per_day_usd: default_spend_per_day_usd(),
+            sessions_at_risk: 0,
             notify: true,
         }
     }

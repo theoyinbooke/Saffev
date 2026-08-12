@@ -68,8 +68,13 @@ fn write_config(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// Fixed DB key so neither this process nor the spawned binary touches the OS
+/// keyring (headless keychain access hangs/prompts — the documented gotcha).
+const DB_KEY: &str = "g6-exit-test-key-0123456789abcdef";
+
 #[tokio::test]
 async fn status_check_exits_2_on_a_fired_signal_and_0_when_clean() {
+    std::env::set_var("SAFFEV_DB_KEY", DB_KEY);
     let dir = std::env::temp_dir().join(format!("saffev-g6exit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg_path = write_config(&dir);
@@ -86,6 +91,11 @@ async fn status_check_exits_2_on_a_fired_signal_and_0_when_clean() {
         .args(["--config", cfg_path.to_str().unwrap(), "status", "--check"])
         .env("NO_COLOR", "1")
         .env("CLAUDE_CONFIG_DIR", &empty_claude)
+        .env("SAFFEV_DB_KEY", DB_KEY)
+        // Hermetic home: every agent reader resolves under the fixture dir, so
+        // the machine's real session history can neither slow this test down
+        // nor trip the sessions-at-risk rule in the "clean" case.
+        .env("HOME", &dir)
         .output()
         .expect("spawn saffev");
     assert_eq!(
@@ -108,6 +118,8 @@ async fn status_check_exits_2_on_a_fired_signal_and_0_when_clean() {
         .args(["--config", cfg_path.to_str().unwrap(), "status", "--check"])
         .env("NO_COLOR", "1")
         .env("CLAUDE_CONFIG_DIR", &empty_claude)
+        .env("SAFFEV_DB_KEY", DB_KEY)
+        .env("HOME", &dir)
         .output()
         .expect("spawn saffev");
     assert_eq!(

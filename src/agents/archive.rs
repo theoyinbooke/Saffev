@@ -29,6 +29,8 @@ pub struct SnapshotSummary {
     pub deleted_detected: u32,
     /// Sessions that failed to parse (skipped, fail-open).
     pub errors: u32,
+    /// Markdown mirrors written into project repos (`[archive] mirror_repos`).
+    pub mirrored: u32,
 }
 
 /// How a session's text is written into the archive.
@@ -64,8 +66,10 @@ impl Redaction {
         self.detector.is_some()
     }
 
-    /// Redact one message body, returning the text to store.
-    fn apply(&self, role: Role, text: &str) -> String {
+    /// Redact one message body, returning the text to store. Crate-visible so
+    /// repo mirroring ([`super::mirror`]) applies the SAME posture — a mirror
+    /// must never be rawer than the archive.
+    pub(crate) fn apply(&self, role: Role, text: &str) -> String {
         let Some(d) = self.detector.as_ref() else {
             return text.to_string();
         };
@@ -85,20 +89,31 @@ impl Redaction {
 }
 
 /// Run one incremental snapshot into the archive. Off the hot path; heavy parsing
-/// happens on the blocking pool.
-pub async fn run_snapshot(store: &Store, redaction: Redaction) -> crate::Result<SnapshotSummary> {
+/// happens on the blocking pool. `mirror` additionally writes each preserved
+/// session's Markdown into its project repo (`[archive] mirror_repos` — see
+/// [`super::mirror`]); mirror failures are logged and never fail the snapshot.
+pub async fn run_snapshot(
+    store: &Store,
+    redaction: Redaction,
+    mirror: bool,
+) -> crate::Result<SnapshotSummary> {
     // Existing archive summaries (with content_hash + source_path + deleted flag)
     // drive both the incremental skip and accurate deletion detection.
     let existing = store.archived_sessions().await.unwrap_or_default();
     let store2 = store.clone();
-    let summary = tokio::task::spawn_blocking(move || build(&store2, existing, &redaction))
+    let summary = tokio::task::spawn_blocking(move || build(&store2, existing, &redaction, mirror))
         .await
         .map_err(|e| crate::Error::Store(format!("archive join: {e}")))?;
     store.flush().await?;
     Ok(summary)
 }
 
-fn build(store: &Store, existing: Vec<ArchivedSession>, redaction: &Redaction) -> SnapshotSummary {
+fn build(
+    store: &Store,
+    existing: Vec<ArchivedSession>,
+    redaction: &Redaction,
+    mirror: bool,
+) -> SnapshotSummary {
     let now = super::now_ms();
     let sessions = super::all_sessions();
     let mut seen: HashSet<String> = HashSet::with_capacity(sessions.len());
@@ -119,6 +134,15 @@ fn build(store: &Store, existing: Vec<ArchivedSession>, redaction: &Redaction) -
                         deleted: false,
                     });
                 }
+                // Mirroring switched on after this session was archived: the
+                // incremental skip would otherwise mean "never mirrored". One
+                // stat per skipped session; the transcript is parsed only when
+                // the mirror file is genuinely missing.
+                if mirror && super::mirror::mirror_path(s).is_some_and(|p| !p.exists()) {
+                    if let Some(d) = super::detail(&s.id) {
+                        summary.mirrored += mirror_one(&d, redaction);
+                    }
+                }
                 continue; // unchanged — no re-parse
             }
         }
@@ -132,6 +156,9 @@ fn build(store: &Store, existing: Vec<ArchivedSession>, redaction: &Redaction) -
                     summary.archived += 1;
                 } else {
                     summary.errors += 1;
+                }
+                if mirror {
+                    summary.mirrored += mirror_one(&d, redaction);
                 }
             }
             None => summary.errors += 1,
@@ -160,6 +187,18 @@ fn build(store: &Store, existing: Vec<ArchivedSession>, redaction: &Redaction) -
     }
 
     summary
+}
+
+/// Mirror one session, fail-open: returns 1 on a write, 0 on skip/error.
+fn mirror_one(d: &super::AgentSessionDetail, redaction: &Redaction) -> u32 {
+    match super::mirror::write_session(d, redaction) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            tracing::debug!(target: "saffev::archive", "repo mirror failed (skipped): {e}");
+            0
+        }
+    }
 }
 
 /// A per-session file source (`.jsonl`) that no longer exists = the app pruned it.
@@ -402,7 +441,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("saffev-archive-{}.db", uuid::Uuid::new_v4()));
         let store = Store::open(&path).await.unwrap();
 
-        let r1 = run_snapshot(&store, Redaction::off()).await.unwrap();
+        let r1 = run_snapshot(&store, Redaction::off(), false).await.unwrap();
         eprintln!("run1: {r1:?}");
         let st = store.archive_stats().await.unwrap();
         eprintln!(
@@ -412,7 +451,7 @@ mod tests {
             st.bytes as f64 / 1e6
         );
 
-        let r2 = run_snapshot(&store, Redaction::off()).await.unwrap();
+        let r2 = run_snapshot(&store, Redaction::off(), false).await.unwrap();
         eprintln!("run2 (expect all skipped): {r2:?}");
         assert_eq!(r2.archived, 0, "unchanged sessions must be skipped");
         assert!(st.count > 0, "should have archived something");

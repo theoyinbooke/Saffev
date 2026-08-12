@@ -562,7 +562,11 @@ pub async fn quality(
     let total_flagged = flagged.len() as u64;
 
     // Eval scores in the window → per-metric good/weak + per-bucket good/weak.
-    let evals = state.store.eval_scores(Some(start)).await.map_err(internal)?;
+    let evals = state
+        .store
+        .eval_scores(Some(start))
+        .await
+        .map_err(internal)?;
     let mut judged: BTreeSet<String> = BTreeSet::new();
     let mut metric_bands: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut bkt_good = vec![0u64; n_buckets];
@@ -1431,6 +1435,7 @@ fn engine_kind_name(kind: crate::engine::EngineKind) -> &'static str {
     match kind {
         crate::engine::EngineKind::Ollama => "ollama",
         crate::engine::EngineKind::LmStudio => "lmstudio",
+        crate::engine::EngineKind::LlamaCpp => "llamacpp",
         crate::engine::EngineKind::Unknown => "unknown",
     }
 }
@@ -1468,13 +1473,20 @@ pub async fn engines_adopt(
     // Gate the Gateway path up front, before any detection or system work, so
     // the user gets the *real* blocker as the error — not a downgrade.
     if !body.cooperative {
-        if requested == "lmstudio" {
+        if requested == "lmstudio" || requested == "llamacpp" {
+            let label = if requested == "lmstudio" {
+                "LM Studio"
+            } else {
+                "llama.cpp"
+            };
             return Err(api_error(
                 StatusCode::CONFLICT,
                 "gateway_unsupported",
-                "Gateway adoption isn't supported for LM Studio (no systemd unit \
-                 to rebind). Use Cooperative mode: point the app at the proxy or \
-                 wrap it with `saffev run`.",
+                &format!(
+                    "Gateway adoption isn't supported for {label} (no systemd unit \
+                     to rebind). Use Cooperative mode: point the app at the proxy \
+                     or wrap it with `saffev run`."
+                ),
             ));
         }
         if cfg.mode != crate::config::Mode::Gateway {
@@ -1591,6 +1603,7 @@ pub async fn engines_revert(
     let kind = match rec.engine.as_str() {
         "ollama" => crate::engine::EngineKind::Ollama,
         "lmstudio" => crate::engine::EngineKind::LmStudio,
+        "llamacpp" => crate::engine::EngineKind::LlamaCpp,
         _ => crate::engine::EngineKind::Unknown,
     };
     let info = crate::engine::EngineInfo {
@@ -2038,8 +2051,21 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
             count: archived.count,
             messages: archived.messages,
             bytes: archived.bytes,
+            db_bytes: db_size_bytes(&cfg),
         },
     })
+}
+
+/// On-disk footprint of the store: the database file plus its WAL (checkpoint
+/// state that can itself grow large). Best-effort — a vanished file is 0, not
+/// an error; this is a display number, never a decision input.
+fn db_size_bytes(cfg: &crate::config::Config) -> u64 {
+    let db = cfg.db_path();
+    let mut total = 0u64;
+    for path in [db.clone(), db.with_extension("db-wal")] {
+        total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    }
+    total
 }
 
 /// Build a compact, cost-bounded transcript for the summarizer: `role: text`
@@ -2419,9 +2445,10 @@ pub async fn archive_run(
             ),
         )
     })?;
-    let summary = crate::agents::archive::run_snapshot(&state.store, redaction)
-        .await
-        .map_err(internal)?;
+    let summary =
+        crate::agents::archive::run_snapshot(&state.store, redaction, cfg.archive.mirror_repos)
+            .await
+            .map_err(internal)?;
     Ok(Json(summary))
 }
 
@@ -2645,15 +2672,14 @@ fn proof_statement(v: &crate::store::ArchiveIntegrity) -> String {
     let altered = if v.altered_sessions.is_empty() {
         String::new()
     } else {
-        format!(
-            " Altered since capture: {}.",
-            v.altered_sessions.join(", ")
-        )
+        format!(" Altered since capture: {}.", v.altered_sessions.join(", "))
     };
     format!(
         "Integrity verification FAILED: {}.{altered} The archived content no longer matches \
          what was recorded when it was preserved.",
-        v.broken_at.as_deref().unwrap_or("the chain does not recompute"),
+        v.broken_at
+            .as_deref()
+            .unwrap_or("the chain does not recompute"),
     )
 }
 
@@ -3130,8 +3156,9 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
     // 5-hour billing blocks with live burn, plan progress. Pure local reads.
     let usage = {
         let pricing = &state.config.load().pricing;
-        let events =
-            crate::agents::usage::claude_code_events(&crate::agents::usage::default_claude_projects_dir());
+        let events = crate::agents::usage::claude_code_events(
+            &crate::agents::usage::default_claude_projects_dir(),
+        );
         if events.is_empty() {
             None
         } else {
@@ -3141,48 +3168,45 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
                 daily.drain(..daily.len() - 30);
             }
             let mut blocks = crate::agents::usage::blocks(&events, pricing, now);
-            let plan = blocks
-                .iter()
-                .find(|b| b.is_active)
-                .map(|active| {
-                    // Allowance: the user's configured estimate, else the
-                    // highest OBSERVED block (needs no invented number).
-                    // Baseline = the max of COMPLETED blocks — including the
-                    // active one made the bar read exactly 100% whenever the
-                    // current block was the all-time max (G3 closing critic).
-                    // With no completed history the active block is all there
-                    // is, and 100% is the honest answer.
-                    let completed_max = blocks
-                        .iter()
-                        .filter(|b| !b.is_gap && !b.is_active)
-                        .map(|b| b.totals.cost_usd)
-                        .fold(0.0f64, f64::max);
-                    let observed_max = if completed_max > 0.0 {
-                        completed_max
+            let plan = blocks.iter().find(|b| b.is_active).map(|active| {
+                // Allowance: the user's configured estimate, else the
+                // highest OBSERVED block (needs no invented number).
+                // Baseline = the max of COMPLETED blocks — including the
+                // active one made the bar read exactly 100% whenever the
+                // current block was the all-time max (G3 closing critic).
+                // With no completed history the active block is all there
+                // is, and 100% is the honest answer.
+                let completed_max = blocks
+                    .iter()
+                    .filter(|b| !b.is_gap && !b.is_active)
+                    .map(|b| b.totals.cost_usd)
+                    .fold(0.0f64, f64::max);
+                let observed_max = if completed_max > 0.0 {
+                    completed_max
+                } else {
+                    active.totals.cost_usd
+                };
+                let allowance = if pricing.plan_block_allowance_usd > 0.0 {
+                    pricing.plan_block_allowance_usd
+                } else {
+                    observed_max
+                };
+                dto::PlanProgress {
+                    plan: if pricing.plan.is_empty() {
+                        "observed-max".to_string()
                     } else {
-                        active.totals.cost_usd
-                    };
-                    let allowance = if pricing.plan_block_allowance_usd > 0.0 {
-                        pricing.plan_block_allowance_usd
+                        pricing.plan.clone()
+                    },
+                    block_cost_allowance_usd: allowance,
+                    spent_usd: active.totals.cost_usd,
+                    used_fraction: if allowance > 0.0 {
+                        active.totals.cost_usd / allowance
                     } else {
-                        observed_max
-                    };
-                    dto::PlanProgress {
-                        plan: if pricing.plan.is_empty() {
-                            "observed-max".to_string()
-                        } else {
-                            pricing.plan.clone()
-                        },
-                        block_cost_allowance_usd: allowance,
-                        spent_usd: active.totals.cost_usd,
-                        used_fraction: if allowance > 0.0 {
-                            active.totals.cost_usd / allowance
-                        } else {
-                            0.0
-                        },
-                        resets_in_ms: (active.end_ts - now).max(0),
-                    }
-                });
+                        0.0
+                    },
+                    resets_in_ms: (active.end_ts - now).max(0),
+                }
+            });
             if blocks.len() > 20 {
                 blocks.drain(..blocks.len() - 20);
             }
@@ -3414,6 +3438,13 @@ pub async fn settings_put(
         persisted.archive.auto = v;
         live.archive.auto = v;
     }
+    // archive.mirror_repos — HOT-RELOADABLE. Writing into the user's repos is
+    // opt-in; the next snapshot backfills mirrors for already-archived
+    // sessions whose file is missing.
+    if let Some(v) = body.archive_mirror_repos {
+        persisted.archive.mirror_repos = v;
+        live.archive.mirror_repos = v;
+    }
 
     // export_dir — HOT-RELOADABLE. Validated here rather than at export time:
     // a user pointing exports at an SD card wants to find out about a typo (or
@@ -3560,10 +3591,9 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         archive_enabled: cfg.archive.enabled,
         archive_auto: cfg.archive.auto,
         archive_redact: cfg.archive.redact,
-        export_dir: cfg
-            .export_dir
-            .as_deref()
-            .map(|p| p.display().to_string()),
+        archive_mirror_repos: cfg.archive.mirror_repos,
+        db_bytes: db_size_bytes(&cfg),
+        export_dir: cfg.export_dir.as_deref().map(|p| p.display().to_string()),
         export_dir_effective: cfg.export_base().display().to_string(),
         restart_required: Vec::new(),
         restart_note: None,
@@ -4079,7 +4109,10 @@ mod tests {
         let resp = settings_put(State(state.clone()), Json(update))
             .await
             .expect("valid export_dir accepted");
-        assert_eq!(resp.0.export_dir.as_deref(), Some(&*dest.display().to_string()));
+        assert_eq!(
+            resp.0.export_dir.as_deref(),
+            Some(&*dest.display().to_string())
+        );
         assert_eq!(resp.0.export_dir_effective, dest.display().to_string());
         assert!(resp.0.restart_required.is_empty(), "applies live");
         assert_eq!(handle.load().export_dir.as_deref(), Some(&*dest));

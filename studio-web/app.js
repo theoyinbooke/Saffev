@@ -2154,12 +2154,23 @@
             ? 'On · detected secrets are replaced with a placeholder before being stored. Safer, but lossy: the original text is not kept anywhere, and your archive may be the last copy. Existing sessions are re-archived redacted on the next snapshot.'
             : 'Off · transcripts are preserved exactly as they were, secrets included. Turn on to keep a safe copy rather than a complete one.',
         el('div', { class: 'ctl' }, [arRedact])));
+      // Repo mirroring writes into the user's own repositories · the copy is
+      // explicit about where and what, since that is an unusual thing to do.
+      const arMirror = switchBtn(s.archiveMirrorRepos, 'Toggle repo mirroring', { disabled: !s.archiveEnabled });
+      arMirror.addEventListener('click', () => { if (!s.archiveEnabled) return; this.save(view, { archiveMirrorRepos: !arMirror.classList.contains('on') }); });
+      arCard.appendChild(setRow('Mirror sessions into their repos',
+        !s.archiveEnabled ? 'Enable preservation first.'
+          : s.archiveMirrorRepos
+            ? 'On · each preserved session is also written as Markdown to .saffev/sessions/ inside the git repository it belongs to, so transcripts live next to the code. Commit them or add .saffev/ to .gitignore · your choice. Redaction (above) applies to these files too.'
+            : 'Off · preserved sessions live only in the encrypted archive. Turn on to also write Markdown transcripts into each project repo (.saffev/sessions/).',
+        el('div', { class: 'ctl' }, [arMirror])));
       panel.appendChild(arCard);
     },
 
     panelSystem(panel, view, s) {
       const sysCard = el('div', { class: 'card reveal' }, [el('div', { class: 'hrow' }, [el('h3', { text: 'System' })])]);
       sysCard.appendChild(setRow('Data directory', 'Config + encrypted database location.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: s.dataDir })])));
+      sysCard.appendChild(setRow('Database size', 'On-disk size of the encrypted store (history, findings, preserved sessions, search index). Grows append-only; compaction is manual for now.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: fmtBytes(s.dbBytes || 0) })])));
       sysCard.appendChild(setRow('Proxy port', 'Where apps send local-LLM traffic.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: ':' + s.proxyPort })])));
       sysCard.appendChild(setRow('Studio port', 'This control plane.', el('div', { class: 'ctl' }, [el('span', { class: 'kv', text: ':' + s.studioPort })])));
       const patterns = (s.customPatterns && s.customPatterns.length) ? s.customPatterns.join(', ') : 'none';
@@ -2234,6 +2245,7 @@
     const n = (name || '').toLowerCase();
     if (n === 'ollama') return 'Ollama';
     if (n === 'lmstudio' || n === 'lm studio') return 'LM Studio';
+    if (n === 'llamacpp' || n === 'llama.cpp') return 'llama.cpp';
     return null;
   }
 
@@ -3348,7 +3360,7 @@
           : risk + ' Nothing is backed up yet.';
       }
       return arch.enabled
-        ? fmtNum(arch.count) + ' sessions preserved · ' + fmtBytes(arch.bytes) + '. Your history is safe here even if the tools delete theirs.'
+        ? fmtNum(arch.count) + ' sessions preserved · ' + fmtBytes(arch.bytes) + (arch.dbBytes ? ' (database on disk: ' + fmtBytes(arch.dbBytes) + ')' : '') + '. Your history is safe here even if the tools delete theirs.'
         : 'Your tools delete their own history on their own clocks. Turn on Preservation to keep a durable, on-device copy.';
     },
 

@@ -97,7 +97,12 @@ pub fn to_markdown(d: &AgentSessionDetail) -> String {
 
 /// A filesystem-safe base name for the export, e.g. `codex_fix-login_a1b2c3`.
 pub fn safe_filename(d: &AgentSessionDetail) -> String {
-    let s = &d.session;
+    safe_filename_for(&d.session)
+}
+
+/// Same, from list metadata alone — lets callers (repo mirroring) name the
+/// file without parsing the transcript.
+pub fn safe_filename_for(s: &super::AgentSession) -> String {
     let slug: String = s
         .title
         .as_deref()
@@ -116,18 +121,23 @@ pub fn safe_filename(d: &AgentSessionDetail) -> String {
         .collect::<Vec<_>>()
         .join("-");
     let slug: String = slug.chars().take(48).collect();
-    let short = super::split_id(&s.id)
-        .map(|(_, r)| r)
-        .unwrap_or(&s.id)
-        .chars()
-        .take(8)
-        .collect::<String>();
     let slug = if slug.is_empty() {
         "session".into()
     } else {
         slug
     };
-    format!("{}_{}_{}", s.tool.key(), slug, short)
+    format!("{}_{}_{}", s.tool.key(), slug, short_id_for(s))
+}
+
+/// The stable short-id suffix of [`safe_filename_for`] (used by mirroring to
+/// find files for a session whose title — the slug half — has changed).
+pub fn short_id_for(s: &super::AgentSession) -> String {
+    super::split_id(&s.id)
+        .map(|(_, r)| r)
+        .unwrap_or(&s.id)
+        .chars()
+        .take(8)
+        .collect()
 }
 
 fn role_label(r: Role) -> &'static str {

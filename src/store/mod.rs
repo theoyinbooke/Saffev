@@ -809,10 +809,7 @@ impl Store {
 
     /// Safety findings (eval pipeline), bounded to `ts >= since_ts` when given
     /// (`None` = all). The Studio buckets them by category.
-    pub async fn safety_findings(
-        &self,
-        since_ts: Option<i64>,
-    ) -> Result<Vec<SafetyFindingRecord>> {
+    pub async fn safety_findings(&self, since_ts: Option<i64>) -> Result<Vec<SafetyFindingRecord>> {
         self.read(move |conn| {
             let since = since_ts.unwrap_or(i64::MIN);
             let mut stmt = conn.prepare(
@@ -1310,6 +1307,22 @@ impl Store {
     }
 
     /// Archive footprint: session count, message count, approximate bytes.
+    /// Write a consistent, compacted copy of the whole database to `dest` via
+    /// `VACUUM INTO` — safe while the daemon is running (SQLite snapshots the
+    /// content), and with SQLCipher the copy stays encrypted **under the same
+    /// key** as the source. Fails if `dest` already exists (never silently
+    /// overwrite a previous backup). Returns the schema `user_version`, for
+    /// the backup manifest.
+    pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<u32> {
+        self.read(move |conn| {
+            let dest_str = dest.to_string_lossy().to_string();
+            conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
+            let v: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            Ok(v)
+        })
+        .await
+    }
+
     pub async fn archive_stats(&self) -> Result<ArchiveStats> {
         self.read(|conn| {
             let (count, messages): (u64, u64) = conn.query_row(
@@ -2984,6 +2997,41 @@ mod tests {
             vec!["b", "a"]
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The backup must be a real, openable copy under the same key — and must
+    /// refuse to overwrite an existing file (a prior backup is not scratch).
+    #[tokio::test]
+    async fn backup_to_writes_an_openable_copy_and_never_overwrites() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        store.enqueue(WriteOp::Setting {
+            key: "backup_probe".into(),
+            value: "42".into(),
+        });
+        store.flush().await.unwrap();
+
+        let dest = std::env::temp_dir().join(format!("saffev-backup-{}.db", uuid::Uuid::new_v4()));
+        let schema = store.backup_to(dest.clone()).await.unwrap();
+        assert!(
+            schema >= 10,
+            "manifest schema version comes from the source"
+        );
+
+        let copy = Store::open(&dest).await.unwrap();
+        assert_eq!(
+            copy.get_setting("backup_probe").await.unwrap(),
+            Some("42".into()),
+            "the copy must contain the source's data"
+        );
+
+        assert!(
+            store.backup_to(dest.clone()).await.is_err(),
+            "an existing destination must be refused, not clobbered"
+        );
+
+        let _ = std::fs::remove_file(&dest);
         let _ = std::fs::remove_file(&path);
     }
 

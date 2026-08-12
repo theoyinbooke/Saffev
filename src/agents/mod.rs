@@ -32,6 +32,7 @@ pub mod export;
 pub mod gemini;
 pub mod gitlink;
 pub mod goose;
+pub mod mirror;
 pub mod opencode;
 pub mod privacy;
 pub mod retention;
@@ -378,9 +379,50 @@ pub fn at_risk_report(sessions: &[AgentSession]) -> Vec<retention::AtRisk> {
         .map(|r| {
             let tool = r.tool();
             let mine: Vec<&AgentSession> = sessions.iter().filter(|s| s.tool == tool).collect();
-            retention::at_risk_for(tool, r.retention(), &mine, now, 7)
+            retention::at_risk_for(
+                tool,
+                r.retention(),
+                &mine,
+                now,
+                retention::AT_RISK_WARN_DAYS,
+            )
         })
         .collect()
+}
+
+/// Sessions at risk of deletion (past their tool's line or crossing it within
+/// [`retention::AT_RISK_WARN_DAYS`]) whose ids are NOT in `archived_ids` — the
+/// preservation gap the at-risk monitor signal announces. Returns the matching
+/// sessions plus the soonest still-upcoming expiry among them (`None` when
+/// every match is already past the line).
+pub fn at_risk_unpreserved<'a>(
+    sessions: &'a [AgentSession],
+    archived_ids: &std::collections::HashSet<String>,
+    now_ms: i64,
+) -> (Vec<&'a AgentSession>, Option<i64>) {
+    // Policy per tool, looked up once — not per session.
+    let policies: std::collections::HashMap<AgentTool, retention::RetentionPolicy> = readers()
+        .iter()
+        .map(|r| (r.tool(), r.retention()))
+        .collect();
+    let (mut hits, mut soonest) = (Vec::new(), None::<i64>);
+    for s in sessions {
+        if archived_ids.contains(&s.id) {
+            continue;
+        }
+        let Some(policy) = policies.get(&s.tool) else {
+            continue;
+        };
+        if retention::is_at_risk(policy, s.updated_ts, now_ms, retention::AT_RISK_WARN_DAYS) {
+            if let Some(expiry) = retention::expiry_ts(policy, s.updated_ts) {
+                if expiry > now_ms {
+                    soonest = Some(soonest.map_or(expiry, |m: i64| m.min(expiry)));
+                }
+            }
+            hits.push(s);
+        }
+    }
+    (hits, soonest)
 }
 
 /// The user's home directory (`$HOME`), or `.` as a fail-soft fallback.
@@ -594,10 +636,7 @@ pub fn cost_usd_split_with(
     let Some(model) = model else { return 0.0 };
     let (pin, pout, pread, pwrite) = pricing.lookup_split(model);
     let reads = cache.saturating_sub(cache_write);
-    (input as f64 * pin
-        + output as f64 * pout
-        + reads as f64 * pread
-        + cache_write as f64 * pwrite)
+    (input as f64 * pin + output as f64 * pout + reads as f64 * pread + cache_write as f64 * pwrite)
         / 1_000_000.0
 }
 

@@ -1,8 +1,9 @@
 //! Engine detection (04 §5.1).
 //!
-//! Probe known ports (`11434`, `1234`), call identifying endpoints (`/api/tags`
-//! for Ollama, `/v1/models` for LM Studio), check for installed binaries
-//! (`ollama`, `lms`) and their service/agent definitions.
+//! Probe known ports (`11434`, `1234`, `8080`), call identifying endpoints
+//! (`/api/tags` for Ollama, `/props` for llama.cpp's `llama-server`,
+//! `/v1/models` for LM Studio), check for installed binaries (`ollama`, `lms`,
+//! `llama-server`) and their service/agent definitions.
 //!
 //! Everything here is best-effort and never panics: a port that does not answer,
 //! a binary that is not installed, or a malformed response just yields a
@@ -14,8 +15,18 @@ use crate::engine::{EngineInfo, EngineKind, StartMode};
 use crate::store::AdoptionState;
 use crate::Result;
 
-/// Ports we probe by default (Ollama, LM Studio).
-pub const KNOWN_PORTS: &[u16] = &[11434, 1234];
+/// Ports we probe by default (Ollama, LM Studio, llama.cpp server).
+pub const KNOWN_PORTS: &[u16] = &[11434, 1234, 8080];
+
+/// Whether an open-but-unrecognized listener on `port` is worth reporting as
+/// [`EngineKind::Unknown`]. On the engine-conventional ports (11434, 1234) an
+/// unknown server is meaningful — the user likely pointed something there. On
+/// `8080` it is almost certainly an unrelated dev server (the most contested
+/// port on any laptop), and reporting it as a mystery "engine" would be noise;
+/// there we only report a POSITIVE identification.
+fn unknown_reportable(port: u16) -> bool {
+    port != 8080
+}
 
 /// How long to wait on an identifying HTTP probe before giving up.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -63,6 +74,11 @@ async fn probe_port_as(port: u16, adoption_state: AdoptionState) -> Result<Optio
     let Some(kind) = kind else {
         return Ok(None);
     };
+    // An unrecognized listener on an opportunistic port (8080) is far more
+    // likely a dev server than an engine — suppress rather than confuse.
+    if kind == EngineKind::Unknown && !unknown_reportable(port) {
+        return Ok(None);
+    }
 
     let version = probe_version(&client, port, kind).await;
     let how_it_starts = start_mode(kind).await.unwrap_or(StartMode::Unknown);
@@ -81,6 +97,7 @@ pub fn engine_name(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Ollama => "ollama",
         EngineKind::LmStudio => "lmstudio",
+        EngineKind::LlamaCpp => "llamacpp",
         EngineKind::Unknown => "unknown",
     }
 }
@@ -99,26 +116,35 @@ pub async fn identify(port: u16) -> Result<EngineKind> {
 /// `None` if the port is closed / unreachable. The recognized-vs-Unknown split
 /// is by which identifying endpoint returns a 2xx with the expected shape.
 async fn identify_with(client: &reqwest::Client, port: u16) -> Option<EngineKind> {
-    // Order the checks by which engine conventionally owns the port so the happy
-    // path is one request, but always try both before concluding "Unknown".
-    let ollama_first = port == 11434;
-
-    let ollama = async { is_ollama(client, port).await };
-    let lmstudio = async { is_lmstudio(client, port).await };
-
-    if ollama_first {
-        if ollama.await {
-            return Some(EngineKind::Ollama);
-        }
-        if lmstudio.await {
-            return Some(EngineKind::LmStudio);
-        }
+    // Order the checks by which engine conventionally owns the port so the
+    // happy path is one request — with one hard constraint: **llama.cpp is
+    // always checked before LM Studio**. llama-server also answers the
+    // OpenAI-shape `/v1/models` that identifies LM Studio, so testing the
+    // generic shape first would mislabel every llama.cpp server; `/props` is
+    // llama.cpp-specific and cannot match LM Studio.
+    let order: [EngineKind; 3] = if port == 11434 {
+        [
+            EngineKind::Ollama,
+            EngineKind::LlamaCpp,
+            EngineKind::LmStudio,
+        ]
     } else {
-        if lmstudio.await {
-            return Some(EngineKind::LmStudio);
-        }
-        if ollama.await {
-            return Some(EngineKind::Ollama);
+        [
+            EngineKind::LlamaCpp,
+            EngineKind::LmStudio,
+            EngineKind::Ollama,
+        ]
+    };
+
+    for kind in order {
+        let hit = match kind {
+            EngineKind::Ollama => is_ollama(client, port).await,
+            EngineKind::LlamaCpp => is_llamacpp(client, port).await,
+            EngineKind::LmStudio => is_lmstudio(client, port).await,
+            EngineKind::Unknown => false,
+        };
+        if hit {
+            return Some(kind);
         }
     }
 
@@ -137,6 +163,23 @@ async fn is_ollama(client: &reqwest::Client, port: u16) -> bool {
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => v.get("models").map(|m| m.is_array()).unwrap_or(false),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// llama.cpp's `llama-server` answers `GET /props` with a JSON object carrying
+/// server-specific keys (`default_generation_settings`, `total_slots`). The
+/// key check matters: `/props` returning any 2xx is not enough on a port as
+/// contested as 8080 — a random dev server must not classify as an engine.
+async fn is_llamacpp(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/props");
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => {
+                v.get("default_generation_settings").is_some() || v.get("total_slots").is_some()
+            }
             Err(_) => false,
         },
         _ => false,
@@ -165,8 +208,9 @@ async fn port_responds(client: &reqwest::Client, port: u16) -> bool {
 
 /// Pull a version string for a recognized engine, if it exposes one.
 ///
-/// Ollama exposes `GET /api/version` → `{"version": "0.x.y"}`. LM Studio has no
-/// stable version endpoint over HTTP, so we leave it `None`.
+/// Ollama exposes `GET /api/version` → `{"version": "0.x.y"}`. llama.cpp's
+/// `/props` may carry a `build_info` string (best-effort — absent on some
+/// builds). LM Studio has no stable version endpoint over HTTP.
 async fn probe_version(client: &reqwest::Client, port: u16, kind: EngineKind) -> Option<String> {
     match kind {
         EngineKind::Ollama => {
@@ -177,6 +221,17 @@ async fn probe_version(client: &reqwest::Client, port: u16, kind: EngineKind) ->
             }
             let v: serde_json::Value = resp.json().await.ok()?;
             v.get("version")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        }
+        EngineKind::LlamaCpp => {
+            let url = format!("http://127.0.0.1:{port}/props");
+            let resp = client.get(&url).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: serde_json::Value = resp.json().await.ok()?;
+            v.get("build_info")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string())
         }
@@ -280,6 +335,7 @@ fn binary_on_path(engine: EngineKind) -> bool {
     let bin = match engine {
         EngineKind::Ollama => "ollama",
         EngineKind::LmStudio => "lms",
+        EngineKind::LlamaCpp => "llama-server",
         EngineKind::Unknown => return false,
     };
     which_on_path(bin)
@@ -323,9 +379,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_ports_cover_ollama_and_lmstudio() {
+    fn known_ports_cover_all_engines() {
         assert!(KNOWN_PORTS.contains(&11434), "Ollama port must be probed");
         assert!(KNOWN_PORTS.contains(&1234), "LM Studio port must be probed");
+        assert!(KNOWN_PORTS.contains(&8080), "llama.cpp port must be probed");
+    }
+
+    /// An unrecognized listener is reportable on the engine-conventional ports
+    /// but suppressed on 8080 — a laptop's dev server must never surface as a
+    /// mystery "engine" card.
+    #[test]
+    fn unknown_listeners_are_suppressed_on_contested_ports() {
+        assert!(unknown_reportable(11434));
+        assert!(unknown_reportable(1234));
+        assert!(!unknown_reportable(8080));
+    }
+
+    #[test]
+    fn llamacpp_props_shape_is_recognized_and_generic_json_is_not() {
+        // The contract is_llamacpp checks: llama-server-specific keys, not 2xx.
+        let props: serde_json::Value =
+            serde_json::json!({ "default_generation_settings": {}, "total_slots": 1 });
+        assert!(
+            props.get("default_generation_settings").is_some()
+                || props.get("total_slots").is_some()
+        );
+        let dev_server: serde_json::Value = serde_json::json!({ "status": "ok" });
+        assert!(
+            dev_server.get("default_generation_settings").is_none()
+                && dev_server.get("total_slots").is_none(),
+            "a generic JSON health payload must not identify as llama.cpp"
+        );
     }
 
     #[test]

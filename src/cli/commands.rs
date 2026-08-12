@@ -258,6 +258,103 @@ pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Resu
     Ok(())
 }
 
+/// `saffev backup [--out DIR]` — write a consistent copy of the encrypted
+/// database (+ the config file) into a timestamped folder under the export
+/// destination. The durable-product answer to "my laptop died": SQLite's
+/// `VACUUM INTO` snapshots the store safely while the daemon runs, and the
+/// copy stays SQLCipher-encrypted under the SAME key — which lives in the OS
+/// keychain, not in the folder, so the README spells out how to carry it.
+pub async fn backup(cli: &Cli, out: Option<std::path::PathBuf>) -> Result<()> {
+    let p = painter(cli);
+    let cfg = load_config(cli).await;
+
+    let base = out.unwrap_or_else(|| cfg.export_base());
+    let now = time::OffsetDateTime::now_utc();
+    let stamp = format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let dir = base.join(format!("Saffev-Backup-{stamp}"));
+    std::fs::create_dir_all(&dir).map_err(crate::Error::Io)?;
+
+    let store = crate::store::Store::open(&cfg.db_path()).await?;
+    let schema = store.backup_to(dir.join("saffev.db")).await?;
+    let db_bytes = std::fs::metadata(dir.join("saffev.db"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Best-effort config copy: a zero-config install has nothing to copy.
+    let cfg_copied = std::fs::copy(cfg.config_path(), dir.join("saffev.toml")).is_ok();
+
+    let created = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let version = env!("CARGO_PKG_VERSION");
+    let readme = format!(
+        "# Saffev backup — {created}\n\n\
+         Created by `saffev backup` v{version}. Contents:\n\n\
+         - `saffev.db` — the complete store (proxy history, findings, preserved\n\
+         \x20 sessions, integrity chain) as a consistent `VACUUM INTO` snapshot.\n\
+         \x20 Schema version {schema}. In the default build this file is\n\
+         \x20 SQLCipher-encrypted with the SAME key as the source machine — the\n\
+         \x20 backup is useless without that key.\n\
+         {config_line}\n\
+         ## The key — read this before you need it\n\n\
+         The database key is deliberately NOT in this folder (a backup that\n\
+         carries its own key is not encrypted in any meaningful sense). To\n\
+         restore on another machine, bring the key yourself:\n\n\
+         - macOS (on the source machine):\n\
+         \x20 `security find-generic-password -s saffev -a db-key -w`\n\
+         - Linux: the secret service entry with service `saffev`, user `db-key`\n\
+         \x20 (e.g. `secret-tool lookup service saffev username db-key`).\n\
+         - If you run Saffev with the `SAFFEV_DB_KEY` environment variable set,\n\
+         \x20 that value IS the key.\n\n\
+         ## Restore\n\n\
+         1. Install Saffev on the new machine — but do NOT start it yet: a\n\
+         \x20  first start would mint a fresh key that cannot open this file.\n\
+         2. Put the key where Saffev looks: add it to the OS keychain (macOS:\n\
+         \x20  `security add-generic-password -s saffev -a db-key -w '<key>'`)\n\
+         \x20  or export `SAFFEV_DB_KEY` for every start.\n\
+         3. Copy `saffev.db` into the data directory ({data_dir}) and, if\n\
+         \x20  present, `saffev.toml` into the config location.\n\
+         4. `saffev start` — History, Agents, and the archive are exactly as\n\
+         \x20  they were.\n",
+        config_line = if cfg_copied {
+            "- `saffev.toml` — the config file at backup time.\n"
+        } else {
+            "- (no config file existed at backup time — defaults were in use)\n"
+        },
+        data_dir = cfg.data_dir.display(),
+    );
+    std::fs::write(dir.join("README.md"), readme).map_err(crate::Error::Io)?;
+
+    println!(
+        "{} {} {}",
+        p.dot(Level::Ok),
+        p.label("backup"),
+        p.success(&format!("written to {}", dir.display()))
+    );
+    println!(
+        "{} {}",
+        p.prompt("·"),
+        p.muted(&format!(
+            "database {:.1} MB · schema v{schema} · encrypted with your existing key",
+            db_bytes as f64 / 1e6
+        ))
+    );
+    println!(
+        "{} {}",
+        p.prompt("·"),
+        p.muted("the key is NOT in the folder — see README.md inside for how to carry it"),
+    );
+    Ok(())
+}
+
 /// `saffev status [--check]`. With `--check`, the monitor rules (G6) are
 /// evaluated once after the human-readable status and the process exits `2`
 /// when any signal fired — the scripting hook (cron / CI / shell prompt) that
@@ -290,6 +387,7 @@ pub async fn status(cli: &Cli, check: bool) -> Result<()> {
     .map(|info| match info.engine {
         crate::engine::EngineKind::Ollama => "ollama".to_string(),
         crate::engine::EngineKind::LmStudio => "lmstudio".to_string(),
+        crate::engine::EngineKind::LlamaCpp => "llamacpp".to_string(),
         crate::engine::EngineKind::Unknown => "engine".to_string(),
     })
     .unwrap_or_else(|| "ollama".to_string());
@@ -434,11 +532,7 @@ pub async fn status(cli: &Cli, check: bool) -> Result<()> {
 /// come from `[monitors]` in the TOML, and the persisted dedup state is shared
 /// with the background loop, so a signal the Studio already announced is not
 /// re-announced by a cron probe (and vice versa).
-async fn status_check(
-    cli: &Cli,
-    cfg: &Config,
-    exposed: Option<bool>,
-) -> Result<()> {
+async fn status_check(cli: &Cli, cfg: &Config, exposed: Option<bool>) -> Result<()> {
     let p = painter(cli);
 
     let db_path = cfg.db_path();
@@ -448,7 +542,11 @@ async fn status_check(
     .await;
     let Some(store) = store else {
         // No store = nothing to evaluate; an unreadable DB must not page anyone.
-        println!("{} {}", p.prompt("~"), p.muted("check: store unavailable · no signals"));
+        println!(
+            "{} {}",
+            p.prompt("~"),
+            p.muted("check: store unavailable · no signals")
+        );
         return Ok(());
     };
 
@@ -465,8 +563,19 @@ async fn status_check(
     .unwrap_or(None);
 
     let mut state = crate::signals::MonitorState::load(&store).await;
-    let signals =
-        crate::signals::evaluate(&store, cfg, current_millis(), exposed, spend, &mut state).await;
+    // Preservation gap (rule 6) — same observation the scheduler supplies,
+    // computed at most once per UTC day (a cold process pays a full listing).
+    let at_risk = crate::signals::at_risk_observation(&store, current_millis(), &mut state).await;
+    let signals = crate::signals::evaluate(
+        &store,
+        cfg,
+        current_millis(),
+        exposed,
+        spend,
+        at_risk,
+        &mut state,
+    )
+    .await;
     state.save(&store);
     // Make the state write durable before the process exits (enqueue alone
     // races process teardown, which would break cross-run dedup).
@@ -805,6 +914,7 @@ async fn detect_upstream_port() -> u16 {
     use crate::engine::EngineKind;
 
     let mut lmstudio_port: Option<u16> = None;
+    let mut llamacpp_port: Option<u16> = None;
     for &port in detect::KNOWN_PORTS {
         if let Ok(Some(info)) = detect::probe_port(port).await {
             match info.engine {
@@ -813,11 +923,18 @@ async fn detect_upstream_port() -> u16 {
                 EngineKind::LmStudio => {
                     lmstudio_port.get_or_insert(port);
                 }
+                EngineKind::LlamaCpp => {
+                    llamacpp_port.get_or_insert(port);
+                }
                 EngineKind::Unknown => {}
             }
         }
     }
-    lmstudio_port.unwrap_or(crate::config::DEFAULT_UPSTREAM_PORT)
+    // Preference order: Ollama > LM Studio > llama.cpp (adoption/journal
+    // support decreases in that order), then the Ollama default.
+    lmstudio_port
+        .or(llamacpp_port)
+        .unwrap_or(crate::config::DEFAULT_UPSTREAM_PORT)
 }
 
 /// The config `start` should run with, plus whether this was a true first run.
@@ -1212,6 +1329,7 @@ async fn print_start_summary(p: &Painter, cfg: &Config, first_run: bool) {
             let kind = match info.engine {
                 crate::engine::EngineKind::Ollama => "ollama",
                 crate::engine::EngineKind::LmStudio => "lmstudio",
+                crate::engine::EngineKind::LlamaCpp => "llamacpp",
                 crate::engine::EngineKind::Unknown => "engine",
             };
             let version = info
@@ -1776,6 +1894,7 @@ pub async fn doctor(cli: &Cli) -> Result<()> {
             let kind = match info.engine {
                 crate::engine::EngineKind::Ollama => "ollama",
                 crate::engine::EngineKind::LmStudio => "lmstudio",
+                crate::engine::EngineKind::LlamaCpp => "llamacpp",
                 crate::engine::EngineKind::Unknown => "unknown",
             };
             println!(

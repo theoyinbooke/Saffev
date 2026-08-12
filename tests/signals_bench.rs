@@ -7,9 +7,10 @@
 //! cargo test --test signals_bench -- --nocapture
 //! ```
 //!
-//! Constructs a fixture store that trips **all five** monitor rule classes at
+//! Constructs a fixture store that trips **all six** monitor rule classes at
 //! once — PII spike, new source app, exposure verdict change, latency p95,
-//! spend-per-day — then evaluates twice and enforces the rubric floors:
+//! spend-per-day, sessions-at-risk — then evaluates twice and enforces the
+//! rubric floors:
 //!
 //! - (a) every rule FIRES on the first evaluation and DEDUPLICATES on the
 //!   second (same inputs, minutes later — the noisy re-fire case);
@@ -27,7 +28,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use saffev::config::Config;
-use saffev::signals::{self, MonitorState, SignalKind};
+use saffev::signals::{self, AtRiskObservation, MonitorState, SignalKind};
 use saffev::store::{
     PiiAction, PiiFindingRecord, RequestMeta, SourceConfidence, Store, TokenSource, WriteOp,
 };
@@ -87,7 +88,7 @@ fn finding(record_id: &str, n: usize) -> PiiFindingRecord {
 async fn signals_floors() {
     let cfg = Config::default(); // thresholds: 20 PII/h · 30_000ms p95 · $10/day
 
-    // ---- fixture: one store tripping all five rules ---------------------------
+    // ---- fixture: one store tripping the store-backed rules -------------------
     let store = Store::open(&tmp_db()).await.expect("open temp store");
     // 25 recent slow requests from a NEVER-seen app "aider": trips latency p95
     // (25 ≥ 20-sample floor, p95 = 45s > 30s) AND new-source-app together.
@@ -114,13 +115,28 @@ async fn signals_floors() {
         ..MonitorState::default()
     };
 
-    // Exposure + spend are observations (inputs), exactly as the scheduler and
-    // `status --check` supply them — $42 estimated spend trips $10/day.
+    // Exposure, spend, and the preservation gap are observations (inputs),
+    // exactly as the scheduler and `status --check` supply them — $42 spend
+    // trips $10/day; 2 unpreserved at-risk sessions trip the default (any).
     let exposed = Some(true);
     let spend = Some(42.0);
+    let at_risk = Some(AtRiskObservation {
+        unpreserved: 2,
+        soonest_expiry_ts: Some(NOW + 3 * 24 * 60 * MINUTE_MS),
+        tools: vec!["Claude Code".into()],
+    });
 
-    // ---- rubric (a): all five fire… -------------------------------------------
-    let first = signals::evaluate(&store, &cfg, NOW, exposed, spend, &mut state).await;
+    // ---- rubric (a): all six fire… --------------------------------------------
+    let first = signals::evaluate(
+        &store,
+        &cfg,
+        NOW,
+        exposed,
+        spend,
+        at_risk.clone(),
+        &mut state,
+    )
+    .await;
     let fired: Vec<SignalKind> = first.iter().map(|s| s.kind).collect();
     let all = [
         SignalKind::PiiSpike,
@@ -128,6 +144,7 @@ async fn signals_floors() {
         SignalKind::ExposureChange,
         SignalKind::LatencyP95,
         SignalKind::SpendPerDay,
+        SignalKind::SessionsAtRisk,
     ];
     for kind in all {
         assert!(
@@ -135,7 +152,7 @@ async fn signals_floors() {
             "rule {kind:?} did not fire; got {fired:?}"
         );
     }
-    assert_eq!(first.len(), 5, "each rule fires exactly once: {fired:?}");
+    assert_eq!(first.len(), 6, "each rule fires exactly once: {fired:?}");
 
     // ---- …and deduplicate ------------------------------------------------------
     // Same conditions five minutes later (same hour bucket / same UTC day /
@@ -146,6 +163,7 @@ async fn signals_floors() {
         NOW + 5 * MINUTE_MS,
         exposed,
         spend,
+        at_risk.clone(),
         &mut state,
     )
     .await;
@@ -166,6 +184,7 @@ async fn signals_floors() {
         NOW + 6 * MINUTE_MS,
         exposed,
         spend,
+        at_risk,
         &mut reloaded,
     )
     .await;
@@ -226,8 +245,9 @@ async fn signals_floors() {
     observations; notifications are local subprocesses (notify-send / osascript), \
     never webhooks; no rule path constructs a URL or opens a socket",
         "config_plane": "toml [monitors] (saffev.toml — same plane as every other setting)",
-        "dedup": "threshold rules once per hour/day bucket; new-app once ever; \
-    exposure once per verdict flip; state persisted in the store settings table",
+        "dedup": "threshold rules once per hour/day bucket (sessions-at-risk once \
+    per UTC day); new-app once ever; exposure once per verdict flip; state \
+    persisted in the store settings table",
     });
     let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/signals-results.json");
     std::fs::write(
@@ -236,7 +256,7 @@ async fn signals_floors() {
     )
     .expect("write bench artifact");
     println!(
-        "G6 signals bench: all five rules fired + deduped · artifact at {}",
+        "G6 signals bench: all six rules fired + deduped · artifact at {}",
         out.display()
     );
 }

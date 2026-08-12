@@ -458,6 +458,13 @@ pub struct SettingsView {
     /// Replace detected secrets with a placeholder before archiving (opt-in, lossy).
     #[serde(default)]
     pub archive_redact: bool,
+    /// Mirror preserved sessions as Markdown into their project repos
+    /// (`<repo>/.saffev/sessions/`, opt-in).
+    #[serde(default)]
+    pub archive_mirror_repos: bool,
+    /// On-disk size of the store database (+WAL), for the System panel.
+    #[serde(default)]
+    pub db_bytes: u64,
     /// Configured export destination (`None` = home folder default). Export
     /// folders (`Saffev-Export`, `Saffev-Audit-<ts>`) are created inside it.
     #[serde(default)]
@@ -519,6 +526,9 @@ pub struct SettingsUpdate {
     pub archive_auto: Option<bool>,
     #[serde(default)]
     pub archive_redact: Option<bool>,
+    /// Toggle Markdown mirroring into project repos.
+    #[serde(default)]
+    pub archive_mirror_repos: Option<bool>,
     /// Set the export destination directory. Must exist, be a directory, and be
     /// writable (so a mounted SD card / USB path is accepted and a typo is
     /// rejected). Empty string clears it back to the home-folder default.
@@ -707,6 +717,10 @@ pub struct ArchiveStatusView {
     pub messages: u64,
     /// Approximate bytes stored.
     pub bytes: u64,
+    /// On-disk size of the whole store (saffev.db + WAL) — archive content
+    /// plus proxy history, findings, and the FTS index. Surfaced so a
+    /// growing database is a number the user sees, not a surprise.
+    pub db_bytes: u64,
 }
 
 /// `GET /api/agents` — the Agents overview.

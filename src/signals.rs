@@ -1,6 +1,6 @@
 //! Signals — local monitor rules that say when something needs attention (G6).
 //!
-//! Five rule classes, evaluated entirely on-device against the store (and two
+//! Six rule classes, evaluated entirely on-device against the store (and three
 //! caller-supplied observations), never against a cloud:
 //!
 //! 1. **PII spike** — more findings in the last hour than the configured
@@ -15,14 +15,20 @@
 //!    ignore it.
 //! 5. **Spend per day** — today's (UTC) estimated coding-agent spend (the G3
 //!    figures) exceeds the threshold.
+//! 6. **Sessions at risk** — coding-agent sessions are about to be deleted by
+//!    their own tool (or already past its deletion line) and are **not in the
+//!    archive**. This is the Preservation wedge as a signal: when auto-archive
+//!    is on and healthy the count is zero and the rule stays silent, so a fire
+//!    means "you are about to lose history and Saffev is not keeping it".
 //!
 //! ## Testability shape
 //!
 //! [`evaluate`] takes the *observations* that would otherwise require touching
-//! the host — the exposure verdict and today's spend — as plain inputs, so
-//! every rule is unit-testable with a fixture store and two `Option`s. The
-//! scheduler (`studio::spawn_monitor_scheduler`) and `saffev status --check`
-//! supply the real values ([`crate::exposure::check`], [`spend_today`]).
+//! the host — the exposure verdict, today's spend, and the at-risk summary —
+//! as plain inputs, so every rule is unit-testable with a fixture store and
+//! three `Option`s. The scheduler (`studio::spawn_monitor_scheduler`) and
+//! `saffev status --check` supply the real values ([`crate::exposure::check`],
+//! [`spend_today`], [`at_risk_observation`]).
 //!
 //! ## Dedup — a monitor that repeats itself is an alarm, not a signal
 //!
@@ -63,7 +69,7 @@ const FIRED_TTL_MS: i64 = 7 * 24 * HOUR_MS;
 /// without anyone noticing (a test pins the relationship).
 const HISTORY_SCAN_LIMIT: u32 = 2000;
 
-/// The five monitor rule classes.
+/// The six monitor rule classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {
@@ -77,6 +83,8 @@ pub enum SignalKind {
     LatencyP95,
     /// Today's estimated spend exceeded the threshold.
     SpendPerDay,
+    /// Unpreserved sessions are at (or past) their tool's deletion line.
+    SessionsAtRisk,
 }
 
 impl SignalKind {
@@ -88,8 +96,25 @@ impl SignalKind {
             SignalKind::ExposureChange => "exposure_change",
             SignalKind::LatencyP95 => "latency_p95",
             SignalKind::SpendPerDay => "spend_per_day",
+            SignalKind::SessionsAtRisk => "sessions_at_risk",
         }
     }
+}
+
+/// The at-risk observation the sessions-at-risk rule consumes — computed by
+/// [`at_risk_observation`] and passed into [`evaluate`] as an input (never
+/// probed from inside), same shape as exposure and spend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AtRiskObservation {
+    /// Sessions past or within [`crate::agents::retention::AT_RISK_WARN_DAYS`]
+    /// of their tool's deletion line AND absent from the archive.
+    pub unpreserved: u32,
+    /// Soonest still-upcoming expiry among them (unix millis); `None` when
+    /// every one of them is already past the line.
+    pub soonest_expiry_ts: Option<i64>,
+    /// Labels of the tools contributing unpreserved at-risk sessions, deduped,
+    /// in first-seen order — for the notification text.
+    pub tools: Vec<String>,
 }
 
 /// One fired monitor signal — what the notification / log line / SSE carries.
@@ -124,6 +149,13 @@ pub struct MonitorState {
     /// existing history as "new" the moment monitors are switched on would be
     /// pure noise.
     pub initialized: bool,
+    /// UTC date (`YYYY-MM-DD`) the at-risk observation was last computed.
+    /// Listing every reader's sessions is a full transcript parse in a cold
+    /// process (potentially tens of seconds on a large history), and the
+    /// sessions-at-risk rule dedupes per UTC day anyway — so the observation
+    /// is computed at most once per day, shared between the scheduler and
+    /// `status --check` through this field.
+    pub at_risk_checked_day: Option<String>,
 }
 
 impl MonitorState {
@@ -167,13 +199,15 @@ impl MonitorState {
     }
 }
 
-/// Evaluate all five monitor rules against the store + supplied observations.
+/// Evaluate all six monitor rules against the store + supplied observations.
 ///
 /// `exposed` is the current exposure verdict (`None` = could not determine —
 /// the rule then holds its state rather than inventing a flip). `spend_today_usd`
-/// is today's (UTC) estimated spend (`None` = no usage data). Both are inputs,
-/// not probes, so the rules are pure enough to unit test; callers pass
-/// [`crate::exposure::check`]'s verdict and [`spend_today`]'s figure.
+/// is today's (UTC) estimated spend (`None` = no usage data). `at_risk` is the
+/// preservation-gap summary (`None` = could not be computed / no sessions).
+/// All three are inputs, not probes, so the rules are pure enough to unit
+/// test; callers pass [`crate::exposure::check`]'s verdict, [`spend_today`]'s
+/// figure, and [`at_risk_observation`]'s summary.
 ///
 /// The caller owns persisting `state` afterwards ([`MonitorState::save`]) —
 /// keeping the store write out of here means a test can assert dedup without
@@ -184,6 +218,7 @@ pub async fn evaluate(
     now_ms: i64,
     exposed: Option<bool>,
     spend_today_usd: Option<f64>,
+    at_risk: Option<AtRiskObservation>,
     state: &mut MonitorState,
 ) -> Vec<Signal> {
     let mut out = Vec::new();
@@ -310,7 +345,94 @@ pub async fn evaluate(
         }
     }
 
+    // --- rule 6 · sessions at risk and not preserved -------------------------
+    // Day bucket like spend: the horizon is measured in days, and a healthy
+    // auto-archive keeps the count at zero, so one nudge per day is signal and
+    // anything chattier is an alarm.
+    if let Some(ar) = at_risk {
+        let day = utc_date(now_ms);
+        if ar.unpreserved > cfg.monitors.sessions_at_risk
+            && state.fire_once(format!("sessions_at_risk:{day}"), now_ms)
+        {
+            let tools = if ar.tools.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", ar.tools.join(", "))
+            };
+            let when = match ar.soonest_expiry_ts {
+                Some(expiry) if expiry > now_ms => {
+                    // Ceiling division by hand: signed div_ceil is unstable at MSRV.
+                    let day_ms = 24 * HOUR_MS;
+                    let days = (expiry - now_ms + day_ms - 1) / day_ms;
+                    format!("soonest in ~{days}d")
+                }
+                _ => "some are already past their tool's cleanup line".into(),
+            };
+            out.push(Signal {
+                kind: SignalKind::SessionsAtRisk,
+                title: "Sessions at risk of deletion".into(),
+                detail: format!(
+                    "{} unpreserved session(s){tools} will be deleted by their own tool — {when}. \
+                     Turn on Preservation in Studio to keep them.",
+                    ar.unpreserved
+                ),
+                ts: now_ms,
+            });
+        }
+    }
+
     out
+}
+
+/// Compute the [`AtRiskObservation`] the sessions-at-risk rule consumes:
+/// list the coding-agent sessions (blocking file IO kept off the reactor),
+/// fetch the archived-session ids, and intersect.
+///
+/// **At most once per UTC day** (recorded in `state.at_risk_checked_day`):
+/// listing is cheap in the long-lived Studio process (warm per-reader cache)
+/// but a full transcript parse in a cold one (`status --check` under cron),
+/// and the rule's dedup is daily — computing more often buys nothing.
+///
+/// `None` when already checked today, when there are no sessions at all
+/// (fresh machine — nothing to say), or when the archive read fails
+/// (fail-soft: a broken store read must not fire a scary "your history is
+/// unpreserved" notification).
+pub async fn at_risk_observation(
+    store: &Store,
+    now_ms: i64,
+    state: &mut MonitorState,
+) -> Option<AtRiskObservation> {
+    let today = utc_date(now_ms);
+    if state.at_risk_checked_day.as_deref() == Some(today.as_str()) {
+        return None;
+    }
+    state.at_risk_checked_day = Some(today);
+    let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
+        .await
+        .unwrap_or_default();
+    if sessions.is_empty() {
+        return None;
+    }
+    let archived_ids: std::collections::HashSet<String> = match store.archived_sessions().await {
+        Ok(rows) => rows.into_iter().map(|a| a.id).collect(),
+        Err(e) => {
+            tracing::debug!(target: "saffev::signals", "at-risk archive read failed: {e}");
+            return None;
+        }
+    };
+    let (hits, soonest) = crate::agents::at_risk_unpreserved(&sessions, &archived_ids, now_ms);
+    let mut tools: Vec<String> = Vec::new();
+    for s in &hits {
+        let label = s.tool.label().to_string();
+        if !tools.contains(&label) {
+            tools.push(label);
+        }
+    }
+    Some(AtRiskObservation {
+        unpreserved: hits.len() as u32,
+        soonest_expiry_ts: soonest,
+        tools,
+    })
 }
 
 /// Today's (UTC) estimated coding-agent spend, from the same G3 machinery the
@@ -464,15 +586,15 @@ mod tests {
         // Pre-seed the app so only the PII rule is under test here.
         state.seen_apps.insert("cursor".into());
 
-        let first = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let first = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert_eq!(kinds(&first), vec![SignalKind::PiiSpike]);
 
         // Same hour bucket → suppressed.
-        let second = evaluate(&store, &cfg, NOW + 60_000, None, None, &mut state).await;
+        let second = evaluate(&store, &cfg, NOW + 60_000, None, None, None, &mut state).await;
         assert!(second.is_empty(), "same-bucket re-fire must dedupe");
 
         // Next hour bucket with the condition still true → fires again (new info).
-        let next_hour = evaluate(&store, &cfg, NOW + HOUR_MS, None, None, &mut state).await;
+        let next_hour = evaluate(&store, &cfg, NOW + HOUR_MS, None, None, None, &mut state).await;
         // The findings are now > 1h old relative to NOW + HOUR_MS only if their
         // ts fell out of the window; r1 is at NOW - 60s, so it did. No fire.
         assert!(next_hour.is_empty());
@@ -489,7 +611,7 @@ mod tests {
         let cfg = Config::default();
         let mut state = seeded_state();
         state.seen_apps.insert("cursor".into());
-        let got = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let got = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert!(got.is_empty(), "= threshold must not fire (rule is >)");
     }
 
@@ -502,12 +624,21 @@ mod tests {
         let cfg = Config::default();
         let mut state = seeded_state();
 
-        let first = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let first = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert_eq!(kinds(&first), vec![SignalKind::NewSourceApp]);
         assert!(first[0].detail.contains("aider"));
 
         // Same app again — even hours later — never re-fires.
-        let later = evaluate(&store, &cfg, NOW + 3 * HOUR_MS, None, None, &mut state).await;
+        let later = evaluate(
+            &store,
+            &cfg,
+            NOW + 3 * HOUR_MS,
+            None,
+            None,
+            None,
+            &mut state,
+        )
+        .await;
         assert!(later.is_empty(), "seen app must never re-fire");
     }
 
@@ -520,7 +651,7 @@ mod tests {
 
         let cfg = Config::default();
         let mut state = MonitorState::default(); // fresh: initialized == false
-        let got = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let got = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert!(got.is_empty(), "first run must seed, not announce history");
         assert!(state.initialized);
         assert!(state.seen_apps.contains("cursor") && state.seen_apps.contains("cline"));
@@ -533,22 +664,22 @@ mod tests {
         let mut state = seeded_state();
 
         // First observation is baseline, not a change.
-        let baseline = evaluate(&store, &cfg, NOW, Some(false), None, &mut state).await;
+        let baseline = evaluate(&store, &cfg, NOW, Some(false), None, None, &mut state).await;
         assert!(baseline.is_empty());
 
         // Flip to exposed → fires.
-        let flipped = evaluate(&store, &cfg, NOW + 1, Some(true), None, &mut state).await;
+        let flipped = evaluate(&store, &cfg, NOW + 1, Some(true), None, None, &mut state).await;
         assert_eq!(kinds(&flipped), vec![SignalKind::ExposureChange]);
         assert!(flipped[0].title.contains("EXPOSED"));
 
         // Still exposed → deduped (level, not edge).
-        let held = evaluate(&store, &cfg, NOW + 2, Some(true), None, &mut state).await;
+        let held = evaluate(&store, &cfg, NOW + 2, Some(true), None, None, &mut state).await;
         assert!(held.is_empty(), "unchanged verdict must not re-fire");
 
         // An Unknown probe must not fake a flip when the verdict returns.
-        let unknown = evaluate(&store, &cfg, NOW + 3, None, None, &mut state).await;
+        let unknown = evaluate(&store, &cfg, NOW + 3, None, None, None, &mut state).await;
         assert!(unknown.is_empty());
-        let back = evaluate(&store, &cfg, NOW + 4, Some(false), None, &mut state).await;
+        let back = evaluate(&store, &cfg, NOW + 4, Some(false), None, None, &mut state).await;
         assert_eq!(kinds(&back), vec![SignalKind::ExposureChange]);
         assert!(back[0].title.contains("resolved"));
     }
@@ -570,7 +701,7 @@ mod tests {
             )));
         }
         store.flush().await.unwrap();
-        let too_few = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let too_few = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert!(
             too_few.is_empty(),
             "p95 on <{MIN_P95_SAMPLES} samples is noise"
@@ -584,11 +715,11 @@ mod tests {
             Some(45_000),
         )));
         store.flush().await.unwrap();
-        let fired = evaluate(&store, &cfg, NOW, None, None, &mut state).await;
+        let fired = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
         assert_eq!(kinds(&fired), vec![SignalKind::LatencyP95]);
 
         // Same hour bucket → deduped.
-        let again = evaluate(&store, &cfg, NOW + 60_000, None, None, &mut state).await;
+        let again = evaluate(&store, &cfg, NOW + 60_000, None, None, None, &mut state).await;
         assert!(again.is_empty());
     }
 
@@ -598,12 +729,21 @@ mod tests {
         let cfg = Config::default(); // threshold $10/day
         let mut state = seeded_state();
 
-        let fired = evaluate(&store, &cfg, NOW, None, Some(12.5), &mut state).await;
+        let fired = evaluate(&store, &cfg, NOW, None, Some(12.5), None, &mut state).await;
         assert_eq!(kinds(&fired), vec![SignalKind::SpendPerDay]);
         assert!(fired[0].detail.contains("12.50"));
 
         // Same UTC day → deduped, even though spend keeps climbing.
-        let again = evaluate(&store, &cfg, NOW + HOUR_MS, None, Some(15.0), &mut state).await;
+        let again = evaluate(
+            &store,
+            &cfg,
+            NOW + HOUR_MS,
+            None,
+            Some(15.0),
+            None,
+            &mut state,
+        )
+        .await;
         assert!(again.is_empty());
 
         // Next UTC day over threshold → fires again.
@@ -613,6 +753,7 @@ mod tests {
             NOW + 24 * HOUR_MS,
             None,
             Some(11.0),
+            None,
             &mut state,
         )
         .await;
@@ -625,6 +766,7 @@ mod tests {
             NOW + 48 * HOUR_MS,
             None,
             Some(3.0),
+            None,
             &mut state,
         )
         .await;
@@ -653,5 +795,130 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("saffev-empty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(spend_today(&PricingConfig::default(), &dir, NOW), None);
+    }
+
+    fn at_risk_obs(unpreserved: u32, soonest: Option<i64>) -> AtRiskObservation {
+        AtRiskObservation {
+            unpreserved,
+            soonest_expiry_ts: soonest,
+            tools: vec!["Claude Code".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_at_risk_fires_and_dedupes_per_utc_day() {
+        let store = tmp_store().await;
+        let cfg = Config::default(); // threshold 0 = any unpreserved session
+        let mut state = seeded_state();
+
+        let obs = at_risk_obs(3, Some(NOW + 2 * 24 * HOUR_MS));
+        let fired = evaluate(&store, &cfg, NOW, None, None, Some(obs.clone()), &mut state).await;
+        assert_eq!(kinds(&fired), vec![SignalKind::SessionsAtRisk]);
+        assert!(fired[0].detail.contains("3 unpreserved"));
+        assert!(fired[0].detail.contains("Claude Code"));
+        assert!(
+            fired[0].detail.contains("~2d"),
+            "soonest expiry rendered in days"
+        );
+
+        // Same UTC day → deduped, even as the count changes.
+        let again = evaluate(
+            &store,
+            &cfg,
+            NOW + HOUR_MS,
+            None,
+            None,
+            Some(at_risk_obs(5, None)),
+            &mut state,
+        )
+        .await;
+        assert!(again.is_empty(), "same-day re-fire must dedupe");
+
+        // Next UTC day with the gap still open → fires again (new information).
+        let next_day = evaluate(
+            &store,
+            &cfg,
+            NOW + 24 * HOUR_MS,
+            None,
+            None,
+            Some(obs),
+            &mut state,
+        )
+        .await;
+        assert_eq!(kinds(&next_day), vec![SignalKind::SessionsAtRisk]);
+    }
+
+    #[tokio::test]
+    async fn sessions_at_risk_quiet_when_preserved_or_unknown() {
+        let store = tmp_store().await;
+        let cfg = Config::default();
+        let mut state = seeded_state();
+
+        // Zero unpreserved (healthy auto-archive) → silent.
+        let healthy = evaluate(
+            &store,
+            &cfg,
+            NOW,
+            None,
+            None,
+            Some(at_risk_obs(0, None)),
+            &mut state,
+        )
+        .await;
+        assert!(healthy.is_empty(), "a preserved history must not fire");
+
+        // No observation at all (fresh machine / read failure) → silent.
+        let unknown = evaluate(&store, &cfg, NOW + 1, None, None, None, &mut state).await;
+        assert!(unknown.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_at_risk_overdue_only_message_names_the_cleanup_line() {
+        let store = tmp_store().await;
+        let cfg = Config::default();
+        let mut state = seeded_state();
+        // soonest = None models "everything is already past the line".
+        let fired = evaluate(
+            &store,
+            &cfg,
+            NOW,
+            None,
+            None,
+            Some(at_risk_obs(2, None)),
+            &mut state,
+        )
+        .await;
+        assert_eq!(kinds(&fired), vec![SignalKind::SessionsAtRisk]);
+        assert!(fired[0].detail.contains("already past"));
+    }
+
+    #[tokio::test]
+    async fn sessions_at_risk_respects_the_threshold() {
+        let store = tmp_store().await;
+        let mut cfg = Config::default();
+        cfg.monitors.sessions_at_risk = 5; // fire only when MORE than 5
+        let mut state = seeded_state();
+        let at_five = evaluate(
+            &store,
+            &cfg,
+            NOW,
+            None,
+            None,
+            Some(at_risk_obs(5, None)),
+            &mut state,
+        )
+        .await;
+        assert!(at_five.is_empty(), "= threshold must not fire (rule is >)");
+        let at_six = evaluate(
+            &store,
+            &cfg,
+            NOW,
+            None,
+            None,
+            Some(at_risk_obs(6, None)),
+            &mut state,
+        )
+        .await;
+        assert_eq!(kinds(&at_six), vec![SignalKind::SessionsAtRisk]);
     }
 }

@@ -1,0 +1,24 @@
+# G7 gauntlet guard (docs/gauntlets/GAUNTLETS.md §G7).
+#
+# Mirrors signals-bench.yml: the bench enforces the load-bearing floors — the
+# deterministic guard has ZERO false positives on the benign corpus and still
+# detects the cases it detects today — while pinning the full confusion matrix
+# in bench/guard-results.json so the git-diff step catches any drift in either
+# direction. Recall is intentionally low (the deterministic floor is
+# high-precision by design); the artifact records exactly what a model-backed
+# ModelGuard has to improve on.
+name: guard-bench
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Score the deterministic guard baseline (floors enforced)
+        run: cargo test --test guard_bench -- --nocapture
+      - name: Committed artifact must match the code
+        run: git diff --exit-code bench/guard-results.json

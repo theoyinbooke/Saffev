@@ -233,8 +233,7 @@ fn spawn_archive_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
     // Clamp at use-site: a hand-edited `interval_minutes = 0` must not busy-spin.
     let minutes = u64::from(state.config.load().archive.interval_minutes.max(1));
     tokio::spawn(async move {
-        let mut tick =
-            tokio::time::interval(std::time::Duration::from_secs(minutes * 60));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(minutes * 60));
         // If a snapshot overruns the period, just resume the cadence — bursts of
         // catch-up snapshots would only re-hash the same sessions.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -253,7 +252,10 @@ fn spawn_archive_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
                     "auto snapshot skipped — redaction is on but failed to build: {e}"
                 ),
                 Ok(redaction) => {
-                    match crate::agents::archive::run_snapshot(&state.store, redaction).await {
+                    let mirror = cfg.archive.mirror_repos;
+                    match crate::agents::archive::run_snapshot(&state.store, redaction, mirror)
+                        .await
+                    {
                         Ok(s) => tracing::info!(
                             target: "saffev::archive",
                             "auto snapshot: {} archived · {} unchanged · {} deleted-at-source · {} errors",
@@ -285,7 +287,7 @@ pub fn monitors_should_run(cfg: &crate::config::Config) -> bool {
 const MONITOR_INTERVAL_SECS: u64 = 60;
 
 /// Spawn the local-monitor loop (G6 signals): every 60s, when
-/// `monitors.enabled`, evaluate the five rule classes and surface each hit as
+/// `monitors.enabled`, evaluate the six rule classes and surface each hit as
 /// a log line, a desktop notification (when `monitors.notify`), and an SSE
 /// [`dto::StreamEvent::Signal`].
 ///
@@ -296,8 +298,7 @@ const MONITOR_INTERVAL_SECS: u64 = 60;
 /// notifications are OS-local subprocesses.
 fn spawn_monitor_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick =
-            tokio::time::interval(std::time::Duration::from_secs(MONITOR_INTERVAL_SECS));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(MONITOR_INTERVAL_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
@@ -332,12 +333,17 @@ fn spawn_monitor_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
             .unwrap_or(None);
 
             let mut mon_state = crate::signals::MonitorState::load(&state.store).await;
+            // Preservation gap (rule 6): computed at most once per UTC day
+            // (recorded in the state); fail-soft to None inside.
+            let at_risk =
+                crate::signals::at_risk_observation(&state.store, now_ms, &mut mon_state).await;
             let signals = crate::signals::evaluate(
                 &state.store,
                 &cfg,
                 now_ms,
                 exposed,
                 spend,
+                at_risk,
                 &mut mon_state,
             )
             .await;
@@ -398,7 +404,10 @@ mod tests {
         // Off by default (observe-only ethos); flipping the one switch changes
         // the very next tick's decision — same contract as `should_run`.
         let mut cfg = crate::config::Config::default();
-        assert!(!monitors_should_run(&cfg), "monitors must be off by default");
+        assert!(
+            !monitors_should_run(&cfg),
+            "monitors must be off by default"
+        );
         cfg.monitors.enabled = true;
         assert!(monitors_should_run(&cfg));
         cfg.monitors.enabled = false;

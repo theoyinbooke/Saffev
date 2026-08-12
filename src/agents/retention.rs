@@ -87,6 +87,34 @@ pub struct AtRisk {
 /// Milliseconds in a day.
 const DAY_MS: i64 = 86_400_000;
 
+/// How far ahead of a tool's deletion line counts as "expiring soon", in days.
+/// One shared constant so the Agents page banner and the at-risk monitor
+/// signal (G6) can never disagree about what "soon" means.
+pub const AT_RISK_WARN_DAYS: i64 = 7;
+
+/// Whether one session is at risk under `policy` at `now_ms`: it is past its
+/// tool's deletion line already, or crosses it within `warn_days`. Only
+/// age-based policies produce a date to be at risk of; churn/keeps-all/unknown
+/// are never "at risk" in this sense (there is no line to warn about).
+pub fn is_at_risk(policy: &RetentionPolicy, updated_ts: i64, now_ms: i64, warn_days: i64) -> bool {
+    match (policy.kind, policy.days) {
+        (RetentionKind::AgeDays, Some(days)) => {
+            let expiry = updated_ts + days as i64 * DAY_MS;
+            expiry <= now_ms + warn_days * DAY_MS
+        }
+        _ => false,
+    }
+}
+
+/// The expiry timestamp (unix millis) a session would be deleted at under an
+/// age-based `policy`; `None` for policies without a per-entry deadline.
+pub fn expiry_ts(policy: &RetentionPolicy, updated_ts: i64) -> Option<i64> {
+    match (policy.kind, policy.days) {
+        (RetentionKind::AgeDays, Some(days)) => Some(updated_ts + days as i64 * DAY_MS),
+        _ => None,
+    }
+}
+
 /// Compute the at-risk breakdown for one tool from its sessions. `now_ms` is the
 /// current wall clock; `warn_days` is how far ahead counts as "expiring soon".
 pub fn at_risk_for(

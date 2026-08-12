@@ -61,6 +61,7 @@ pub(crate) async fn probe_health(kind: EngineKind, port: u16) -> HealthState {
     let url = match kind {
         EngineKind::Ollama => format!("http://127.0.0.1:{port}/api/tags"),
         EngineKind::LmStudio => format!("http://127.0.0.1:{port}/v1/models"),
+        EngineKind::LlamaCpp => format!("http://127.0.0.1:{port}/health"),
         // Unknown engine: a bare touch is the best we can do.
         EngineKind::Unknown => format!("http://127.0.0.1:{port}/"),
     };

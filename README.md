@@ -137,12 +137,14 @@ sniff everything hitting Ollama on `:11434`. So an app that calls Ollama
 it to your real engine, unchanged:
 
 ```text
-your app ──▶ Saffev proxy (:8088) ──▶ Ollama :11434  /  LM Studio :1234
+your app ──▶ Saffev proxy (:8088) ──▶ Ollama :11434 / LM Studio :1234 / llama.cpp :8080
                   └─ records it → Studio (Live / History / Privacy)
 ```
 
-Saffev works the same whether your engine is **Ollama** or **LM Studio** — it
-forwards whatever path your client sends to whichever engine is running.
+Saffev works the same whether your engine is **Ollama**, **LM Studio**, or
+**llama.cpp's `llama-server`** — it forwards whatever path your client sends to
+whichever engine is running. (llama.cpp is identified by its `/props` endpoint,
+so an unrelated dev server on `:8080` is never mistaken for an engine.)
 
 ### The easy way — `saffev run` (no config edits)
 
@@ -234,12 +236,31 @@ front of your inference path:
 
 ## What's new
 
-The most recent work, on top of everything below: the unified **Timeline**,
-**full-text search** inside preserved conversations, the whole-history **privacy
-report**, **redaction on preservation**, **blocking** as an alternative to
-masking, and a **tamper-evident archive** with an audit bundle. Listing a large
-history also went from ~27 seconds to ~30 milliseconds, and a token
-double-counting bug that overstated estimated cost more than tenfold is fixed.
+**v0.7.2** — the "make the wedge visible" release, on top of the v0.7.x gauntlet
+campaign (12 agent readers, ccusage-parity cost analytics, a widened request
+record + `saffev report`, local monitors + notifications, all benchmarked in
+[BENCHMARKS.md](BENCHMARKS.md)):
+
+- **"Sessions at risk" is now a signal.** A sixth local monitor fires when your
+  tools are about to delete sessions Saffev hasn't preserved — the one alert
+  that is the reason the product exists. Silent when auto-archive is keeping up.
+- **Repo mirroring (opt-in).** Preservation can also write each session as
+  Markdown into the git repo it belongs to (`<repo>/.saffev/sessions/`), so
+  transcripts live next to the code. Redaction applies; commit them or gitignore
+  them, your choice.
+- **`saffev backup`.** A consistent, still-encrypted copy of the whole store
+  plus a restore README — the answer to "my laptop died".
+- **llama.cpp** joins Ollama and LM Studio as a recognized engine (identified by
+  `/props`, so a dev server on `:8080` is never mistaken for one).
+- **Database size is visible** in Settings and the Preservation banner (no more
+  invisible multi-hundred-MB growth), and a **guard scorecard** (G7) now
+  measures the safety floor honestly.
+
+The v0.6/0.7.0/0.7.1 work this builds on: the unified **Timeline**, **full-text
+search** inside preserved conversations, the whole-history **privacy report**,
+**redaction on preservation**, **blocking** as an alternative to masking, a
+**tamper-evident archive** with an audit bundle, and the jump from ~27 s to
+~30 ms when listing a large history.
 
 Before that, v1 built on the passive core with seven shipped features, all
 preserving the invariants above (fail-open, on-device, observe-by-default,
@@ -493,6 +514,11 @@ Cost and token figures are estimates, and the tool says so where it shows them:
   them; otherwise we estimate with a bundled tokenizer. The Analytics tokens
   figure now tells you what share of the total was estimated instead of blending
   the two silently.
+- **Benchmarked claims live in [BENCHMARKS.md](BENCHMARKS.md)** — detection
+  scores vs Presidio, cost parity vs ccusage, adapter coverage, and archive
+  guarantees, each produced by a committed harness that CI re-runs on every
+  push. If a number there can't be reproduced with the printed command, that's
+  a bug.
 
 ## Build / run / test
 

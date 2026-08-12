@@ -98,6 +98,12 @@ pub enum Command {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Back up the encrypted database + config (for safekeeping or moving machines).
+    Backup {
+        /// Directory to create the backup folder in (default: the export destination).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Stream activity.
     Logs {
         /// Keep following new activity.
@@ -187,6 +193,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Report { days, ref out } => {
             let out = out.clone();
             commands::report(&cli, days, out.as_deref()).await
+        }
+        Command::Backup { ref out } => {
+            let out = out.clone();
+            commands::backup(&cli, out).await
         }
         Command::Logs { follow } => commands::logs(&cli, follow).await,
         Command::Update { check } => commands::update(&cli, check).await,

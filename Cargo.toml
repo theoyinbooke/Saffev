@@ -1,6 +1,6 @@
 [package]
 name = "saffev"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Saffev — a transparent, on-device proxy + Studio in front of a local LLM engine (observe-only, fail-open)."
@@ -115,3 +115,37 @@ codegen-units = 1
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# --- Linux system packages (G8) ---
+#
+# cargo-dist has no native deb/rpm generation (its installers are shell /
+# homebrew / msi / npm / powershell / pkg), so Linux packages are built by
+# `cargo-deb` and `cargo-generate-rpm` as a post-release CI step. This metadata
+# is inert to every other build — it is read ONLY when those tools run.
+#
+# NOTE: not yet verified end-to-end. Per the repo's honesty rule, this ships as
+# config + a CI job that must be exercised on a clean Ubuntu/Fedora VM before
+# any release claims deb/rpm support. See docs/design/linux-packaging.md.
+[package.metadata.deb]
+maintainer = "Olanrewaju Oyinbooke"
+copyright = "2026, Olanrewaju Oyinbooke"
+license-file = ["LICENSE-MIT", "0"]
+extended-description = "Saffev is a single on-device binary: a transparent, fail-open reverse proxy and local web Studio in front of a local LLM engine (Ollama, LM Studio, llama.cpp), plus a Preservation layer that keeps a durable, encrypted, tamper-evident copy of your AI coding-tool session history."
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/saffev", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/saffev/README.md", "644"],
+    ["packaging/systemd/saffev.service", "usr/lib/systemd/user/saffev.service", "644"],
+]
+
+# cargo-generate-rpm reads this table. Same binary, same unit file.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/saffev", dest = "/usr/bin/saffev", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/saffev/README.md", mode = "644" },
+    { source = "packaging/systemd/saffev.service", dest = "/usr/lib/systemd/user/saffev.service", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+# glibc only — everything else (SQLCipher, OpenSSL) is vendored/bundled.

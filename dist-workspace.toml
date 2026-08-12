@@ -7,8 +7,13 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell"]
+# The installers to generate for each app.
+# - shell: the curl|sh installer (all unix targets).
+# - homebrew: a tap formula (macOS + Linux), so `brew install` works.
+# G8 (first-class Linux) adds native Linux packages via the per-target
+# `[dist.linux]`-style keys below (deb + rpm), so `apt`/`dnf` users install
+# and uninstall the normal way and `revert` restores the pre-Saffev state.
+installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # v0.1.2 adds ARM-Linux + Windows to the original three (macOS both arches +
 # Linux x86_64). The unix-only daemon/attribution/signal code is now cfg-gated for

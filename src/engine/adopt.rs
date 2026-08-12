@@ -174,6 +174,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
     match kind {
         EngineKind::Ollama => "ollama",
         EngineKind::LmStudio => "lmstudio",
+        EngineKind::LlamaCpp => "llamacpp",
         EngineKind::Unknown => "unknown",
     }
 }

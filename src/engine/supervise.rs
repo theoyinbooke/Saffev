@@ -165,6 +165,13 @@ fn spawn_engine(kind: EngineKind, port: u16) -> Result<Child> {
                 "LM Studio is Cooperative-only; not supervised in Gateway mode".into(),
             ));
         }
+        EngineKind::LlamaCpp => {
+            // Same stance: llama-server has no canonical service to rebind and
+            // is launched with per-run flags we do not know — Cooperative only.
+            return Err(Error::Unsupported(
+                "llama.cpp is Cooperative-only; not supervised in Gateway mode".into(),
+            ));
+        }
         EngineKind::Unknown => {
             return Err(Error::Engine(
                 "cannot supervise an unidentified engine".into(),

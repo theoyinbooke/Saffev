@@ -1,0 +1,33 @@
+# Optional systemd USER unit for Saffev (G8, Linux).
+#
+# Runs the proxy + Studio in the foreground under systemd's supervision — the
+# Linux equivalent of the macOS menu-bar app's supervision, for headless or
+# server installs. It is a *user* unit (no root), and it starts Saffev with
+# --no-open (nothing to open a browser on a server).
+#
+# Enable:  systemctl --user enable --now saffev.service
+# Logs:    journalctl --user -u saffev -f
+# Disable: systemctl --user disable --now saffev.service
+#
+# This does NOT enter Gateway mode — that still requires `mode = "gateway"` in
+# the config and `saffev adopt`, exactly as documented. This unit just keeps the
+# Cooperative proxy + Studio alive across logins.
+
+[Unit]
+Description=Saffev — on-device LLM proxy + Studio
+Documentation=https://github.com/theoyinbooke/Saffev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/saffev start --foreground --no-open
+Restart=on-failure
+RestartSec=5
+# Fail-open governs model TRAFFIC, not the supervisor: if Saffev cannot start
+# (port taken, bad config), systemd surfaces it rather than looping silently.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=default.target
