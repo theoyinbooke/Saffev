@@ -195,10 +195,7 @@ impl GeminiReader {
                 // rewrite the session identity (G2 round-3 critic).
                 if v.get("sessionId").is_some() && v.get("projectHash").is_some() {
                     if session_id.is_none() {
-                        session_id = v
-                            .get("sessionId")
-                            .and_then(Value::as_str)
-                            .map(String::from);
+                        session_id = v.get("sessionId").and_then(Value::as_str).map(String::from);
                         absorb_meta(&v, &mut start_ts, &mut updated_ts);
                     } else {
                         // Still absorb a later lastUpdated (monotonic max).
@@ -344,10 +341,7 @@ impl GeminiReader {
                                 .and_then(Value::as_str)
                                 .unwrap_or("tool")
                                 .to_string();
-                            let args = tc
-                                .get("args")
-                                .map(Value::to_string)
-                                .unwrap_or_default();
+                            let args = tc.get("args").map(Value::to_string).unwrap_or_default();
                             messages.push(AgentMessage {
                                 role: Role::Assistant,
                                 kind: MessageKind::ToolUse,
@@ -378,8 +372,7 @@ impl GeminiReader {
             .into_iter()
             .max_by_key(|(_, (n, last))| (*n, *last))
             .map(|(m, _)| m);
-        let title = summary
-            .or_else(|| first_user.map(|t| super::claude_code::truncate(&t, 80)));
+        let title = summary.or_else(|| first_user.map(|t| super::claude_code::truncate(&t, 80)));
         let session = AgentSession {
             id: AgentSession::make_id(AgentTool::Gemini, &raw_id),
             tool: AgentTool::Gemini,
@@ -544,13 +537,20 @@ mod tests {
         ];
         std::fs::write(&p, lines.join("\n")).unwrap();
         let d = GeminiReader::parse(&p, &dir.join("proj"), true).expect("parses");
-        assert_eq!(d.session.message_count, 2, "target turn must be rewound too");
+        assert_eq!(
+            d.session.message_count, 2,
+            "target turn must be rewound too"
+        );
         assert_eq!(d.session.input_tokens, 0, "rewound tokens must not count");
         assert!(!d.messages.iter().any(|m| m.content == "answer one"));
         assert!(!d.messages.iter().any(|m| m.content == "abandoned turn"));
         assert!(d.messages.iter().any(|m| m.content == "second try"));
         // A rewind to a ghost id is a no-op, never fatal.
-        std::fs::write(&p, format!("{}\n{{\"$rewindTo\":\"ghost\"}}", lines.join("\n"))).unwrap();
+        std::fs::write(
+            &p,
+            format!("{}\n{{\"$rewindTo\":\"ghost\"}}", lines.join("\n")),
+        )
+        .unwrap();
         assert!(GeminiReader::parse(&p, &dir.join("proj"), false).is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -572,7 +572,10 @@ mod tests {
         std::fs::write(&p, lines.join("\n")).unwrap();
         let d = GeminiReader::parse(&p, &dir.join("proj"), true).expect("parses");
         assert_eq!(d.session.message_count, 1);
-        assert_eq!(d.session.input_tokens, 0, "pre-checkpoint tokens must not count");
+        assert_eq!(
+            d.session.input_tokens, 0,
+            "pre-checkpoint tokens must not count"
+        );
         assert!(d.messages.iter().any(|m| m.content == "post-checkpoint"));
         assert!(!d.messages.iter().any(|m| m.content == "pre-checkpoint"));
         std::fs::remove_dir_all(&dir).ok();
@@ -594,7 +597,10 @@ mod tests {
         ];
         std::fs::write(&p, lines.join("\n")).unwrap();
         let d = GeminiReader::parse(&p, &dir.join("proj"), false).expect("parses");
-        assert!(d.session.id.ends_with("000000000011"), "identity is first-wins");
+        assert!(
+            d.session.id.ends_with("000000000011"),
+            "identity is first-wins"
+        );
         assert_eq!(
             d.session.started_ts,
             super::super::rfc3339_millis("2026-07-28T12:00:00.000Z")
@@ -612,7 +618,8 @@ mod tests {
         let chats = dir.join("proj/chats");
         std::fs::create_dir_all(&chats).unwrap();
         let meta = r#"{"sessionId":"88889999-aaaa-4bbb-8ccc-000000000012","projectHash":"d","startTime":"2026-07-28T13:00:00.000Z","lastUpdated":"2026-07-28T13:00:00.000Z"}"#;
-        let msg = r#"{"id":"m1","timestamp":"2026-07-28T13:00:01.000Z","type":"user","content":"hi"}"#;
+        let msg =
+            r#"{"id":"m1","timestamp":"2026-07-28T13:00:01.000Z","type":"user","content":"hi"}"#;
         std::fs::write(
             chats.join("session-2026-07-28T13-00-88889999.json"),
             r#"{"sessionId":"88889999-aaaa-4bbb-8ccc-000000000012","projectHash":"d","startTime":"2026-07-28T13:00:00.000Z","lastUpdated":"2026-07-28T13:00:00.000Z","messages":[{"id":"m1","timestamp":"2026-07-28T13:00:01.000Z","type":"user","content":"hi"}]}"#,

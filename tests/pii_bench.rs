@@ -107,7 +107,10 @@ fn pii_bench_scorecard() {
             // anything that fired here is real output on real text — charge it.
             for (k, v) in &found {
                 kinds.entry(k.clone()).or_default().fp += 1;
-                failures.push(format!("[{}] FALSE-POSITIVE {k} matched {v:?} (on xfail case)", case.id));
+                failures.push(format!(
+                    "[{}] FALSE-POSITIVE {k} matched {v:?} (on xfail case)",
+                    case.id
+                ));
             }
             known_gaps.push(serde_json::json!({
                 "id": case.id,
@@ -207,7 +210,10 @@ fn pii_bench_scorecard() {
         let t = floor(k);
         let p = t.precision().unwrap_or(1.0);
         let r = t.recall().unwrap_or(1.0);
-        assert!(p >= min_p, "{k} precision {p:.3} fell below floor {min_p:.3}");
+        assert!(
+            p >= min_p,
+            "{k} precision {p:.3} fell below floor {min_p:.3}"
+        );
         assert!(r >= min_r, "{k} recall {r:.3} fell below floor {min_r:.3}");
     };
     assert_floor("email", 1.0, 1.0);

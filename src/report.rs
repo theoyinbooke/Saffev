@@ -80,7 +80,10 @@ pub fn render(i: &ReportInputs) -> String {
         out.push('\n');
     };
 
-    push(&mut out, &format!("# Saffev privacy report — last {} days", i.period_days));
+    push(
+        &mut out,
+        &format!("# Saffev privacy report — last {} days", i.period_days),
+    );
     push(&mut out, "");
     push(
         &mut out,
@@ -101,11 +104,22 @@ pub fn render(i: &ReportInputs) -> String {
     push(&mut out, &format!(
         "- **{total} model exchanges** were proxied in the period. The proxy forwards ONLY to the configured local engine port — a structural property of the configuration, not a per-request measurement (see Exposure below for whether anything else could reach that engine)."
     ));
-    push(&mut out, &format!(
-        "- Saffev stored **{}** for those exchanges. {}",
-        if payload { "metadata AND payloads (explicitly enabled)" } else { "metadata only — raw prompt/response text was never written to disk" },
-        if payload { "Payload storage is an explicit, logged user setting." } else { "" }
-    ));
+    push(
+        &mut out,
+        &format!(
+            "- Saffev stored **{}** for those exchanges. {}",
+            if payload {
+                "metadata AND payloads (explicitly enabled)"
+            } else {
+                "metadata only — raw prompt/response text was never written to disk"
+            },
+            if payload {
+                "Payload storage is an explicit, logged user setting."
+            } else {
+                ""
+            }
+        ),
+    );
     let masked_line = match (masking.enabled, masking.dry_run) {
         (false, _) => "- **Masking was off** (observe-only): request bodies passed through unchanged; findings below are what a masking policy WOULD have caught.".to_string(),
         (true, true) => "- **Masking was in dry-run**: nothing was mutated; findings below record what WOULD have been redacted.".to_string(),
@@ -126,10 +140,20 @@ pub fn render(i: &ReportInputs) -> String {
     let mut failed = 0usize;
     for r in &i.history {
         *by_app
-            .entry(r.request.source_app.clone().unwrap_or_else(|| "unknown".into()))
+            .entry(
+                r.request
+                    .source_app
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            )
             .or_default() += 1;
         *by_model
-            .entry(r.request.model.clone().unwrap_or_else(|| "unspecified".into()))
+            .entry(
+                r.request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unspecified".into()),
+            )
             .or_default() += 1;
         *by_engine.entry(r.request.engine.clone()).or_default() += 1;
         let err = r
@@ -178,7 +202,10 @@ pub fn render(i: &ReportInputs) -> String {
     for f in &i.findings {
         let kind_label = kind_name(f.kind, f.label.as_deref());
         *by_kind.entry(kind_label).or_default() += 1;
-        let app = req_app.get(f.record_id.as_str()).copied().unwrap_or("unknown");
+        let app = req_app
+            .get(f.record_id.as_str())
+            .copied()
+            .unwrap_or("unknown");
         *by_finding_app.entry(app.to_string()).or_default() += 1;
         if f.side == Side::Request {
             request_side += 1;
@@ -245,24 +272,35 @@ pub fn render(i: &ReportInputs) -> String {
                     a.entries, a.sessions
                 ));
             } else {
-                push(&mut out, &format!(
-                    "- **TAMPER DETECTED** — {}{}",
-                    a.broken_at.as_deref().unwrap_or("chain verification failed"),
-                    if a.altered_sessions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · altered sessions: {}", a.altered_sessions.join(", "))
-                    }
-                ));
+                push(
+                    &mut out,
+                    &format!(
+                        "- **TAMPER DETECTED** — {}{}",
+                        a.broken_at
+                            .as_deref()
+                            .unwrap_or("chain verification failed"),
+                        if a.altered_sessions.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · altered sessions: {}", a.altered_sessions.join(", "))
+                        }
+                    ),
+                );
             }
             if let Some(s) = stats {
-                push(&mut out, &format!(
-                    "- {} preserved sessions · {} messages · {} bytes",
-                    s.count, s.messages, s.bytes
-                ));
+                push(
+                    &mut out,
+                    &format!(
+                        "- {} preserved sessions · {} messages · {} bytes",
+                        s.count, s.messages, s.bytes
+                    ),
+                );
             }
         }
-        _ => push(&mut out, "- Archive is not enabled — no preservation claims are made."),
+        _ => push(
+            &mut out,
+            "- Archive is not enabled — no preservation claims are made.",
+        ),
     }
     push(&mut out, "");
     push(&mut out, "> **Boundary:** integrity is a SHA-256 hash chain over archived content; it proves the archive was not edited after capture, not that the source tools' files were unmodified before capture.");
@@ -271,20 +309,36 @@ pub fn render(i: &ReportInputs) -> String {
     // ---- Configuration appendix --------------------------------------------------------
     push(&mut out, "## Configuration at generation time");
     push(&mut out, "");
-    push(&mut out, &format!("- Payload storage: **{}**", if payload { "ON (explicit)" } else { "off (default)" }));
-    push(&mut out, &format!(
-        "- Masking: **{}**",
-        match (masking.enabled, masking.dry_run) {
-            (false, _) => "off (observe-only)".to_string(),
-            (true, true) => "enabled, dry-run".to_string(),
-            (true, false) => "enabled, active".to_string(),
-        }
-    ));
+    push(
+        &mut out,
+        &format!(
+            "- Payload storage: **{}**",
+            if payload {
+                "ON (explicit)"
+            } else {
+                "off (default)"
+            }
+        ),
+    );
+    push(
+        &mut out,
+        &format!(
+            "- Masking: **{}**",
+            match (masking.enabled, masking.dry_run) {
+                (false, _) => "off (observe-only)".to_string(),
+                (true, true) => "enabled, dry-run".to_string(),
+                (true, false) => "enabled, active".to_string(),
+            }
+        ),
+    );
     push(&mut out, &format!("- Retention: {:?}", i.config.retention));
-    push(&mut out, &format!(
-        "- Pricing table verified: {} (estimates only; never fetched)",
-        i.config.pricing.as_of
-    ));
+    push(
+        &mut out,
+        &format!(
+            "- Pricing table verified: {} (estimates only; never fetched)",
+            i.config.pricing.as_of
+        ),
+    );
     out
 }
 

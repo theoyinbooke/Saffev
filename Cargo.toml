@@ -1,6 +1,6 @@
 [package]
 name = "saffev"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Saffev — a transparent, on-device proxy + Studio in front of a local LLM engine (observe-only, fail-open)."
@@ -31,9 +31,10 @@ default = ["sqlcipher"]
 sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 # Menu-bar / system-tray launcher (Saffev.app). OFF by default so the headless
 # server builds (and Linux/Windows release artifacts) are unaffected. Enabled only
-# for the macOS .app build. Pulls in a native event loop + tray widget; all objc
-# unsafe stays inside those crates, so `#![forbid(unsafe_code)]` still holds.
-tray = ["dep:tray-icon", "dep:tao"]
+# for the macOS .app build. Pulls in a native event loop + tray widget + (macOS
+# only) a WKWebView for the drop-down panel; all objc unsafe stays inside those
+# crates, so `#![forbid(unsafe_code)]` still holds.
+tray = ["dep:tray-icon", "dep:tao", "dep:wry"]
 
 [dependencies]
 # --- menu-bar launcher (feature `tray`, optional) ---
@@ -105,6 +106,13 @@ sha2 = "0.10"
 # (G1 privacy lens). Keccak is NOT SHA-3-the-standard (different padding), so
 # sha2 can't stand in for it.
 sha3 = "0.10"
+
+# --- menu-bar drop-down panel (feature `tray`, macOS only) ---
+# The status-item panel is a borderless tao window hosting a WKWebView. wry is
+# target-gated so `--features tray` on Linux/Windows still means "menu only"
+# and never pulls webkit2gtk/WebView2 into those builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = { version = "0.56", optional = true, default-features = false }
 
 [profile.release]
 strip = true

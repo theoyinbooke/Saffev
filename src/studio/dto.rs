@@ -721,6 +721,19 @@ pub struct ArchiveStatusView {
     /// plus proxy history, findings, and the FTS index. Surfaced so a
     /// growing database is a number the user sees, not a surprise.
     pub db_bytes: u64,
+    /// Newest `archived_ts` in the archive.
+    #[serde(default)]
+    pub latest_ts: Option<i64>,
+    /// When `saffev backup` last completed (recorded by the command).
+    #[serde(default)]
+    pub last_backup_ts: Option<i64>,
+    #[serde(default)]
+    pub last_backup_dir: Option<String>,
+    /// The archive changed after the last backup (or was never backed up
+    /// while holding sessions) — the one condition under which "Back up" is
+    /// worth offering.
+    #[serde(default)]
+    pub changed_since_backup: bool,
 }
 
 /// `GET /api/agents` — the Agents overview.
@@ -868,6 +881,14 @@ pub struct AgentAnalytics {
     /// JSONL — daily rows, 5-hour billing blocks, live burn, plan progress.
     /// `None` when no per-request usage data exists on this machine.
     pub usage: Option<UsageReport>,
+    /// Last 30 UTC days of spend split by tool key (ascending, gaps filled).
+    /// Claude Code days are the usage engine's exact rows; other tools are
+    /// dated by each session's last activity.
+    #[serde(default)]
+    pub daily_by_tool: Vec<crate::agents::DailyToolRow>,
+    /// Tool key → display label, for the chart legend.
+    #[serde(default)]
+    pub tool_labels: std::collections::BTreeMap<String, String>,
 }
 
 /// The G3 usage report (Claude Code per-request data; UTC grouping).

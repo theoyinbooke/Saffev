@@ -88,14 +88,18 @@ async fn load_config(cli: &Cli) -> Config {
     })
     .await;
 
-    match loaded {
+    let cfg = match loaded {
         Some(Ok(cfg)) => cfg,
         Some(Err(err)) => {
             tracing::debug!("config load error, using defaults: {err}");
             Config::default()
         }
         None => Config::default(),
-    }
+    };
+    // Opt-in Aider scan roots (`[agents] aider_roots`): installed once so every
+    // reader built afterwards, in any command, sees them.
+    crate::agents::aider::configure_extra_roots(cfg.agents.aider_root_paths());
+    cfg
 }
 
 /// Direct, dependency-free liveness probe: is something accepting TCP on
@@ -163,6 +167,22 @@ fn group_thousands(n: u64) -> String {
         out.push(*b as char);
     }
     out
+}
+
+/// Human-readable byte size for status lines (`132_547_291 -> "126.4 MB"`).
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +310,20 @@ pub async fn backup(cli: &Cli, out: Option<std::path::PathBuf>) -> Result<()> {
 
     // Best-effort config copy: a zero-config install has nothing to copy.
     let cfg_copied = std::fs::copy(cfg.config_path(), dir.join("saffev.toml")).is_ok();
+
+    // Remember this backup so the Studio/panel can say "backed up · 3h ago"
+    // and only offer another one once the archive has changed. Flushed
+    // explicitly: this process exits right after.
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+    store.enqueue(crate::store::WriteOp::Setting {
+        key: "last_backup_ts".to_string(),
+        value: now_ms.to_string(),
+    });
+    store.enqueue(crate::store::WriteOp::Setting {
+        key: "last_backup_dir".to_string(),
+        value: dir.to_string_lossy().to_string(),
+    });
+    let _ = store.flush().await;
 
     let created = now
         .format(&time::format_description::well_known::Rfc3339)
@@ -517,11 +551,61 @@ pub async fn status(cli: &Cli, check: bool) -> Result<()> {
         }
     }
 
+    // --- history line -----------------------------------------------------
+    // The Keep half of the product in one line: what is preserved, or a nudge
+    // when nothing is. Reads only the archive tables (cheap SQL) — never the
+    // live session listing, which is expensive on a cold cache.
+    match collect_archive_stats(&cfg).await {
+        Some(a) if a.count > 0 => {
+            println!(
+                "{} {} {} {} {}",
+                p.dot(Level::Ok),
+                p.label("history"),
+                p.value(&format!("{} sessions preserved", group_thousands(a.count))),
+                p.muted("·"),
+                p.muted(&human_bytes(a.bytes)),
+            );
+        }
+        _ if cfg.archive.enabled => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("history"),
+                p.muted("preservation on · first snapshot pending"),
+            );
+        }
+        _ => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Warn),
+                p.label("history"),
+                p.warn("nothing preserved · your AI tools delete their own history"),
+            );
+            println!(
+                "{}      {}",
+                p.muted("·"),
+                p.muted("see what's at risk in Studio ▸ Agents, or run `saffev status --check`"),
+            );
+        }
+    }
+
     if check {
         return status_check(cli, &cfg, exposed_flag).await;
     }
 
     Ok(())
+}
+
+/// Archive (preservation) stats for the status `history` line. Opens the store
+/// read-only-in-spirit and degrades to `None` when there is no DB yet or the
+/// store module is stubbed — the caller then falls back to the config flag.
+async fn collect_archive_stats(cfg: &Config) -> Option<crate::store::ArchiveStats> {
+    let db_path = cfg.db_path();
+    let store = guard("store open", async move {
+        crate::store::Store::open(&db_path).await
+    })
+    .await?;
+    guard("archive stats", async move { store.archive_stats().await }).await
 }
 
 /// The `--check` tail of [`status`]: evaluate the monitor rules once against

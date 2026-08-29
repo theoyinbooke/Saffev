@@ -58,11 +58,19 @@ fn build_db(sql_rel: &str, name: &str) -> PathBuf {
 fn uuid_ish() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn raw_id(session: &AgentSession) -> &str {
-    session.id.split_once(':').map(|(_, r)| r).unwrap_or(&session.id)
+    session
+        .id
+        .split_once(':')
+        .map(|(_, r)| r)
+        .unwrap_or(&session.id)
 }
 
 /// Token-count coverage — three-valued because honesty demands it: `Proven`
@@ -146,12 +154,7 @@ impl Coverage {
 }
 
 /// Shared field checks on a (session, detail-messages) pair.
-fn check_common(
-    cov: &mut Coverage,
-    reader: &dyn AgentReader,
-    good: &AgentSession,
-    tool_key: &str,
-) {
+fn check_common(cov: &mut Coverage, reader: &dyn AgentReader, good: &AgentSession, tool_key: &str) {
     cov.session_id = good.id.starts_with(&format!("{tool_key}:"));
     cov.title = good.title.as_deref().is_some_and(|t| !t.is_empty());
     cov.project = good.project.as_deref().is_some_and(|p| !p.is_empty());
@@ -223,7 +226,11 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("000000000003"))
             .expect("codex: good session listed");
         check_common(&mut cov, &reader, good, "codex");
-        assert_eq!(good.title.as_deref(), Some("Wire healthcheck"), "title from session_index");
+        assert_eq!(
+            good.title.as_deref(),
+            Some("Wire healthcheck"),
+            "title from session_index"
+        );
         assert_eq!(good.git_branch.as_deref(), Some("feature/g2"));
         // OpenAI convention: input_tokens is TOTAL; adapter must subtract cache.
         cov.token_counts = TokenCoverage::Proven(
@@ -341,7 +348,10 @@ fn agents_fixture_coverage() {
                 && good.output_tokens == 38 + 95 + 21
                 && good.cache_tokens == 1536 + 2048,
         );
-        assert_eq!(good.message_count, 3, "re-appended record must not add a turn");
+        assert_eq!(
+            good.message_count, 3,
+            "re-appended record must not add a turn"
+        );
         assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
         // Legacy pre-v0.39 single-JSON generation still parses.
         let legacy = sessions
@@ -435,11 +445,12 @@ fn agents_fixture_coverage() {
         check_common(&mut cov, &reader, good, "cline");
         // Anthropic convention: tokensIn already excludes cache.
         cov.token_counts = TokenCoverage::Proven(
-            good.input_tokens == 12480
-                && good.output_tokens == 312
-                && good.cache_tokens == 11200,
+            good.input_tokens == 12480 && good.output_tokens == 312 && good.cache_tokens == 11200,
         );
-        assert_eq!(good.title.as_deref(), Some("Add a retry to the fetch helper"));
+        assert_eq!(
+            good.title.as_deref(),
+            Some("Add a retry to the fetch helper")
+        );
         assert_eq!(good.started_ts, 1753600000000, "task id IS the start time");
         let detail = reader.session_detail("1753600000000").expect("detail");
         assert!(detail
@@ -473,7 +484,11 @@ fn agents_fixture_coverage() {
         };
         let good = sessions
             .iter()
-            .find(|s| s.title.as_deref().is_some_and(|t| t.contains("healthcheck endpoint")))
+            .find(|s| {
+                s.title
+                    .as_deref()
+                    .is_some_and(|t| t.contains("healthcheck endpoint"))
+            })
             .expect("aider: good session listed");
         check_common(&mut cov, &reader, good, "aider");
         assert_eq!(good.model.as_deref(), Some("gpt-4o"));
@@ -496,7 +511,11 @@ fn agents_fixture_coverage() {
         // just assistant text / ignored announcements — never fatal.
         let hurt = sessions
             .iter()
-            .find(|s| s.title.as_deref().is_some_and(|t| t.contains("before the noise")))
+            .find(|s| {
+                s.title
+                    .as_deref()
+                    .is_some_and(|t| t.contains("before the noise"))
+            })
             .expect("aider: corrupted session still listed");
         // 1 user + 2 assistant blocks (the `> ` announcement lines split the
         // assistant text — correct per aider's own reading rules).
@@ -530,11 +549,23 @@ fn agents_fixture_coverage() {
             "input_tokens follows each provider's own convention (recorded as stored)".into(),
         );
         let detail = reader.session_detail("20260715_1").expect("detail");
-        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::Thinking)));
-        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::ToolResult)));
         // sub_agent side threads and archived sessions must not list.
-        assert!(sessions.iter().all(|s| !s.id.ends_with("sub-1")), "sub_agent listed");
-        assert!(sessions.iter().all(|s| !s.id.ends_with("arch-1")), "archived listed");
+        assert!(
+            sessions.iter().all(|s| !s.id.ends_with("sub-1")),
+            "sub_agent listed"
+        );
+        assert!(
+            sessions.iter().all(|s| !s.id.ends_with("arch-1")),
+            "archived listed"
+        );
         // Corrupted content_json: the session lists with its aggregates, the
         // blob degrades to zero blocks in detail — never fatal.
         let hurt = sessions
@@ -542,9 +573,8 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("20260715_2"))
             .expect("goose: corrupted-blob session still listed");
         let hurt_detail = reader.session_detail("20260715_2").expect("detail");
-        cov.corrupted_nonfatal = hurt.message_count == 1
-            && hurt.input_tokens == 50
-            && hurt_detail.messages.is_empty();
+        cov.corrupted_nonfatal =
+            hurt.message_count == 1 && hurt.input_tokens == 50 && hurt_detail.messages.is_empty();
         table.insert("goose".into(), cov.to_json());
         complete += usize::from(cov.complete());
     }
@@ -562,7 +592,10 @@ fn agents_fixture_coverage() {
             .find(|s| s.id.ends_with("1d5e7a8b9c0d"))
             .expect("amp: good thread listed");
         check_common(&mut cov, &reader, good, "amp");
-        assert_eq!(good.title.as_deref(), Some("Fix the flaky attribution test"));
+        assert_eq!(
+            good.title.as_deref(),
+            Some("Fix the flaky attribution test")
+        );
         assert_eq!(good.project.as_deref(), Some("/home/dev/fixture-proj"));
         // Per-message usage, Anthropic camelCase: inputTokens excludes cache.
         cov.token_counts = TokenCoverage::Proven(
@@ -579,8 +612,14 @@ fn agents_fixture_coverage() {
         let detail = reader
             .session_detail(&format!("T-{}", "3f2b9c1e-8a4d-4e6b-9c2f-1d5e7a8b9c0d"))
             .expect("detail");
-        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::Thinking)));
-        assert!(detail.messages.iter().any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(detail
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::ToolResult)));
         // Corrupted (truncated) thread file: skipped, never fatal.
         cov.corrupted_nonfatal = sessions.iter().all(|s| !s.id.ends_with("T-corrupt"));
         table.insert("amp".into(), cov.to_json());
@@ -606,8 +645,9 @@ fn agents_fixture_coverage() {
         // Roo does NOT persist the model per task (only a mutable profile
         // name in VS Code secrets) — honestly absent, never guessed.
         cov.model_absent_in_format = true;
-        cov.notes
-            .push("model id not persisted per task (profile name only) — absent, not guessed".into());
+        cov.notes.push(
+            "model id not persisted per task (profile name only) — absent, not guessed".into(),
+        );
         // Roo convention: tokensIn INCLUDES cache — non-cached = 5230 − 5000.
         cov.token_counts = TokenCoverage::Proven(
             good.input_tokens == 230
@@ -643,14 +683,20 @@ fn agents_fixture_coverage() {
         let truncated = dir.join("truncated.vscdb");
         std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
         let not_sqlite = dir.join("not-a-db.vscdb");
-        std::fs::write(&not_sqlite, b"this is just text pretending to be a database").unwrap();
+        std::fs::write(
+            &not_sqlite,
+            b"this is just text pretending to be a database",
+        )
+        .unwrap();
         for db in [truncated.clone(), not_sqlite.clone()] {
             assert!(
                 CursorReader::with_db(db.clone()).list_sessions().is_empty(),
                 "cursor: binary-corrupt db must degrade to empty, got sessions from {db:?}"
             );
             assert!(
-                OpenCodeReader::with_db(db.clone()).list_sessions().is_empty(),
+                OpenCodeReader::with_db(db.clone())
+                    .list_sessions()
+                    .is_empty(),
                 "opencode: binary-corrupt db must degrade to empty, got sessions from {db:?}"
             );
             assert!(

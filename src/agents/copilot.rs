@@ -105,12 +105,9 @@ impl CopilotReader {
             let trimmed = value.trim();
             // Single-quoted YAML scalars escape embedded quotes by doubling
             // them ('' -> '); unescape after stripping (G2 closing critic).
-            let single_quoted = trimmed.len() >= 2
-                && trimmed.starts_with('\'')
-                && trimmed.ends_with('\'');
-            let value = trimmed
-                .trim_matches(|c| c == '"' || c == '\'')
-                .to_string();
+            let single_quoted =
+                trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'');
+            let value = trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
             let value = if single_quoted {
                 value.replace("''", "'")
             } else {
@@ -524,8 +521,7 @@ impl AgentReader for CopilotReader {
         AgentTool::Copilot
     }
     fn is_present(&self) -> bool {
-        self.base.join("session-state").is_dir()
-            || self.base.join("history-session-state").is_dir()
+        self.base.join("session-state").is_dir() || self.base.join("history-session-state").is_dir()
     }
     fn list_sessions(&self) -> Vec<AgentSession> {
         let mut out: Vec<AgentSession> = Vec::new();
@@ -533,17 +529,17 @@ impl AgentReader for CopilotReader {
         // Modern first: a resumed legacy session exists in BOTH stores
         // (migration preserves the original) — modern wins the dedupe.
         for p in self.modern_sessions() {
-            if let Some(s) = super::cached_file_parse(&p, |p| {
-                Self::parse_modern(p, false).map(|d| d.session)
-            }) {
+            if let Some(s) =
+                super::cached_file_parse(&p, |p| Self::parse_modern(p, false).map(|d| d.session))
+            {
                 seen.insert(s.id.clone());
                 out.push(s);
             }
         }
         for p in self.legacy_sessions() {
-            if let Some(s) = super::cached_file_parse(&p, |p| {
-                Self::parse_legacy(p, false).map(|d| d.session)
-            }) {
+            if let Some(s) =
+                super::cached_file_parse(&p, |p| Self::parse_legacy(p, false).map(|d| d.session))
+            {
                 if seen.insert(s.id.clone()) {
                     out.push(s);
                 }
@@ -630,10 +626,19 @@ mod tests {
         assert_eq!(d.session.cache_tokens, 14100);
         assert_eq!(d.session.output_tokens, 42);
         assert_eq!(d.session.tool_call_count, 1);
-        assert!(d.messages.iter().any(|m| matches!(m.kind, MessageKind::Thinking)));
-        assert!(d.messages.iter().any(|m| matches!(m.kind, MessageKind::ToolResult)));
+        assert!(d
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::Thinking)));
+        assert!(d
+            .messages
+            .iter()
+            .any(|m| matches!(m.kind, MessageKind::ToolResult)));
         // Raw prompt, not the transformed wrapper.
-        assert!(d.messages.iter().any(|m| m.content == "list the files here"));
+        assert!(d
+            .messages
+            .iter()
+            .any(|m| m.content == "list the files here"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

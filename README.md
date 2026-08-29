@@ -3,17 +3,32 @@
 **Saffev remembers what every AI tool on your computer did, protects what you did
 not mean to share, and keeps the record even after those tools throw theirs away.**
 
+Right now, the AI coding tools on your machine are deleting their own history on
+their own clocks — Claude Code prunes transcripts after about 30 days, Cursor
+rotates old chats — with no warning and no way back. Install Saffev, open the
+Studio, and the first thing it tells you is exactly which of your sessions are
+scheduled to disappear, before it happens.
+
 It is one Rust binary and a local web Studio. Nothing is uploaded, nothing is
 sent to us, and there is no account. Three things it does:
+
+### Keep
+
+This is the part nobody else does. Saffev reads the session history your coding
+tools already write to disk — twelve of them: Claude Code, Codex, Cursor,
+OpenCode, VS Code Copilot, Gemini CLI, Copilot CLI, Cline, Roo Code, Aider,
+Goose, and Amp — shows what is scheduled to disappear, and keeps an encrypted
+copy that survives it, with a tamper-evident record so you can prove a session
+was not altered afterwards. Export any of it to Markdown or JSON at any time. It
+is your data.
 
 ### See
 
 Every model call your apps make, recorded on this machine: which app, which
-model, how long it took, what it cost, what failed. Plus every coding session
-from Claude Code, Codex, Cursor, OpenCode, and VS Code Copilot, read straight
-from the files those tools already write. One **Timeline** shows all of it
-together, and one search box looks through all of it at once, including what was
-actually said inside your conversations.
+model, how long it took, what it cost, what failed — plus every one of those
+coding sessions, and what each one cost you across tools and models. One
+**Timeline** shows all of it together, and one search box looks through all of
+it at once, including what was actually said inside your conversations.
 
 ### Protect
 
@@ -22,15 +37,6 @@ show you where they are, quietly replace them before they reach a model, or stop
 the request entirely for the things that must never be sent. There is a
 whole-history **Privacy report** that answers the question people actually have:
 *what have I been pasting into AI tools, and where?*
-
-### Keep
-
-This is the part nobody else does. Your AI coding tools delete their own history
-on their own clocks (Claude Code prunes transcripts after about 30 days, Cursor
-rotates its store). You are not warned and you cannot get it back. Saffev shows
-you what is scheduled to disappear and keeps an encrypted copy that survives it,
-with a tamper-evident record so you can prove a session was not altered
-afterwards. Export any of it to Markdown or JSON at any time. It is your data.
 
 > **Positioning.** Cloud observability tools watch the app *you are building* and
 > need you to instrument your code. Enterprise DLP sits on the network and belongs
@@ -57,8 +63,21 @@ Download
 **[`Saffev-macos-arm64.dmg`](https://github.com/theoyinbooke/Saffev/releases/latest/download/Saffev-macos-arm64.dmg)**,
 open it, and drag `Saffev.app` onto the `Applications` shortcut inside — no
 unzip. It lives in the menu bar (no Dock icon, no terminal) and keeps the proxy +
-Studio running: **Open Studio · Start · Stop · Restart · Open at Login · Quit**.
-Under the hood it is the same `saffev` binary running `saffev tray`.
+Studio running. **Click the icon** for the drop-down panel: today's requests,
+leaks caught and block spend at a glance, then tabs for **Keep** (sessions
+preserved, which tools are near their deletion line, one-click *Preserve now* /
+*Back up*), **Privacy** (masking posture, findings by kind), **Spend** (current
+5-hour block, burn rate, plan allowance) and **Alerts** (everything that needs
+you, evaluated on-device). The header gear opens persistent quick settings for
+login launch, preservation, masking, dry-run, and panel appearance; advanced
+settings stay in Studio. Service controls — Start · Stop · Restart · Logs ·
+Open at Login · Quit — sit in its footer (there is no separate native menu on
+macOS; the panel is the whole UI). Under the hood it is the same `saffev`
+binary running `saffev tray`; the panel is a local web view served by your own
+Studio, so it never reaches the network. It asks macOS for **no folder or
+media permissions**: the one reader that has to search for its files (Aider)
+stays out of Desktop, Documents, Downloads and every media folder unless you
+list a directory under `[agents] aider_roots` in `saffev.toml`.
 
 **Updating in place.** Installer installs can update themselves: run `saffev
 update` (or `saffev update --check` to just look), or click **Update** in the

@@ -2028,11 +2028,43 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         .await
         .unwrap_or_default();
     let tools = crate::agents::tool_stats(&sessions);
-    let at_risk = crate::agents::at_risk_report(&sessions);
+    // At-risk = past (or within a week of) the tool's deletion line AND not
+    // yet in the archive. A preserved session is safe by definition; counting
+    // it here kept the "overdue" flag up after the user clicked Preserve.
+    let archived_ids: std::collections::HashSet<String> = state
+        .store
+        .archived_sessions()
+        .await
+        .map(|v| v.into_iter().map(|a| a.id).collect())
+        .unwrap_or_default();
+    let unpreserved: Vec<crate::agents::AgentSession> = sessions
+        .iter()
+        .filter(|s| !archived_ids.contains(&s.id))
+        .cloned()
+        .collect();
+    let at_risk = crate::agents::at_risk_report(&unpreserved);
     let total_sessions = tools.iter().map(|t| t.sessions).sum();
     let total_tokens = tools.iter().map(|t| t.tokens).sum();
     let total_cost_usd = tools.iter().map(|t| t.cost_usd).sum();
     let archived = state.store.archive_stats().await.unwrap_or_default();
+    let last_backup_ts: Option<i64> = state
+        .store
+        .get_setting("last_backup_ts")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok());
+    let last_backup_dir: Option<String> = state
+        .store
+        .get_setting("last_backup_dir")
+        .await
+        .ok()
+        .flatten();
+    let changed_since_backup = match (archived.latest_ts, last_backup_ts) {
+        (Some(latest), Some(backup)) => latest > backup,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
     let cfg = state.config.load();
     Json(dto::AgentsOverview {
         tools: tools.iter().map(tool_stat_view).collect(),
@@ -2046,6 +2078,10 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         },
         at_risk: at_risk.iter().map(at_risk_view).collect(),
         archive: dto::ArchiveStatusView {
+            latest_ts: archived.latest_ts,
+            last_backup_ts,
+            last_backup_dir,
+            changed_since_backup,
             enabled: cfg.archive.enabled,
             auto: cfg.archive.auto,
             count: archived.count,
@@ -3221,6 +3257,38 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
         }
     };
 
+    // Daily spend by tool: sessions dated by last activity for every tool,
+    // then Claude Code's day rows replaced by the usage engine's exact ones.
+    let daily_by_tool = {
+        let pricing = state.config.load().pricing.clone();
+        let now = crate::agents::now_ms();
+        let mut rows = crate::agents::daily_by_tool(&sessions, &pricing, now, 30);
+        if let Some(u) = usage.as_ref() {
+            let cc = crate::agents::AgentTool::ClaudeCode.key();
+            let exact: BTreeMap<&str, &crate::agents::usage::DailyRow> =
+                u.daily.iter().map(|d| (d.date.as_str(), d)).collect();
+            for row in rows.iter_mut() {
+                row.cost_by_tool.remove(cc);
+                row.tokens_by_tool.remove(cc);
+                if let Some(d) = exact.get(row.date.as_str()) {
+                    let t = &d.totals;
+                    if t.cost_usd > 0.0 || t.input + t.output > 0 {
+                        row.cost_by_tool.insert(cc.to_string(), t.cost_usd);
+                        row.tokens_by_tool.insert(
+                            cc.to_string(),
+                            t.input + t.output + t.cache_read + t.cache_write,
+                        );
+                    }
+                }
+            }
+        }
+        rows
+    };
+    let tool_labels: BTreeMap<String, String> = by_tool
+        .iter()
+        .map(|t| (t.tool.key().to_string(), t.tool.label().to_string()))
+        .collect();
+
     Json(dto::AgentAnalytics {
         total_sessions,
         total_tokens,
@@ -3229,6 +3297,8 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
         by_tool: by_tool.iter().map(tool_stat_view).collect(),
         by_model,
         usage,
+        daily_by_tool,
+        tool_labels,
     })
 }
 
@@ -4090,6 +4160,33 @@ mod tests {
         let live = handle.load();
         assert!(live.payload_storage, "payload_storage applies live");
         assert_eq!(live.retention, crate::config::Retention::Age { days: 7 });
+    }
+
+    /// The two preservation switches exposed by the menu-bar quick settings
+    /// must survive a full process restart, not merely the current ArcSwap.
+    #[tokio::test]
+    async fn settings_put_archive_switches_persist_to_disk() {
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        let config_path = handle.load().config_path();
+
+        let update = dto::SettingsUpdate {
+            archive_enabled: Some(true),
+            archive_auto: Some(true),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state), Json(update))
+            .await
+            .expect("settings_put ok");
+        assert!(resp.0.archive_enabled);
+        assert!(resp.0.archive_auto);
+        assert!(handle.load().archive.enabled, "archive applies live");
+        assert!(handle.load().archive.auto, "auto-preserve applies live");
+
+        let saved = std::fs::read_to_string(config_path).expect("saved config exists");
+        let reloaded: crate::config::Config =
+            toml::from_str(&saved).expect("saved config parses after restart");
+        assert!(reloaded.archive.enabled, "archive setting persisted");
+        assert!(reloaded.archive.auto, "auto-preserve setting persisted");
     }
 
     /// export_dir applies live: a valid, writable directory is accepted, swapped

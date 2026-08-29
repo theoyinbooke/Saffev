@@ -91,7 +91,9 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
             if p.extension().map(|e| e != "jsonl").unwrap_or(true) {
                 continue;
             }
-            let Ok(file) = fs::File::open(&p) else { continue };
+            let Ok(file) = fs::File::open(&p) else {
+                continue;
+            };
             let session_id = p
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
@@ -108,8 +110,12 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
                 if v.get("type").and_then(Value::as_str) != Some("assistant") {
                     continue;
                 }
-                let Some(msg) = v.get("message") else { continue };
-                let Some(usage) = msg.get("usage") else { continue };
+                let Some(msg) = v.get("message") else {
+                    continue;
+                };
+                let Some(usage) = msg.get("usage") else {
+                    continue;
+                };
                 let ts = v
                     .get("timestamp")
                     .and_then(Value::as_str)
@@ -198,7 +204,7 @@ pub struct DailyRow {
 }
 
 /// UTC calendar date of a unix-millis timestamp.
-fn utc_date(ts: i64) -> String {
+pub(crate) fn utc_date(ts: i64) -> String {
     let t = time::OffsetDateTime::from_unix_timestamp(ts / 1000)
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day())
@@ -216,7 +222,10 @@ pub fn daily(events: &[UsageEvent], pricing: &PricingConfig) -> Vec<DailyRow> {
             by_project: BTreeMap::new(),
         });
         row.totals.add(e, pricing);
-        row.by_model.entry(e.model.clone()).or_default().add(e, pricing);
+        row.by_model
+            .entry(e.model.clone())
+            .or_default()
+            .add(e, pricing);
         row.by_project
             .entry(e.project.clone().unwrap_or_else(|| "unknown".into()))
             .or_default()
@@ -247,7 +256,10 @@ pub fn monthly(events: &[UsageEvent], pricing: &PricingConfig) -> Vec<MonthlyRow
             by_model: BTreeMap::new(),
         });
         row.totals.add(e, pricing);
-        row.by_model.entry(e.model.clone()).or_default().add(e, pricing);
+        row.by_model
+            .entry(e.model.clone())
+            .or_default()
+            .add(e, pricing);
     }
     months.into_values().collect()
 }
@@ -438,7 +450,11 @@ mod tests {
             9 * h + 45 * 60_000 + BLOCK_MS,
             "gap starts at last entry + 5h"
         );
-        assert_eq!(blocks[1].end_ts, 30 * h + 2 * 60_000, "gap ends at next entry");
+        assert_eq!(
+            blocks[1].end_ts,
+            30 * h + 2 * 60_000,
+            "gap ends at next entry"
+        );
         assert_eq!(blocks[2].start_ts, 30 * h);
         assert!(!blocks[2].is_active, "now is far past");
     }

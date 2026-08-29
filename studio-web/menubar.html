@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Saffev — menu bar</title>
+  <!-- The menu-bar panel. Served by the Studio (token injected like index.html)
+       and rendered inside the tray app's transparent WKWebView. Same self-hosted
+       fonts + tokens as the Studio: nothing is fetched from outside the device. -->
+  <link rel="stylesheet" href="/fonts.css" />
+  <link rel="stylesheet" href="/tokens.css" />
+  <link rel="stylesheet" href="/menubar.css" />
+</head>
+<body>
+  <div class="pop">
+    <div class="tip" aria-hidden="true"></div>
+    <section class="panel" id="panel" role="dialog" aria-label="Saffev menu bar panel">
+      <header class="hd">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 512 512" fill="currentColor">
+            <path d="M34 242H52C68 242 78 230 81 214L96 100C102 54 139 24 186 24H326C373 24 410 54 416 100L431 214C434 230 444 242 460 242H478V250H442C414 250 396 268 382 294C368 320 354 336 330 336C306 336 291 315 276 283L246 219C232 188 220 164 196 164C172 164 158 183 144 207C126 238 110 250 82 250H34Z"/>
+            <path d="M34 270H82C110 270 126 258 144 227C158 203 172 192 196 192C220 192 232 216 246 247L276 311C291 343 306 364 330 364C354 364 368 348 382 322C396 296 414 278 442 278H478V270H460C444 270 434 282 431 298L416 412C410 458 373 488 326 488H186C139 488 102 458 96 412L81 298C78 282 68 270 52 270Z"/>
+          </svg>
+        </div>
+        <div class="wm">
+          <b id="appName">Saffev</b>
+          <span class="status" id="status"><span class="dot"></span><span id="statusText">Connecting…</span></span>
+        </div>
+        <div class="hd-actions">
+          <button class="btn ghost sm" id="btnOpen" title="Open the full Studio in your browser">Open Studio <span class="arrow">↗</span></button>
+          <button class="iconbtn" id="btnSettings" title="Quick settings" aria-label="Quick settings" aria-pressed="false"></button>
+          <button class="iconbtn" id="btnPin" title="Keep the panel open" aria-label="Pin panel" aria-pressed="false"></button>
+        </div>
+      </header>
+
+      <nav class="tabs" id="tabs" role="tablist" aria-label="Panel sections"></nav>
+
+      <div class="notice" id="notice" hidden></div>
+
+      <div class="body" id="body" aria-live="polite"></div>
+
+      <footer class="ft" id="foot"></footer>
+    </section>
+  </div>
+  <script src="/menubar.js" defer></script>
+</body>
+</html>

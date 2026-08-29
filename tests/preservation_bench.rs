@@ -94,7 +94,12 @@ fn git(dir: &Path, date_secs: Option<i64>, args: &[&str]) {
     cmd.arg("-C")
         .arg(dir)
         .args(["-c", "user.name=g5", "-c", "user.email=g5@bench.local"])
-        .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=g5main"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=g5main",
+        ])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .args(args);
@@ -124,11 +129,20 @@ async fn preservation_floors() {
     let mut cfg = Config::default();
     assert!(!saffev::studio::should_run(&cfg), "off by default");
     cfg.archive.enabled = true;
-    assert!(!saffev::studio::should_run(&cfg), "enabled without auto = manual only");
+    assert!(
+        !saffev::studio::should_run(&cfg),
+        "enabled without auto = manual only"
+    );
     cfg.archive.auto = true;
-    assert!(saffev::studio::should_run(&cfg), "enabled + auto = snapshot");
+    assert!(
+        saffev::studio::should_run(&cfg),
+        "enabled + auto = snapshot"
+    );
     cfg.archive.enabled = false;
-    assert!(!saffev::studio::should_run(&cfg), "disabling stops the very next tick");
+    assert!(
+        !saffev::studio::should_run(&cfg),
+        "disabling stops the very next tick"
+    );
 
     // ---- archive three sessions from three different tools --------------------
     // Fixed key via the documented env override so the bench needs no keyring.
@@ -176,7 +190,8 @@ async fn preservation_floors() {
         // (--no-default-features) build where the DB is unencrypted SQLite.
         conn.pragma_update(None, "key", "g5-preservation-bench-key-0123456789")
             .expect("pragma key");
-        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         conn.execute(
             "UPDATE archived_messages SET content = 'quietly rewritten by the bench' \
              WHERE session_id = 'codex:g5'",
@@ -205,7 +220,13 @@ async fn preservation_floors() {
         git(
             &repo,
             Some(W0 + 60 * i),
-            &["commit", "-q", "--allow-empty", "-m", &format!("g5 commit {i}")],
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                &format!("g5 commit {i}"),
+            ],
         );
     }
     // The decoy: far outside every session window below.
@@ -217,23 +238,49 @@ async fn preservation_floors() {
 
     // A window covering all five (pad 10 min) links exactly those five —
     // the decoy must not leak in.
-    let all = gitlink::commits_for(&repo, None, W0 * 1000, (W0 + 400) * 1000, gitlink::DEFAULT_PAD_MS);
+    let all = gitlink::commits_for(
+        &repo,
+        None,
+        W0 * 1000,
+        (W0 + 400) * 1000,
+        gitlink::DEFAULT_PAD_MS,
+    );
     let summaries: BTreeSet<String> = all.iter().map(|c| c.summary.clone()).collect();
-    assert_eq!(all.len(), 5, "window must link exactly the 5 in-window commits");
+    assert_eq!(
+        all.len(),
+        5,
+        "window must link exactly the 5 in-window commits"
+    );
     assert_eq!(
         summaries,
-        (1..=5).map(|i| format!("g5 commit {i}")).collect::<BTreeSet<_>>(),
+        (1..=5)
+            .map(|i| format!("g5 commit {i}"))
+            .collect::<BTreeSet<_>>(),
         "the decoy commit outside the window must not link"
     );
     assert!(all.iter().all(|c| !c.hash.is_empty() && c.ts > 0));
     // The recorded branch works; a branch that no longer exists falls back to
     // HEAD instead of pretending the work vanished.
     assert_eq!(
-        gitlink::commits_for(&repo, Some("g5main"), W0 * 1000, (W0 + 400) * 1000, gitlink::DEFAULT_PAD_MS).len(),
+        gitlink::commits_for(
+            &repo,
+            Some("g5main"),
+            W0 * 1000,
+            (W0 + 400) * 1000,
+            gitlink::DEFAULT_PAD_MS
+        )
+        .len(),
         5
     );
     assert_eq!(
-        gitlink::commits_for(&repo, Some("branch-rebased-away"), W0 * 1000, (W0 + 400) * 1000, gitlink::DEFAULT_PAD_MS).len(),
+        gitlink::commits_for(
+            &repo,
+            Some("branch-rebased-away"),
+            W0 * 1000,
+            (W0 + 400) * 1000,
+            gitlink::DEFAULT_PAD_MS
+        )
+        .len(),
         5,
         "missing branch must fall back to HEAD"
     );
@@ -244,12 +291,12 @@ async fn preservation_floors() {
     let no_repo = tmp_path("norepo");
     std::fs::create_dir_all(&no_repo).unwrap();
     let session_windows: Vec<(&Path, i64, i64)> = vec![
-        (&repo, W0, W0 + 90),          // covers commit 1
-        (&repo, W0 + 90, W0 + 150),    // covers commit 2
-        (&repo, W0 + 150, W0 + 210),   // covers commit 3
-        (&repo, W0 + 210, W0 + 270),   // covers commit 4
-        (&repo, W0 + 270, W0 + 400),   // covers commit 5
-        (&no_repo, W0, W0 + 400),      // no repo — honestly unlinked
+        (&repo, W0, W0 + 90),        // covers commit 1
+        (&repo, W0 + 90, W0 + 150),  // covers commit 2
+        (&repo, W0 + 150, W0 + 210), // covers commit 3
+        (&repo, W0 + 210, W0 + 270), // covers commit 4
+        (&repo, W0 + 270, W0 + 400), // covers commit 5
+        (&no_repo, W0, W0 + 400),    // no repo — honestly unlinked
     ];
     let linked = session_windows
         .iter()
@@ -292,6 +339,9 @@ async fn preservation_floors() {
     println!("{pretty}");
     let out_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/bench");
     std::fs::create_dir_all(out_dir).expect("create bench dir");
-    std::fs::write(format!("{out_dir}/preservation-results.json"), pretty + "\n")
-        .expect("write bench/preservation-results.json");
+    std::fs::write(
+        format!("{out_dir}/preservation-results.json"),
+        pretty + "\n",
+    )
+    .expect("write bench/preservation-results.json");
 }

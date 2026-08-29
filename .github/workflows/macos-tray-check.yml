@@ -1,6 +1,7 @@
 # Compile the macOS menu-bar tray on every push.
 #
-# The `tray` feature (src/cli/tray.rs + tao/tray-icon) is otherwise only built
+# The `tray` feature (src/cli/tray.rs + tray_panel.rs, tao/tray-icon/wry) is
+# otherwise only built
 # inside the tag-time DMG job, so a breaking change to `daemon`/`Config` that
 # touches the tray would surface for the first time while cutting a release —
 # the worst possible moment. This job is a cheap `cargo check`, not a package:

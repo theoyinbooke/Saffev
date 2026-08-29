@@ -33,7 +33,7 @@ a{color:inherit}
   width:32px;height:32px;border-radius:var(--r-md);flex:none;display:grid;place-items:center;
   background:var(--surface-2);border:1px solid var(--border);color:var(--brand);
 }
-.brand .mark svg{width:20px;height:20px}
+.brand .mark svg{width:23px;height:23px}
 .brand .wm{font-family:var(--font-display);font-weight:600;font-size:1.12rem;letter-spacing:-.02em}
 .brand .wm small{display:block;font-family:var(--font-mono);font-weight:500;font-size:.58rem;letter-spacing:.2em;color:var(--text-3);text-transform:uppercase;margin-top:2px}
 .navlabel{font-family:var(--font-mono);font-size:.6rem;letter-spacing:.18em;text-transform:uppercase;color:var(--text-3);padding:16px 11px 6px}

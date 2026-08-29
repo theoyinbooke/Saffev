@@ -528,6 +528,62 @@ pub fn detail(id: &str) -> Option<AgentSessionDetail> {
         .and_then(|r| r.session_detail(raw))
 }
 
+/// One UTC day of spend, split by tool key (`claude_code`, `codex`, …).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyToolRow {
+    pub date: String,
+    pub cost_by_tool: std::collections::BTreeMap<String, f64>,
+    pub tokens_by_tool: std::collections::BTreeMap<String, u64>,
+}
+
+/// Per-day, per-tool spend for the last `days` UTC days (ascending, gaps
+/// filled with empty rows), from the listed sessions.
+///
+/// A session is dated by its **last activity** (`updated_ts`) and its whole
+/// cost lands on that day — the readers carry session totals, not per-request
+/// timestamps, so this is the honest resolution for every tool except Claude
+/// Code, whose exact per-day rows come from the usage engine (the API layer
+/// swaps those in). Tokens = input + output + cache, the same sum the
+/// Spend views use.
+pub fn daily_by_tool(
+    sessions: &[AgentSession],
+    pricing: &crate::config::PricingConfig,
+    now_ms: i64,
+    days: usize,
+) -> Vec<DailyToolRow> {
+    let mut rows: Vec<DailyToolRow> = (0..days)
+        .rev()
+        .map(|k| DailyToolRow {
+            date: usage::utc_date(now_ms - (k as i64) * 86_400_000),
+            ..Default::default()
+        })
+        .collect();
+    let index: std::collections::HashMap<String, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.date.clone(), i))
+        .collect();
+    for s in sessions {
+        let Some(&i) = index.get(&usage::utc_date(s.updated_ts)) else {
+            continue;
+        };
+        let key = s.tool.key().to_string();
+        let cost = cost_usd_split_with(
+            pricing,
+            s.model.as_deref(),
+            s.input_tokens,
+            s.output_tokens,
+            s.cache_tokens,
+            s.cache_write_tokens,
+        );
+        *rows[i].cost_by_tool.entry(key.clone()).or_insert(0.0) += cost;
+        *rows[i].tokens_by_tool.entry(key).or_insert(0) +=
+            s.input_tokens + s.output_tokens + s.cache_tokens;
+    }
+    rows
+}
+
 /// Per-tool overview: presence + session/token/cost rollups over the listed
 /// sessions. Reuses one `all_sessions()` pass for the present tools.
 pub fn detected() -> Vec<ToolStat> {
@@ -710,6 +766,47 @@ pub fn rfc3339_millis(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_by_tool_dates_sessions_by_last_activity_and_fills_gaps() {
+        let day = 86_400_000;
+        let now = 1_700_000_000_000i64; // 2023-11-14 22:13 UTC
+        let mk = |tool: AgentTool, updated: i64, output: u64| AgentSession {
+            id: AgentSession::make_id(tool, "x"),
+            tool,
+            title: None,
+            project: None,
+            git_branch: None,
+            model: Some("claude-sonnet-4-5".into()),
+            started_ts: updated - 1000,
+            updated_ts: updated,
+            message_count: 1,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: output,
+            cache_tokens: 0,
+            cache_write_tokens: 0,
+            source_path: String::new(),
+        };
+        let sessions = vec![
+            mk(AgentTool::ClaudeCode, now, 1_000_000),
+            mk(AgentTool::Codex, now - day, 2_000_000),
+            mk(AgentTool::Codex, now - day, 2_000_000),
+            mk(AgentTool::Cursor, now - 40 * day, 5_000_000), // outside the window
+        ];
+        let pricing = crate::config::PricingConfig::default();
+        let rows = daily_by_tool(&sessions, &pricing, now, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].date, usage::utc_date(now - 2 * day));
+        assert!(
+            rows[0].cost_by_tool.is_empty(),
+            "gap day is present but empty"
+        );
+        assert_eq!(rows[1].tokens_by_tool.get("codex"), Some(&4_000_000));
+        assert!(rows[1].cost_by_tool["codex"] > 0.0);
+        assert_eq!(rows[2].tokens_by_tool.get("claude_code"), Some(&1_000_000));
+        assert!(!rows.iter().any(|r| r.cost_by_tool.contains_key("cursor")));
+    }
 
     #[test]
     fn id_namespacing_roundtrips() {

@@ -11,6 +11,10 @@ pub mod daemon;
 /// macOS menu-bar launcher (Saffev.app). Only built with `--features tray`.
 #[cfg(feature = "tray")]
 pub mod tray;
+/// The menu-bar drop-down panel behind the tray icon (macOS window; pure
+/// protocol/geometry helpers everywhere). Only built with `--features tray`.
+#[cfg(feature = "tray")]
+pub mod tray_panel;
 
 use clap::{Parser, Subcommand};
 

@@ -220,6 +220,7 @@ fn sample_report_regenerates_deterministically() {
             count: 17,
             messages: 812,
             bytes: 1_204_224,
+            latest_ts: None,
         }),
         agent_tools: vec![
             ("Claude Code".into(), 12),

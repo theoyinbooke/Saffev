@@ -2515,6 +2515,7 @@
     title: 'Analytics',
     sub: 'Granular, on-device insight into your local-AI traffic · nothing leaves this device.',
     tab: 'overview',
+    usageScope: 'local', // Usage tab: 'local' = proxied engine traffic · 'cloud' = coding-agent usage
     rangeMs: 24 * 60 * 60 * 1000,
     data: null,
     RANGES: [
@@ -2526,6 +2527,7 @@
     TABS: [
       { k: 'overview', l: 'Overview' },
       { k: 'usage', l: 'Usage' },
+      { k: 'billing', l: 'Billing' },
       { k: 'performance', l: 'Performance' },
       { k: 'privacy', l: 'Privacy' },
       { k: 'quality', l: 'Quality' },
@@ -2541,7 +2543,18 @@
         tabs.appendChild(b);
       });
       const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.reload(); }, { ariaLabel: 'Time range', align: 'right' });
-      view.appendChild(el('div', { class: 'an-head reveal' }, [tabs, el('div', { class: 'spacer' }), el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
+      // Usage-source picker lives on the same row as the Window filter (compact);
+      // only shown while the Usage tab is active — renderTab toggles it.
+      const srcSel = dropdown(
+        [{ value: 'local', label: 'Local models' }, { value: 'cloud', label: 'Cloud models' }],
+        this.usageScope,
+        (v) => { if (this.usageScope === v) return; this.usageScope = v; this.renderTab(); },
+        { ariaLabel: 'Usage source', align: 'right' }
+      );
+      const srcWrap = el('span', { id: 'usageSrc', style: 'display:' + (this.tab === 'usage' ? 'contents' : 'none') }, [
+        el('span', { class: 'an-range-lbl', text: 'Source' }), srcSel,
+      ]);
+      view.appendChild(el('div', { class: 'an-head reveal' }, [tabs, el('div', { class: 'spacer' }), srcWrap, el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
       view.appendChild(el('div', { class: 'an-panel', id: 'anPanel' }));
       await this.reload();
     },
@@ -2563,17 +2576,23 @@
 
     renderTab() {
       $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
+      const src = $('#usageSrc');
+      if (src) src.style.display = this.tab === 'usage' ? 'contents' : 'none';
       const panel = $('#anPanel');
       if (!panel) return;
       panel.innerHTML = '';
       // Privacy + Quality are folded in as tabs; they own their own data + empty
       // states (fetched from /privacy and /quality), so they render directly and
-      // bypass the analytics-window empty guard below.
+      // bypass the analytics-window empty guard below. Billing reads agent
+      // transcripts, not proxy traffic, so it bypasses it too.
       if (this.tab === 'privacy') { Privacy.render(panel, this); return; }
       if (this.tab === 'quality') { Quality.draw(panel, this.rangeMs); return; }
+      if (this.tab === 'billing') { Agents.billingPanel(panel); return; }
       if (!this.data) return;
       const d = this.data;
-      if (d.totalRequests === 0 && this.tab !== 'overview') {
+      // Usage handles its own empty state — its Cloud models side reads agent
+      // transcripts off disk and has data even with zero proxy traffic.
+      if (d.totalRequests === 0 && this.tab !== 'overview' && this.tab !== 'usage') {
         panel.appendChild(emptyState('No traffic in this window', 'Try a longer window, or point an app at the proxy (see About & integrate).'));
         return;
       }
@@ -2633,6 +2652,15 @@
     },
 
     usage(panel, d) {
+      // Two sources of usage, one screen: Local models is the proxied engine
+      // traffic (windowed above); Cloud models is coding-agent usage read from
+      // transcripts on disk (all-time). Picked via the Source dropdown in the
+      // header row; billing blocks live on the Billing tab.
+      if (this.usageScope === 'cloud') { Agents.cloudUsagePanel(panel); return; }
+      if (d.totalRequests === 0) {
+        panel.appendChild(emptyState('No local traffic in this window', 'Try a longer window, or point an app at the proxy (see About & integrate). Switch Source to Cloud models for coding-agent usage.'));
+        return;
+      }
       const C = window.SaffevCharts;
       const xl = this.xLabels(d);
       const grid = el('section', { class: 'an-grid' });
@@ -2923,9 +2951,10 @@
     title: 'Agents',
     sub: 'Own your AI history. Read on-device, see what each tool is about to delete, and keep a durable copy that is yours.',
     q: '', tool: '',
-    tab: 'sessions',
+    tab: 'overview',
     rangeMs: 0,
-    TABS: [{ k: 'sessions', l: 'Sessions' }, { k: 'privacy', l: 'Privacy' }, { k: 'usage', l: 'Usage' }],
+    // Usage moved to Analytics › Usage (Cloud models) — one usage screen, two sources.
+    TABS: [{ k: 'overview', l: 'Overview' }, { k: 'sessions', l: 'Sessions' }, { k: 'privacy', l: 'Privacy' }],
     RANGES: [
       { value: 0, label: 'All time' },
       { value: 7 * 86400000, label: 'Last 7 days' },
@@ -2936,42 +2965,13 @@
 
     async render(view) {
       this.q = ''; this.tool = '';
+      this._overview = null;
       view.innerHTML = '';
-      view.appendChild(loadingState('Reading coding-agent history…'));
-      let ov;
-      try { ov = await api('/agents'); hideBanner(); }
-      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not read agent history', e.message || '')); return; }
-      view.innerHTML = '';
-      this._tools = ov.tools;
-      this._analysis = ov.analysis || { available: false, enabled: false };
-      this._atRisk = ov.atRisk || [];
-      this._archive = ov.archive || { enabled: false, count: 0, bytes: 0 };
-
-      // Overview metric strip.
-      view.appendChild(statStrip(4, [
-        statCell('Sessions', fmtNum(ov.totalSessions), 'across all tools'),
-        statCell('Preserved', fmtNum(this._archive.count), this._archive.enabled ? fmtBytes(this._archive.bytes) : 'archive off'),
-        statCell('Est. cost', '$' + (ov.totalCostUsd || 0).toFixed(2), 'vs cloud pricing'),
-        statCell('Tools', String(ov.tools.filter((t) => t.present).length), 'detected on-device'),
-      ]));
-
-      // Preservation banner — the wedge: surface at-risk history + archive state.
-      view.appendChild(this.preserveBanner());
-
-      // Per-tool source cards.
-      const present = ov.tools.filter((t) => t.present);
-      if (!present.length) {
-        view.appendChild(el('div', { class: 'card reveal' }, [
-          aboutSection(ICON.eye, 'No coding agents detected', 'Nothing to read yet'),
-          el('p', { class: 'about-p', text: 'Saffev reads local session history from Claude Code, Codex, OpenCode, and Cursor — on-device, nothing leaves the machine. None were found in their usual locations.' }),
-        ]));
-        return;
-      }
-      view.appendChild(this.toolTable(present));
-
-      // Sessions / Privacy / Usage share this page: they are three questions
-      // about the same history, not three different places.
-      this._present = present;
+      // Shell first, data second: the tab bar paints immediately and the
+      // history read streams into the panel below, so the page is responsive
+      // while agent files are parsed off disk. The tab bar leads the page:
+      // Overview / Sessions / Privacy are three questions about the same
+      // history, and every section lives on a tab.
       const tabs = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Agents sections' });
       this.TABS.forEach((t) => {
         const b = el('button', { class: 'tab' + (this.tab === t.k ? ' active' : ''), type: 'button', role: 'tab', 'data-k': t.k, text: t.l });
@@ -2979,7 +2979,19 @@
         tabs.appendChild(b);
       });
       view.appendChild(el('div', { class: 'an-head reveal' }, [tabs]));
-      view.appendChild(el('div', { class: 'an-panel', id: 'agentPanel' }));
+      const panel = el('div', { class: 'an-panel', id: 'agentPanel' });
+      panel.appendChild(loadingState('Reading coding-agent history…'));
+      view.appendChild(panel);
+
+      let ov;
+      try { ov = await api('/agents'); hideBanner(); }
+      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not read agent history', e.message || '')); return; }
+      this._overview = ov;
+      this._tools = ov.tools;
+      this._analysis = ov.analysis || { available: false, enabled: false };
+      this._atRisk = ov.atRisk || [];
+      this._archive = ov.archive || { enabled: false, count: 0, bytes: 0 };
+      this._present = ov.tools.filter((t) => t.present);
       await this.renderTab();
     },
 
@@ -2987,10 +2999,37 @@
       $$('.an-head .tab').forEach((b) => b.classList.toggle('active', b.dataset.k === this.tab));
       const panel = $('#agentPanel');
       if (!panel) return;
+      // Data still loading: leave the loading state in place — the fetch in
+      // render() calls back here and draws whichever tab is active by then.
+      if (!this._overview) return;
       panel.innerHTML = '';
       if (this.tab === 'privacy') return this.privacyTab(panel);
-      if (this.tab === 'usage') return this.usageTab(panel);
-      return this.sessionsTab(panel);
+      if (this.tab === 'sessions') return this.sessionsTab(panel);
+      return this.overviewTab(panel);
+    },
+
+    overviewTab(panel) {
+      const ov = this._overview;
+      // Overview metric strip.
+      panel.appendChild(statStrip(4, [
+        statCell('Sessions', fmtNum(ov.totalSessions), 'across all tools'),
+        statCell('Preserved', fmtNum(this._archive.count), this._archive.enabled ? fmtBytes(this._archive.bytes) : 'archive off'),
+        statCell('Est. cost', '$' + (ov.totalCostUsd || 0).toFixed(2), 'vs cloud pricing'),
+        statCell('Tools', String(this._present.length), 'detected on-device'),
+      ]));
+
+      // Preservation banner — the wedge: surface at-risk history + archive state.
+      panel.appendChild(this.preserveBanner());
+
+      // Per-tool source table.
+      if (!this._present.length) {
+        panel.appendChild(el('div', { class: 'card reveal' }, [
+          aboutSection(ICON.eye, 'No coding agents detected', 'Nothing to read yet'),
+          el('p', { class: 'about-p', text: 'Saffev reads local session history from Claude Code, Codex, OpenCode, and Cursor — on-device, nothing leaves the machine. None were found in their usual locations.' }),
+        ]));
+        return;
+      }
+      panel.appendChild(this.toolTable(this._present));
     },
 
     async sessionsTab(panel) {
@@ -3104,9 +3143,11 @@
       ]));
     },
 
-    /* Usage across coding agents. The data behind this was already computed and
-       served by the API; it simply had no screen until now. */
-    async usageTab(panel) {
+    /* Usage across coding agents — the cloud-model side of the usage story.
+       Rendered inside Analytics › Usage under the "Cloud models" toggle; the
+       data (sessions, tokens, billing blocks) comes from agent transcripts,
+       not proxy traffic, so it lives here with the other agent readers. */
+    async cloudUsagePanel(panel) {
       panel.appendChild(loadingState('Adding up usage…'));
       let d;
       try { d = await api('/agents/analytics'); hideBanner(); }
@@ -3120,7 +3161,8 @@
         statCell('Est. cost', '$' + (d.totalCostUsd || 0).toFixed(2), 'at list prices'),
       ]));
       panel.appendChild(el('div', { class: 'searchnote reveal', text:
-        'Cost is an estimate from public list prices for the model each session reported. Locally-run models cost nothing and are counted as $0.' }));
+        'All-time usage read from coding-agent transcripts on this machine (the window above applies to local traffic only). '
+        + 'Cost is an estimate from public list prices for the model each session reported. Locally-run models cost nothing and are counted as $0.' }));
 
       const table = (title, rows, nameOf) => {
         const COLS = [
@@ -3144,12 +3186,24 @@
 
       panel.appendChild(table('By tool', d.byTool.filter((t) => t.present), (r) => toolBadge(r.tool, r.label)));
       panel.appendChild(table('By model', d.byModel.slice(0, 20), (r) => el('span', { class: 'cell-model', text: r.model })));
+    },
 
-      /* G3: per-request usage — 5-hour billing blocks with live burn, plan
-         progress, and recent days. Claude Code data; UTC grouping; the
-         pricing table's as-of date is always shown so estimates are dated. */
+    /* G3: per-request usage — 5-hour billing blocks with live burn, plan
+       progress, and recent days. Claude Code data; UTC grouping; the pricing
+       table's as-of date is always shown so estimates are dated. Rendered as
+       the Analytics › Billing tab. */
+    async billingPanel(panel) {
+      panel.appendChild(loadingState('Adding up usage…'));
+      let d;
+      try { d = await api('/agents/analytics'); hideBanner(); }
+      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load billing blocks', e.message || '')); return; }
+      panel.innerHTML = '';
       const u = d.usage;
-      if (u) {
+      if (!u) {
+        panel.appendChild(emptyState('No per-request usage yet', 'Billing blocks are built from Claude Code per-request usage records; none were found on this machine.'));
+        return;
+      }
+      {
         const money = (v) => '$' + (v || 0).toFixed(v >= 10 ? 2 : 3);
         const active = (u.blocks || []).find((b) => b.isActive);
         const cells = [];
@@ -3270,34 +3324,58 @@
         el('span', { class: 'preserve-ic', html: ICON.shield || ICON.eye }),
         el('div', { class: 'preserve-text' }, [
           el('span', { class: 'preserve-title', text: 'Preservation' }),
-          el('span', { class: 'preserve-sub', text: this.preserveMsg(atrisk, overdue, soon, arch) }),
+          // One compact line; the full sentence lives in the tooltip.
+          el('span', { class: 'preserve-sub', text: this.preserveMsg(atrisk, overdue, soon, arch), title: this.preserveTitle(atrisk, overdue, soon, arch) }),
         ]),
       ]));
+      // One primary action; the occasional ones (Export all / Audit bundle)
+      // fold into a More menu so the banner never reads as a toolbar.
       const actions = el('div', { class: 'preserve-actions' });
       if (arch.enabled) {
-        // Integrity status as a compact chip so the banner stays one line —
-        // the full sentence (and head digest) lives in the tooltip.
-        actions.appendChild(el('span', { class: 'integrity-chip', id: 'integrityLine', text: 'verifying…', title: 'Checking the archive integrity chain…' }));
+        actions.appendChild(el('span', { class: 'integrity-chip', id: 'integrityLine', text: 'checking…', title: 'Checking that preserved sessions still match what was recorded when they were kept…' }));
         const btn = el('button', { class: 'btn sm brand', type: 'button', id: 'archiveNowBtn', text: 'Archive now' });
         btn.addEventListener('click', () => this.archiveNow(btn));
         actions.appendChild(btn);
+        actions.appendChild(this.moreMenu([
+          { label: 'Export all', title: 'Write every preserved session as Markdown to your export folder', onPick: (t) => this.exportAll(t) },
+          { label: 'Audit bundle', title: 'Write a folder containing the transcripts, the integrity chain, and how to check it', onPick: (t) => this.auditBundle(t) },
+        ]));
+        this.loadIntegrity();
       } else {
         actions.appendChild(el('a', { class: 'btn sm brand', href: '#/settings/privacy/preservation', text: 'Turn on Preservation' }));
-      }
-      const exp = el('button', { class: 'btn ghost sm', type: 'button', text: 'Export all' });
-      exp.addEventListener('click', () => this.exportAll(exp));
-      actions.appendChild(exp);
-      if (arch.enabled) {
-        const aud = el('button', { class: 'btn ghost sm', type: 'button', title: 'Write a folder containing the transcripts, the integrity chain, and how to check it', text: 'Audit bundle' });
-        aud.addEventListener('click', () => this.auditBundle(aud));
-        actions.appendChild(aud);
-        this.loadIntegrity();
+        const exp = el('button', { class: 'btn ghost sm', type: 'button', text: 'Export all' });
+        exp.addEventListener('click', () => this.exportAll(exp));
+        actions.appendChild(exp);
       }
       wrap.appendChild(actions);
-      // The verify verdict as a full sentence (the proof statement), not just a
-      // chip — filled by loadIntegrity() once /archive/verify answers.
-      if (arch.enabled) wrap.appendChild(el('p', { class: 'preserve-proof', id: 'integrityProof', hidden: 'hidden' }));
       return wrap;
+    },
+
+    // A small overflow menu (reuses the design-system dropdown chrome) for
+    // secondary actions. Each item's onPick receives the trigger button so it
+    // can show its busy state there.
+    moreMenu(items) {
+      const root = el('div', { class: 'dropdown' });
+      const trigger = el('button', { class: 'btn ghost sm', type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': 'false' }, [
+        el('span', { text: 'More' }), el('span', { class: 'dd-caret', html: ICON.chevD }),
+      ]);
+      const menu = el('div', { class: 'dd-menu', role: 'menu' });
+      menu.hidden = true;
+      const close = () => { menu.hidden = true; root.classList.remove('open'); trigger.setAttribute('aria-expanded', 'false'); document.removeEventListener('click', close); };
+      items.forEach((it) => {
+        const o = el('div', { class: 'dd-opt', role: 'menuitem', title: it.title || null }, [
+          el('span', { class: 'dd-check' }), el('span', { class: 'dd-opt-label', text: it.label }),
+        ]);
+        o.addEventListener('click', (e) => { e.stopPropagation(); close(); it.onPick(trigger); });
+        menu.appendChild(o);
+      });
+      trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (menu.hidden) { menu.hidden = false; root.classList.add('open'); trigger.setAttribute('aria-expanded', 'true'); setTimeout(() => document.addEventListener('click', close), 0); }
+        else close();
+      });
+      root.appendChild(trigger); root.appendChild(menu);
+      return root;
     },
 
     async loadIntegrity() {
@@ -3307,61 +3385,71 @@
       if (!chip) return;
       if (!v.entries) {
         chip.className = 'integrity-chip';
-        chip.textContent = 'not verified yet';
-        chip.title = 'The integrity chain has no entries yet — sessions preserved by an older version predate it. Archive now writes the first entries.';
+        chip.textContent = 'tamper check pending';
+        chip.title = 'The integrity chain has no entries yet · sessions preserved by an older version predate it. Archive now writes the first entries.';
       } else if (v.intact) {
+        // Plain-language verdict; the full proof statement (what was
+        // recomputed, what anchors it) lives in the tooltip so the banner
+        // stays one line and "intact" is never an unexplained tick.
         chip.className = 'integrity-chip ok';
-        chip.textContent = '✓ verified';
-        chip.title = fmtNum(v.entries) + ' preservation events across ' + fmtNum(v.sessions) + ' sessions, unaltered since they were kept.'
-          + (v.headDigest ? '\nHead digest: ' + v.headDigest.slice(0, 16) + ' — record it elsewhere to anchor the archive at this point in time.' : '');
+        chip.textContent = '✓ nothing altered';
+        chip.title = (v.proofStatement
+          ? v.proofStatement
+          : fmtNum(v.entries) + ' preservation events across ' + fmtNum(v.sessions) + ' sessions recomputed correctly · unaltered since they were kept.')
+          + (v.headDigest ? '\nHead digest: ' + v.headDigest.slice(0, 16) + ' · record it elsewhere to anchor the archive at this point in time.' : '');
       } else {
         chip.className = 'integrity-chip bad';
-        chip.textContent = '⚠ integrity failed';
-        chip.title = v.brokenAt || 'The archive does not match what was recorded.';
-      }
-      // The human-readable proof: what was recomputed, what anchors it, what a
-      // failure means. Shown verbatim so "verified" is never an unexplained tick.
-      const proof = $('#integrityProof');
-      if (proof && v.proofStatement) {
-        proof.hidden = false;
-        proof.textContent = v.proofStatement;
-        proof.className = 'preserve-proof' + (v.entries && !v.intact ? ' bad' : '');
+        chip.textContent = '⚠ archive was altered';
+        chip.title = (v.proofStatement ? v.proofStatement + '\n' : '') + (v.brokenAt || 'The archive does not match what was recorded.');
       }
     },
 
     async auditBundle(btn) {
-      const orig = btn.textContent;
+      const orig = btn.innerHTML;
       btn.disabled = true; btn.textContent = 'Building…';
       try {
         const r = await api('/archive/audit', { method: 'POST' });
         showBanner('Audit bundle written to ' + r.dir + ' · ' + fmtNum(r.sessions) + ' transcripts · integrity ' + (r.intact ? 'verified' : 'FAILED'), r.intact ? '' : 'danger');
       } catch (e) { handleApiError(e); }
-      btn.disabled = false; btn.textContent = orig;
+      btn.disabled = false; btn.innerHTML = orig;
     },
 
     async exportAll(btn) {
-      const orig = btn.textContent;
+      const orig = btn.innerHTML;
       btn.disabled = true; btn.textContent = 'Exporting…';
       try {
         const r = await api('/archive/export', { method: 'POST', body: { format: 'md' } });
         showBanner('Exported ' + fmtNum(r.count) + ' sessions to ' + r.dir + (r.errors ? ' · ' + r.errors + ' failed' : ''));
       } catch (e) { handleApiError(e); }
-      btn.disabled = false; btn.textContent = orig;
+      btn.disabled = false; btn.innerHTML = orig;
     },
 
+    // Compact one-liner for the banner; preserveTitle carries the full story
+    // as a tooltip so the card never wraps to a second row.
     preserveMsg(atrisk, overdue, soon, arch) {
       if (atrisk > 0) {
-        const parts = [];
-        if (overdue) parts.push(overdue + ' already overdue');
-        if (soon) parts.push(soon + ' within 7 days');
-        const risk = atrisk + ' session' + (atrisk === 1 ? '' : 's') + ' scheduled for deletion by your tools (' + parts.join(' · ') + ').';
+        const risk = atrisk + ' at risk of deletion' + (overdue ? ' (' + overdue + ' overdue)' : '');
         return arch.enabled
-          ? risk + ' ' + fmtNum(arch.count) + ' preserved here · ' + fmtBytes(arch.bytes) + '.'
-          : risk + ' Nothing is backed up yet.';
+          ? risk + ' · ' + fmtNum(arch.count) + ' preserved · ' + fmtBytes(arch.bytes)
+          : risk + ' · nothing backed up yet';
       }
       return arch.enabled
-        ? fmtNum(arch.count) + ' sessions preserved · ' + fmtBytes(arch.bytes) + (arch.dbBytes ? ' (database on disk: ' + fmtBytes(arch.dbBytes) + ')' : '') + '. Your history is safe here even if the tools delete theirs.'
-        : 'Your tools delete their own history on their own clocks. Turn on Preservation to keep a durable, on-device copy.';
+        ? fmtNum(arch.count) + ' sessions preserved · ' + fmtBytes(arch.bytes)
+        : 'Your tools delete their own history · nothing preserved yet';
+    },
+
+    preserveTitle(atrisk, overdue, soon, arch) {
+      const parts = [];
+      if (atrisk > 0) {
+        const when = [];
+        if (overdue) when.push(overdue + ' already overdue');
+        if (soon) when.push(soon + ' within 7 days');
+        parts.push(atrisk + ' session' + (atrisk === 1 ? ' is' : 's are') + ' scheduled for deletion by the tools that created them' + (when.length ? ' (' + when.join(' · ') + ')' : '') + '.');
+      }
+      parts.push(arch.enabled
+        ? fmtNum(arch.count) + ' sessions are preserved here (' + fmtBytes(arch.bytes) + (arch.dbBytes ? ' · database on disk ' + fmtBytes(arch.dbBytes) : '') + ') and stay even if the tools delete theirs.'
+        : 'Nothing is backed up yet. Turn on Preservation to keep a durable, on-device copy.');
+      return parts.join(' ');
     },
 
     async archiveNow(btn) {
@@ -3874,6 +3962,39 @@
     },
   };
 
+  /* =========================================================================
+     FIRST-LOOK WEDGE — once per day, if sessions are scheduled for deletion by
+     their tools and nothing is preserved, say so on whatever page the user
+     opened. Discovering silent data loss must not depend on finding the Agents
+     page first. Skips entirely once Preservation is on (the Agents banner
+     carries the story from there).
+     ========================================================================= */
+  async function wedgeCheck() {
+    if ((location.hash || '').startsWith('#/agents')) return; // banner already says it there
+    const KEY = 'saffev-wedge-day';
+    const today = new Date().toISOString().slice(0, 10);
+    try { if (localStorage.getItem(KEY) === today) return; } catch (e) {}
+    let ov;
+    try { ov = await api('/agents'); } catch (e) { return; }
+    const arch = ov.archive || {};
+    const atrisk = (ov.atRisk || []).reduce((a, r) => a + (r.overdue || 0) + (r.expiringSoon || 0), 0);
+    if (!atrisk || arch.enabled) return;
+    try { localStorage.setItem(KEY, today); } catch (e) {}
+    const host = ensureToastHost();
+    const t = el('div', { class: 'toast' });
+    t.appendChild(el('span', { class: 'toast-ic', html: ICON.shieldAlert }));
+    t.appendChild(el('div', { class: 'toast-b' }, [
+      el('div', { class: 'toast-t', text: atrisk + ' session' + (atrisk === 1 ? '' : 's') + ' will be deleted by your tools' }),
+      el('div', { class: 'toast-d', text: 'Nothing is backed up yet. Click to see what is at risk and keep a copy.' }),
+    ]));
+    const x = el('button', { class: 'toast-x', type: 'button', 'aria-label': 'Dismiss', text: '✕' });
+    x.addEventListener('click', (e) => { e.stopPropagation(); t.remove(); });
+    t.appendChild(x);
+    t.addEventListener('click', () => { t.remove(); location.hash = '#/agents'; });
+    host.appendChild(t);
+    setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 15000);
+  }
+
   function applyBrand() {
     document.title = BRAND.wordmark + ' · Studio';
     setText('#wmName', BRAND.wordmark);
@@ -3895,6 +4016,8 @@
       checkForUpdate();
       // Live leak alerts (its own SSE, on-device only) fire on any page.
       LeakAlerts.init();
+      // First-look wedge: surface silently-expiring history once per day.
+      wedgeCheck();
     }
   }
 

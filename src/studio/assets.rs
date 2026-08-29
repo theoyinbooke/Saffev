@@ -60,14 +60,20 @@ pub async fn serve(uri: Uri, token: Arc<str>) -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+/// HTML shells that get the install token injected. `index.html` is the SPA;
+/// `menubar.html` is the menu-bar panel the tray app loads from this same
+/// origin (see `cli::tray_panel`), so it authenticates exactly like the SPA
+/// without the tray process ever touching the keyring.
+const TOKEN_SHELLS: &[&str] = &["index.html", "menubar.html"];
+
 /// Look up `path` in the embedded assets and build a response with the right
-/// `Content-Type` (guessed from the extension) if present. `index.html` gets the
-/// install token injected as `window.__SAFFEV_TOKEN__`.
+/// `Content-Type` (guessed from the extension) if present. The HTML shells in
+/// [`TOKEN_SHELLS`] get the install token injected as `window.__SAFFEV_TOKEN__`.
 fn serve_embedded(path: &str, token: &str) -> Option<Response> {
     let asset = StudioAssets::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
 
-    let body = if path == "index.html" {
+    let body = if TOKEN_SHELLS.contains(&path) {
         let html = String::from_utf8_lossy(&asset.data);
         Body::from(inject_token(&html, token))
     } else {
@@ -129,6 +135,72 @@ mod tests {
         );
     }
 
+    /// The menu-bar panel shell is served with the token injected too, and its
+    /// stylesheet/script are embedded (the tray app has no other source).
+    #[tokio::test]
+    async fn menubar_shell_is_served_with_token_injected() {
+        let resp = serve("/menubar.html".parse::<Uri>().unwrap(), tok()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(
+            html.contains("window.__SAFFEV_TOKEN__=\"test-token-123\""),
+            "token not injected into menubar.html"
+        );
+        for file in ["menubar.css", "menubar.js"] {
+            assert!(
+                StudioAssets::get(file).is_some(),
+                "missing embedded panel asset: {file}"
+            );
+        }
+        // A plain asset never carries the token.
+        let resp = serve("/menubar.js".parse::<Uri>().unwrap(), tok()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-token-123"));
+    }
+
+    #[test]
+    fn selected_brand_mark_is_used_on_every_embedded_surface() {
+        const MARK_FINGERPRINT: &str = "M34 242H52C68 242";
+        for path in ["index.html", "menubar.html", "favicon.svg"] {
+            let asset =
+                StudioAssets::get(path).unwrap_or_else(|| panic!("missing brand surface: {path}"));
+            let text = String::from_utf8_lossy(&asset.data);
+            assert!(
+                text.contains(MARK_FINGERPRINT),
+                "{path} does not contain the selected Saffev mark"
+            );
+            assert!(
+                !text.contains("circle cx=\"17\""),
+                "{path} still contains the retired target icon"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_bar_exposes_persistent_quick_settings() {
+        let html = StudioAssets::get("menubar.html").expect("embedded menubar shell");
+        let html = String::from_utf8_lossy(&html.data);
+        assert!(html.contains("id=\"btnSettings\""));
+
+        let js = StudioAssets::get("menubar.js").expect("embedded menubar logic");
+        let js = String::from_utf8_lossy(&js.data);
+        for field in [
+            "archiveEnabled",
+            "archiveAuto",
+            "maskingEnabled",
+            "maskingDryRun",
+            "loginEnabled",
+            "method: 'PUT'",
+        ] {
+            assert!(js.contains(field), "quick settings missing {field}");
+        }
+    }
+
     #[tokio::test]
     async fn falls_back_to_index_for_client_route() {
         // An extension-less path that does not exist as an asset must serve the
@@ -155,7 +227,15 @@ mod tests {
     #[test]
     fn no_font_cdn_references_in_embedded_assets() {
         let needles = ["fonts.googleapis", "gstatic", "googleapis"];
-        for path in ["index.html", "tokens.css", "fonts.css", "styles.css"] {
+        for path in [
+            "index.html",
+            "tokens.css",
+            "fonts.css",
+            "styles.css",
+            "menubar.html",
+            "menubar.css",
+            "menubar.js",
+        ] {
             let asset =
                 StudioAssets::get(path).unwrap_or_else(|| panic!("missing embedded asset: {path}"));
             let text = String::from_utf8_lossy(&asset.data).to_lowercase();

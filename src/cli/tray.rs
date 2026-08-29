@@ -1,10 +1,19 @@
-//! macOS menu-bar launcher (Saffev.app) — feature `tray`, macOS-first.
+//! macOS menu-bar app (Saffev.app) — feature `tray`, macOS-first.
 //!
 //! A lightweight supervisor over the existing daemon lifecycle ([`super::daemon`]):
 //! it owns the macOS run loop, keeps the proxy + Studio running as a **child
-//! process** (so this launcher needs no async runtime), and offers a menu:
-//! Open Studio · Start/Stop/Restart · Open Logs · Open at Login · Quit. No new
-//! server code; all objc unsafe lives inside `tray-icon`/`tao`, so
+//! process** (so this launcher needs no async runtime), and puts two things in
+//! the status bar:
+//!
+//! - **Left-click → the panel** ([`super::tray_panel`]): a custom drop-down
+//!   widget (stats, preservation aging, privacy posture, spend, alerts, and the
+//!   service controls) rendered by a webview that loads `menubar.html` from the
+//!   running Studio. Fully custom UI, no native menu chrome.
+//! - **A plain menu** with the same actions on the non-macOS `tray` builds
+//!   (there is no panel there). On macOS the status item deliberately has no
+//!   native menu: see the note at the tray builder.
+//!
+//! No new server code; all objc unsafe lives inside `tray-icon`/`tao`/`wry`, so
 //! `#![forbid(unsafe_code)]` still holds.
 //!
 //! Supervision contract (the part users rely on):
@@ -21,14 +30,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tao::event::{Event, StartCause};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::daemon;
+use super::tray_panel::{sanitize_route, sanitize_theme, HostState, Panel, PanelMsg};
 use crate::config::Config;
 
 /// How many times the supervisor retries a daemon that died on its own before
@@ -40,6 +51,20 @@ const MAX_RESTART_ATTEMPTS: u32 = 3;
 /// running" counts as a crash. Prevents double-spawns while it initializes
 /// (keychain, DB open, port binds all happen in this window).
 const SPAWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Everything that wakes the run loop besides OS events. Tray clicks and menu
+/// picks arrive through handlers (so they're immediate, not polled on the next
+/// tick); the panel's IPC and finished background jobs come the same way.
+#[derive(Debug)]
+pub enum UserEvent {
+    Tray(TrayIconEvent),
+    Menu(MenuEvent),
+    Panel(PanelMsg),
+    /// `saffev backup` finished: `Ok(folder)` or `Err(message)`.
+    BackupDone(Result<PathBuf, String>),
+    /// The folder picker closed: `Some(path)` or `None` (cancelled).
+    ExportDirChosen(Option<PathBuf>),
+}
 
 /// Everything the supervisor tracks between ticks.
 struct Supervisor {
@@ -145,18 +170,39 @@ impl Supervisor {
         }
     }
 
+    /// Whether a spawn is still inside its grace window (the "starting" state).
+    fn is_starting(&self) -> bool {
+        !self.is_running()
+            && !self.user_stopped
+            && !self.gave_up
+            && self
+                .last_spawn
+                .map(|t| t.elapsed() < SPAWN_GRACE)
+                .unwrap_or(false)
+    }
+
+    /// Machine-readable status for the panel.
+    fn status_key(&self) -> &'static str {
+        if self.is_running() {
+            "running"
+        } else if self.gave_up {
+            "failed"
+        } else if self.user_stopped {
+            "stopped"
+        } else if self.is_starting() || self.attempts > 0 {
+            "starting"
+        } else {
+            "stopped"
+        }
+    }
+
     /// Status line for the menu.
     fn status_text(&self) -> &'static str {
-        if self.is_running() {
-            "● Running"
-        } else if self.gave_up {
-            "△ Failed to start — see Open Logs"
-        } else if self.user_stopped {
-            "○ Stopped"
-        } else if self.attempts > 0 {
-            "◌ Restarting…"
-        } else {
-            "○ Stopped"
+        match self.status_key() {
+            "running" => "● Running",
+            "failed" => "△ Failed to start — see Open Logs",
+            "starting" => "◌ Starting…",
+            _ => "○ Stopped",
         }
     }
 }
@@ -190,23 +236,106 @@ fn plan_tick(
     (true, attempts + 1, false)
 }
 
+/// The actions both UIs (panel + fallback menu) can trigger.
+#[derive(Debug, Clone, PartialEq)]
+enum Action {
+    OpenStudio(Option<String>),
+    Start,
+    Stop,
+    Restart,
+    Logs,
+    Update,
+    Backup,
+    ChooseExportDir,
+    SetLogin(Option<bool>),
+    Quit,
+}
+
+/// Map a menu id to its action. The fallback menu has no routes.
+fn menu_action(id: &str) -> Option<Action> {
+    Some(match id {
+        "open" => Action::OpenStudio(None),
+        "start" => Action::Start,
+        "stop" => Action::Stop,
+        "restart" => Action::Restart,
+        "logs" => Action::Logs,
+        "update" => Action::Update,
+        "backup" => Action::Backup,
+        "login" => Action::SetLogin(None),
+        "quit" => Action::Quit,
+        _ => return None,
+    })
+}
+
+/// Map a panel message to an action, or `None` for the panel-internal ones
+/// (ready / close / pin / resize), which the loop handles itself.
+fn panel_action(msg: &PanelMsg) -> Option<Action> {
+    Some(match msg {
+        PanelMsg::Open { route } => Action::OpenStudio(sanitize_route(route)),
+        PanelMsg::Start => Action::Start,
+        PanelMsg::Stop => Action::Stop,
+        PanelMsg::Restart => Action::Restart,
+        PanelMsg::Logs => Action::Logs,
+        PanelMsg::Update => Action::Update,
+        PanelMsg::Backup => Action::Backup,
+        PanelMsg::ChooseExportDir => Action::ChooseExportDir,
+        PanelMsg::SetLogin { enabled } => Action::SetLogin(Some(*enabled)),
+        PanelMsg::Quit => Action::Quit,
+        PanelMsg::Ready
+        | PanelMsg::Close
+        | PanelMsg::SetPinned { .. }
+        | PanelMsg::SetTheme { .. }
+        | PanelMsg::Resize { .. } => return None,
+    })
+}
+
 /// Entry point for `saffev tray`. Runs synchronously on the main thread. Never
 /// returns (the tao run loop `std::process::exit`s on Quit).
 pub fn run_tray() -> ExitCode {
     let config = Config::load().unwrap_or_default();
     let studio_url = config.studio_url();
+    let studio_port = config.ports.studio;
     let mut sup = Supervisor::new(&config);
 
     // Start the service on launch if it isn't already up.
     sup.start();
 
-    let event_loop = EventLoopBuilder::<()>::new().build();
+    #[allow(unused_mut)]
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // Menu-bar only: no Dock icon, no app switcher entry. The .app's Info.plist
+    // already says LSUIElement; this makes a terminal `saffev tray` match it.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
+    let proxy = event_loop.create_proxy();
+
+    // Route tray clicks + menu picks into the run loop as user events so they
+    // are handled the moment they happen (the channels would only be drained
+    // on the 2s tick). Must be installed BEFORE the tray/menu are built.
+    {
+        let p = Arc::new(Mutex::new(proxy.clone()));
+        let p1 = p.clone();
+        TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
+            if let Ok(p) = p1.lock() {
+                let _ = p.send_event(UserEvent::Tray(ev));
+            }
+        }));
+        let p2 = p.clone();
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            if let Ok(p) = p2.lock() {
+                let _ = p.send_event(UserEvent::Menu(ev));
+            }
+        }));
+    }
 
     let open_item = MenuItem::with_id("open", "Open Saffev Studio", true, None);
     let status_item = MenuItem::with_id("status", "Starting…", false, None);
     let start_item = MenuItem::with_id("start", "Start", true, None);
     let stop_item = MenuItem::with_id("stop", "Stop", true, None);
     let restart_item = MenuItem::with_id("restart", "Restart", true, None);
+    let backup_item = MenuItem::with_id("backup", "Back Up Archive…", true, None);
     let logs_item = MenuItem::with_id("logs", "Open Logs", true, None);
     // A DMG-installed .app can't self-update in place (see
     // `update::APP_BUNDLE_MESSAGE`), so "check for updates" honestly means:
@@ -222,6 +351,8 @@ pub fn run_tray() -> ExitCode {
     let _ = menu.append(&start_item);
     let _ = menu.append(&stop_item);
     let _ = menu.append(&restart_item);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&backup_item);
     let _ = menu.append(&logs_item);
     let _ = menu.append(&update_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -229,95 +360,329 @@ pub fn run_tray() -> ExitCode {
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit_item);
 
-    let menu_channel = MenuEvent::receiver();
     let mut tray: Option<TrayIcon> = None;
+    let mut panel: Option<Panel> = None;
+    let mut last_state: Option<HostState> = None;
+    let mut backup_running = false;
+    let mut picker_open = false;
+    // The viewer's theme choice, echoed from the Studio page so the offline
+    // card renders the same way. In-memory only: the page persists it.
+    let mut theme = String::new();
     let refresh = Duration::from_secs(2);
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + refresh);
+    let host_state =
+        |sup: &Supervisor, panel: &Option<Panel>, studio_url: &str, theme: &str| HostState {
+            app_name: crate::brand::APP_NAME.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            studio_url: studio_url.to_string(),
+            running: sup.is_running(),
+            status: sup.status_key().to_string(),
+            status_text: sup
+                .status_text()
+                .trim_start_matches(['●', '○', '◌', '△', ' '])
+                .to_string(),
+            login_enabled: login_enabled(),
+            pinned: panel.as_ref().map(|p| p.pinned).unwrap_or(false),
+            theme: theme.to_string(),
+            home_dir: crate::agents::home().to_string_lossy().to_string(),
+        };
+
+    // The supervision tick runs on a fixed deadline, checked on EVERY wake-up.
+    // Re-arming `WaitUntil(now + refresh)` per event would let a busy webview
+    // starve the timer (each event pushes the deadline out again).
+    let mut next_tick = Instant::now() + refresh;
+
+    event_loop.run(move |event, target, control_flow| {
+        let now = Instant::now();
+        if now >= next_tick {
+            next_tick = now + refresh;
+            sup.tick();
+            if let Some(p) = panel.as_mut() {
+                p.sync(sup.is_running());
+            }
+        }
+        *control_flow = ControlFlow::WaitUntil(next_tick);
+
+        let mut act: Option<Action> = None;
 
         match event {
             // macOS: the status item must be created after the app is initialized.
             Event::NewEvents(StartCause::Init) => {
-                tray = TrayIconBuilder::new()
-                    .with_menu(Box::new(menu.clone()))
+                let mut builder = TrayIconBuilder::new()
                     .with_tooltip("Saffev — local AI studio")
                     .with_icon(status_icon(sup.is_running()))
-                    .build()
-                    .ok();
-                refresh_ui(
-                    &tray,
-                    &status_item,
-                    &start_item,
-                    &stop_item,
-                    &restart_item,
-                    &sup,
+                    // macOS template images are automatically rendered white
+                    // or black for the current menu-bar appearance. The source
+                    // stays a pure alpha mask, so it remains legible in either.
+                    .with_icon_as_template(cfg!(target_os = "macos"));
+                // macOS: NO native menu on the status item. tray-icon installs
+                // the menu on the NSStatusItem itself, and AppKit pops it on
+                // any click before the crate's `menu_on_left_click(false)`
+                // override runs — verified with a synthesized click — so the
+                // panel would never open. Left AND right click open the panel
+                // (it carries every action, Quit included). Elsewhere there is
+                // no panel, so the menu stays on the primary button.
+                if !cfg!(target_os = "macos") {
+                    builder = builder.with_menu(Box::new(menu.clone()));
+                }
+                tray = builder.build().ok();
+                panel = Panel::new(target, proxy.clone(), &studio_url, studio_port);
+                tracing::debug!(
+                    "menu-bar: tray built: {}, panel built: {}",
+                    tray.is_some(),
+                    panel.is_some()
                 );
             }
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                sup.tick();
-                refresh_ui(
-                    &tray,
-                    &status_item,
-                    &start_item,
-                    &stop_item,
-                    &restart_item,
-                    &sup,
+            Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click {
+                rect,
+                button: MouseButton::Left | MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                ..
+            })) => {
+                tracing::debug!(
+                    "menu-bar: status item clicked at {:?} (panel present: {})",
+                    rect.position,
+                    panel.is_some()
                 );
+                let state = host_state(&sup, &panel, &studio_url, &theme);
+                if let Some(p) = panel.as_mut() {
+                    p.toggle(rect, &state);
+                }
+            }
+            Event::UserEvent(UserEvent::Tray(_)) => {}
+            Event::UserEvent(UserEvent::Menu(ev)) => {
+                act = menu_action(ev.id.0.as_str());
+                if act == Some(Action::SetLogin(None)) {
+                    // The checkbox already flipped itself; apply what it shows.
+                    act = Some(Action::SetLogin(Some(login_item.is_checked())));
+                }
+            }
+            Event::UserEvent(UserEvent::Panel(msg)) => match &msg {
+                PanelMsg::Ready => {
+                    let state = host_state(&sup, &panel, &studio_url, &theme);
+                    if let Some(p) = panel.as_mut() {
+                        p.mark_ready();
+                        p.push_state(&state);
+                    }
+                }
+                PanelMsg::Close => {
+                    if let Some(p) = panel.as_mut() {
+                        p.hide();
+                    }
+                }
+                PanelMsg::SetPinned { pinned } => {
+                    if let Some(p) = panel.as_mut() {
+                        p.set_pinned(*pinned);
+                    }
+                }
+                PanelMsg::SetTheme { theme: t } => {
+                    theme = sanitize_theme(t);
+                }
+                PanelMsg::Resize { height } => {
+                    if let Some(p) = panel.as_mut() {
+                        p.set_height(*height);
+                    }
+                }
+                other => act = panel_action(other),
+            },
+            Event::UserEvent(UserEvent::BackupDone(result)) => {
+                backup_running = false;
+                let js = match &result {
+                    Ok(dir) => {
+                        // Show the folder: the point of a backup is knowing where it is.
+                        let _ = std::process::Command::new("open").arg(dir).spawn();
+                        format!(
+                            "window.__saffevHost&&window.__saffevHost.notice&&window.__saffevHost.notice({});",
+                            serde_json::json!({
+                                "kind": "ok",
+                                "title": "Backup written",
+                                "detail": dir.display().to_string(),
+                            })
+                        )
+                    }
+                    Err(msg) => format!(
+                        "window.__saffevHost&&window.__saffevHost.notice&&window.__saffevHost.notice({});",
+                        serde_json::json!({
+                            "kind": "error",
+                            "title": "Backup failed",
+                            "detail": msg,
+                        })
+                    ),
+                };
+                if let Some(p) = panel.as_ref() {
+                    p.eval(&js);
+                }
+            }
+            Event::UserEvent(UserEvent::ExportDirChosen(path)) => {
+                picker_open = false;
+                let json = serde_json::to_string(&path.map(|p| p.to_string_lossy().to_string()))
+                    .unwrap_or_else(|_| "null".into());
+                if let Some(p) = panel.as_ref() {
+                    p.eval(&format!(
+                        "window.__saffevHost&&window.__saffevHost.exportDirChosen&&window.__saffevHost.exportDirChosen({json});"
+                    ));
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Focused(false),
+                ..
+            } => {
+                // The folder picker is a separate window; losing focus to it
+                // must not close the panel its result goes back to.
+                if !picker_open {
+                    if let Some(p) = panel.as_mut() {
+                        p.on_blur();
+                    }
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                if let Some(p) = panel.as_mut() {
+                    p.hide();
+                }
             }
             _ => {}
         }
 
-        while let Ok(ev) = menu_channel.try_recv() {
-            match ev.id.0.as_str() {
-                "open" => open_url(&studio_url),
-                "start" => sup.start(),
-                "stop" => sup.stop(),
-                "restart" => sup.restart(),
-                "logs" => open_logs(&sup.log_path),
-                "update" => open_url(crate::update::RELEASES_URL),
-                "login" => {
-                    set_login(login_item.is_checked());
+        if let Some(action) = act {
+            match action {
+                Action::OpenStudio(route) => {
+                    let url = match route {
+                        Some(r) => format!("{studio_url}/{r}"),
+                        None => studio_url.clone(),
+                    };
+                    open_url(&url);
+                    if let Some(p) = panel.as_mut() {
+                        if !p.pinned {
+                            p.hide();
+                        }
+                    }
+                }
+                Action::Start => sup.start(),
+                Action::Stop => sup.stop(),
+                Action::Restart => sup.restart(),
+                Action::Logs => open_logs(&sup.log_path),
+                Action::Update => open_url(crate::update::RELEASES_URL),
+                Action::Backup => {
+                    if !backup_running {
+                        backup_running = true;
+                        spawn_backup(sup.config_path.clone(), proxy.clone());
+                        if let Some(p) = panel.as_ref() {
+                            p.eval(
+                                "window.__saffevHost&&window.__saffevHost.notice&&window.__saffevHost.notice({\"kind\":\"busy\",\"title\":\"Backing up…\",\"detail\":\"Encrypted copy of the archive + restore notes\"});",
+                            );
+                        }
+                    }
+                }
+                Action::ChooseExportDir => {
+                    if !picker_open {
+                        picker_open = true;
+                        spawn_folder_picker(proxy.clone());
+                    }
+                }
+                Action::SetLogin(want) => {
+                    set_login(want.unwrap_or_else(|| !login_enabled()));
                     // Re-sync the checkbox to what actually happened on disk, so
                     // a failed write can't leave it claiming a state it isn't in.
                     login_item.set_checked(login_enabled());
                 }
-                "quit" => {
+                Action::Quit => {
                     // Quitting the menu-bar app leaves the service running by
                     // design (Quit != Stop). Use Stop to actually shut it down.
                     *control_flow = ControlFlow::Exit;
                 }
-                _ => {}
             }
-            refresh_ui(
-                &tray,
-                &status_item,
-                &start_item,
-                &stop_item,
-                &restart_item,
-                &sup,
+            if let Some(p) = panel.as_mut() {
+                p.sync(sup.is_running());
+            }
+        }
+
+        // Refresh the icon + fallback menu, and push state to the panel only
+        // when something changed (the page re-renders on every push).
+        let running = sup.is_running();
+        if let Some(t) = &tray {
+            let _ = t.set_icon_with_as_template(
+                Some(status_icon(running)),
+                cfg!(target_os = "macos"),
             );
+        }
+        status_item.set_text(sup.status_text());
+        start_item.set_enabled(!running);
+        stop_item.set_enabled(running);
+        restart_item.set_enabled(running);
+        backup_item.set_enabled(!backup_running);
+
+        let state = host_state(&sup, &panel, &studio_url, &theme);
+        if last_state.as_ref() != Some(&state) {
+            if let Some(p) = panel.as_ref() {
+                p.push_state(&state);
+            }
+            last_state = Some(state);
         }
     });
 }
 
-fn refresh_ui(
-    tray: &Option<TrayIcon>,
-    status_item: &MenuItem,
-    start_item: &MenuItem,
-    stop_item: &MenuItem,
-    restart_item: &MenuItem,
-    sup: &Supervisor,
-) {
-    let running = sup.is_running();
-    if let Some(t) = tray {
-        let _ = t.set_icon(Some(status_icon(running)));
-    }
-    status_item.set_text(sup.status_text());
-    // Only the actions that can do something are clickable.
-    start_item.set_enabled(!running);
-    stop_item.set_enabled(running);
-    restart_item.set_enabled(running);
+/// Native folder picker (AppleScript `choose folder`) on a worker thread. The
+/// prompt is a constant; the only user-influenced value is the RESULT, which
+/// is data. Cancel (non-zero exit) reports `None`.
+fn spawn_folder_picker(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg("POSIX path of (choose folder with prompt \"Where should Saffev keep backups and exports?\")")
+            .output();
+        let chosen = match out {
+            Ok(o) if o.status.success() => {
+                let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(p.trim_end_matches('/')))
+                }
+            }
+            _ => None,
+        };
+        let _ = proxy.send_event(UserEvent::ExportDirChosen(chosen));
+    });
+}
+
+/// Run `saffev backup` as a child (it needs the store + keyring key, which the
+/// daemon path owns) on a worker thread, and report the created folder.
+fn spawn_backup(config_path: PathBuf, proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        let result = (|| -> Result<PathBuf, String> {
+            let exe = daemon::current_exe_on_disk().map_err(|e| e.to_string())?;
+            let out = std::process::Command::new(exe)
+                .arg("--config")
+                .arg(&config_path)
+                .arg("--no-color")
+                .arg("backup")
+                .output()
+                .map_err(|e| e.to_string())?;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let msg = stderr
+                    .lines()
+                    .chain(stdout.lines())
+                    .last()
+                    .unwrap_or("backup exited with an error");
+                return Err(msg.trim().to_string());
+            }
+            // The command prints the folder it wrote; find the path on any line.
+            stdout
+                .lines()
+                .flat_map(|l| l.split_whitespace())
+                .map(|w| w.trim_matches(|c: char| c == '"' || c == '\'' || c == ':' || c == ','))
+                .filter(|w| w.contains("Saffev-Backup-"))
+                .map(PathBuf::from)
+                .find(|p| p.is_dir())
+                .ok_or_else(|| "backup finished but its folder was not reported".to_string())
+        })();
+        let _ = proxy.send_event(UserEvent::BackupDone(result));
+    });
 }
 
 fn open_url(url: &str) {
@@ -336,30 +701,75 @@ fn open_logs(path: &Path) {
     let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
-/// A 32×32 target glyph — teal when running, dim grey when stopped.
-fn status_icon(running: bool) -> Icon {
-    let size = 32usize;
-    let (r, g, b) = if running {
-        (15u8, 118, 110)
+/// A hand-rasterized 32×32 alpha mask of the canonical Saffev recorder mark.
+/// `#` is fully opaque, `+` is the antialiased edge, and spaces are clear.
+const STATUS_ICON_MASK: [&str; 32] = [
+    "                                ",
+    "          ++++++++++++          ",
+    "        +##############+        ",
+    "       ##################       ",
+    "      +##################+      ",
+    "      ####################      ",
+    "      ####################      ",
+    "      ####################      ",
+    "     +####################+     ",
+    "     +#############+++####+     ",
+    "     +############+    ###+     ",
+    "     +############ +##++##+     ",
+    "     ############++#### +##     ",
+    "     ############+###### ##     ",
+    "    +###########+#######+ ++++  ",
+    "      +#########+########+      ",
+    "  +++++ #######+###########+++  ",
+    "    +###+######+###########+    ",
+    "     ###++####++###########     ",
+    "     ####++##++############     ",
+    "     +####    ############+     ",
+    "     +#####+++############+     ",
+    "     +####################+     ",
+    "     +####################+     ",
+    "      ####################      ",
+    "      ####################      ",
+    "      ####################      ",
+    "      +##################+      ",
+    "       ##################       ",
+    "        +##############+        ",
+    "          ++++++++++++          ",
+    "                                ",
+];
+
+fn status_icon_rgba(running: bool) -> Vec<u8> {
+    let rgb = if cfg!(target_os = "macos") {
+        // NSImage template content is defined by alpha, not RGB.
+        (0, 0, 0)
+    } else if running {
+        (17, 118, 110)
     } else {
         (128, 128, 128)
     };
-    let (cx, cy) = (15.5f32, 15.5f32);
-    let mut rgba = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let d = (dx * dx + dy * dy).sqrt();
-            let on = (9.0..=13.0).contains(&d) || d <= 4.5;
-            let i = (y * size + x) * 4;
-            rgba[i] = r;
-            rgba[i + 1] = g;
-            rgba[i + 2] = b;
-            rgba[i + 3] = if on { 255 } else { 0 };
+    let mut rgba = Vec::with_capacity(32 * 32 * 4);
+    for row in STATUS_ICON_MASK {
+        for px in row.bytes() {
+            let base_alpha = match px {
+                b'#' => 255,
+                b'+' => 128,
+                _ => 0,
+            };
+            let alpha = if running {
+                base_alpha
+            } else {
+                ((base_alpha as u16 * 112) / 255) as u8
+            };
+            rgba.extend_from_slice(&[rgb.0, rgb.1, rgb.2, alpha]);
         }
     }
-    Icon::from_rgba(rgba, size as u32, size as u32).expect("valid icon")
+    rgba
+}
+
+/// The canonical Saffev mark for the status item. On macOS this is installed
+/// as a template image so AppKit supplies the correct menu-bar foreground.
+fn status_icon(running: bool) -> Icon {
+    Icon::from_rgba(status_icon_rgba(running), 32, 32).expect("valid icon")
 }
 
 // ----- Open at Login (a per-user LaunchAgent) -----
@@ -444,5 +854,45 @@ mod tests {
         // …the fourth gives up (visible failed state), and stays given up.
         assert_eq!(plan_tick(false, false, false, 3, false), (false, 3, true));
         assert_eq!(plan_tick(false, false, true, 3, false), (false, 3, true));
+    }
+
+    #[test]
+    fn both_uis_map_onto_the_same_actions() {
+        assert_eq!(menu_action("start"), Some(Action::Start));
+        assert_eq!(menu_action("backup"), Some(Action::Backup));
+        assert_eq!(menu_action("bogus"), None);
+        assert_eq!(panel_action(&PanelMsg::Stop), Some(Action::Stop));
+        assert_eq!(
+            panel_action(&PanelMsg::Open {
+                route: "#/agents".into()
+            }),
+            Some(Action::OpenStudio(Some("#/agents".into())))
+        );
+        // A tampered route degrades to the Studio root, never to an argument.
+        assert_eq!(
+            panel_action(&PanelMsg::Open {
+                route: "--evil".into()
+            }),
+            Some(Action::OpenStudio(None))
+        );
+        // Panel-internal messages are not actions.
+        assert_eq!(panel_action(&PanelMsg::Ready), None);
+        assert_eq!(panel_action(&PanelMsg::Resize { height: 1.0 }), None);
+    }
+
+    #[test]
+    fn status_icon_is_the_canonical_transparent_mark() {
+        assert!(STATUS_ICON_MASK.iter().all(|row| row.len() == 32));
+        let running = status_icon_rgba(true);
+        let stopped = status_icon_rgba(false);
+        assert_eq!(running.len(), 32 * 32 * 4);
+        assert_eq!(running[3], 0, "top-left must stay transparent");
+        let running_alpha: u32 = running.iter().skip(3).step_by(4).map(|a| *a as u32).sum();
+        let stopped_alpha: u32 = stopped.iter().skip(3).step_by(4).map(|a| *a as u32).sum();
+        assert!(running_alpha > 0);
+        assert!(
+            stopped_alpha < running_alpha,
+            "stopped state should be visibly dimmer"
+        );
     }
 }

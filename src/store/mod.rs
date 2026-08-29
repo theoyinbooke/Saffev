@@ -586,6 +586,9 @@ pub struct ArchiveStats {
     pub count: u64,
     pub messages: u64,
     pub bytes: u64,
+    /// When the newest session was (re)archived — "has anything changed since
+    /// the last backup?" compares against this.
+    pub latest_ts: Option<i64>,
 }
 
 /// A cloneable handle the proxy and control plane use to enqueue writes and run
@@ -606,7 +609,16 @@ struct StoreInner {
     tx: mpsc::Sender<WriteOp>,
     /// Path to the on-disk DB, used to open read connections on demand.
     path: std::path::PathBuf,
+    /// Idle read connections, reused across reads. Opening a SQLCipher
+    /// connection is not free (key handshake + KDF), and under a polling
+    /// client every read used to open — and, while slow, hold — a fresh
+    /// connection, which once exhausted the 256-fd limit macOS gives a
+    /// launchd-spawned app. Capped at [`READ_POOL_MAX`].
+    readers: std::sync::Mutex<Vec<Connection>>,
 }
+
+/// Idle read connections kept for reuse; extra ones are simply dropped.
+const READ_POOL_MAX: usize = 4;
 
 impl Store {
     /// Open (creating if needed) the database at `path`, run migrations, and
@@ -640,7 +652,11 @@ impl Store {
         spawn_writer(conn, rx);
 
         Ok(Store {
-            inner: Arc::new(StoreInner { tx, path }),
+            inner: Arc::new(StoreInner {
+                tx,
+                path,
+                readers: std::sync::Mutex::new(Vec::new()),
+            }),
         })
     }
 
@@ -668,17 +684,32 @@ impl Store {
             .map_err(|_| Error::Store("writer thread gone".into()))
     }
 
-    /// Run a read query on a fresh connection on the blocking pool. WAL mode
-    /// lets these run concurrently with the single writer.
+    /// Run a read query on the blocking pool, on an idle pooled connection
+    /// when one exists (else a fresh one). WAL mode lets these run
+    /// concurrently with the single writer. A connection goes back to the pool
+    /// only after a successful read, so a failed statement never leaves a
+    /// half-broken connection for the next caller.
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
-        let path = self.inner.path.clone();
+        let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<T> {
-            let conn = open_read_connection(&path)?;
-            f(&conn)
+            let pooled = inner.readers.lock().ok().and_then(|mut p| p.pop());
+            let conn = match pooled {
+                Some(c) => c,
+                None => open_read_connection(&inner.path)?,
+            };
+            let out = f(&conn);
+            if out.is_ok() {
+                if let Ok(mut p) = inner.readers.lock() {
+                    if p.len() < READ_POOL_MAX {
+                        p.push(conn);
+                    }
+                }
+            }
+            out
         })
         .await
         .map_err(|e| Error::Store(format!("read join: {e}")))?
@@ -1335,7 +1366,12 @@ impl Store {
                 [],
                 |r| Ok(r.get::<_, i64>(0)? as u64),
             )?;
+            let latest_ts: Option<i64> =
+                conn.query_row("SELECT MAX(archived_ts) FROM archived_sessions", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })?;
             Ok(ArchiveStats {
+                latest_ts,
                 count,
                 messages,
                 bytes,
@@ -1408,7 +1444,7 @@ fn open_read_connection(path: &Path) -> Result<Connection> {
 /// (headless/CI/dev override — see [`keys::get_or_create_db_key`]).
 #[cfg(feature = "sqlcipher")]
 fn apply_key(conn: &Connection) -> Result<()> {
-    let key = keys::get_or_create_db_key()?;
+    let key = cached_db_key()?;
     // PRAGMA key must run first, before touching any table. Use a quoted string
     // key (passphrase form); SQLCipher derives the actual key via KDF.
     conn.pragma_update(None, "key", key.as_str())?;
@@ -1424,6 +1460,22 @@ fn apply_key(conn: &Connection) -> Result<()> {
 #[inline]
 fn apply_key(_conn: &Connection) -> Result<()> {
     Ok(())
+}
+
+/// The DB key, fetched from the env/keyring ONCE per process. Every new
+/// connection used to call into the OS keyring; besides the cost, a pending
+/// keychain permission prompt then blocked every read behind it and reads
+/// piled up until the process ran out of file descriptors. The key cannot
+/// change while the process lives, so caching it is exact.
+#[cfg(feature = "sqlcipher")]
+fn cached_db_key() -> Result<String> {
+    static DB_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(k) = DB_KEY.get() {
+        return Ok(k.clone());
+    }
+    let key = keys::get_or_create_db_key()?;
+    let _ = DB_KEY.set(key.clone());
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------

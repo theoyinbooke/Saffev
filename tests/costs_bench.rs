@@ -140,7 +140,12 @@ fn costs_match_ccusage() {
         );
         // Per-model rows match by name and cost.
         let ref_models = theirs["modelBreakdowns"].as_array().unwrap();
-        assert_eq!(ours.by_model.len(), ref_models.len(), "model rows on {}", ours.date);
+        assert_eq!(
+            ours.by_model.len(),
+            ref_models.len(),
+            "model rows on {}",
+            ours.date
+        );
         for rm in ref_models {
             let name = rm["modelName"].as_str().unwrap();
             let ours_m = ours
@@ -192,7 +197,12 @@ fn costs_match_ccusage() {
         );
         let d = rel_delta(ours.totals.cost_usd, theirs["costUSD"].as_f64().unwrap());
         max_cost_delta = max_cost_delta.max(d);
-        assert!(d <= tol, "block cost delta {:.4} > 2% at {}", d, ours.start_ts);
+        assert!(
+            d <= tol,
+            "block cost delta {:.4} > 2% at {}",
+            d,
+            ours.start_ts
+        );
     }
     deltas.push(serde_json::json!({
         "compared": "blocks (9: 5 usage + 4 gaps)",
@@ -217,9 +227,17 @@ fn costs_match_ccusage() {
     // ---- Monthly rows -----------------------------------------------------------
     let ours_monthly = usage::monthly(&events, &pricing);
     let ref_monthly = reference["monthly"]["monthly"].as_array().unwrap();
-    assert_eq!(ours_monthly.len(), ref_monthly.len(), "monthly row count differs");
+    assert_eq!(
+        ours_monthly.len(),
+        ref_monthly.len(),
+        "monthly row count differs"
+    );
     for (ours, theirs) in ours_monthly.iter().zip(ref_monthly) {
-        assert_eq!(ours.month, theirs["period"].as_str().unwrap(), "monthly period");
+        assert_eq!(
+            ours.month,
+            theirs["period"].as_str().unwrap(),
+            "monthly period"
+        );
         let d = rel_delta(ours.totals.cost_usd, theirs["totalCost"].as_f64().unwrap());
         max_cost_delta = max_cost_delta.max(d);
         assert!(d <= tol, "month {} cost delta {:.4} > 2%", ours.month, d);
@@ -250,13 +268,19 @@ fn costs_match_ccusage() {
         .iter()
         .find(|e| e.stored_cost_usd.is_some())
         .expect("stored-cost event present");
-    assert!((stored.cost(&pricing) - 0.1234).abs() < 1e-9, "stored costUSD not trusted");
+    assert!(
+        (stored.cost(&pricing) - 0.1234).abs() < 1e-9,
+        "stored costUSD not trusted"
+    );
     // The entry at exactly block_start+5h stays IN the block (strict >).
     let day23_block = ours_blocks
         .iter()
         .find(|b| !b.is_gap && utc_of(b.start_ts).starts_with("2026-07-23"))
         .expect("2026-07-23 block");
-    assert_eq!(day23_block.totals.entries, 3, "boundary entry left its block");
+    assert_eq!(
+        day23_block.totals.entries, 3,
+        "boundary entry left its block"
+    );
 
     // ---- Artifact ---------------------------------------------------------------
     let out = serde_json::json!({

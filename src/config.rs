@@ -329,6 +329,40 @@ impl Default for AnalysisConfig {
     }
 }
 
+/// Coding-agent reader options.
+///
+/// Every reader knows where its tool keeps history, except Aider, which has no
+/// central store and must be found by walking for `.aider.chat.history.md`.
+/// That walk stays out of macOS's protected folders (Desktop, Documents,
+/// Downloads, Music, Movies, Pictures…) so a first launch never fires a
+/// permission prompt for data a code tool has no reason to touch. If your
+/// Aider projects live in one of those folders, list the exact directories
+/// here and macOS will ask for that folder — once, and for a stated reason.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Extra directories to scan for Aider chat histories, e.g.
+    /// `["~/Documents/code"]`. Leading `~` is expanded. Each is walked with
+    /// the same depth/size bounds as the home walk.
+    pub aider_roots: Vec<String>,
+}
+
+impl AgentsConfig {
+    /// The configured Aider roots as absolute paths (`~` expanded), existing
+    /// directories only.
+    pub fn aider_root_paths(&self) -> Vec<PathBuf> {
+        self.aider_roots
+            .iter()
+            .map(|r| match r.strip_prefix("~/") {
+                Some(rest) => crate::agents::home().join(rest),
+                None if r == "~" => crate::agents::home(),
+                None => PathBuf::from(r),
+            })
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+}
+
 /// Preservation / archive config — Saffev's durable, encrypted copy of your
 /// coding-agent history, so a session survives the source app deleting it.
 ///
@@ -641,6 +675,12 @@ impl PricingConfig {
 /// The full Saffev configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// The TOML file this config was loaded from, so Settings write-through
+    /// goes back to the SAME file — including an explicit `--config` whose
+    /// folder differs from `data_dir`. Never serialized; `None` for a config
+    /// built in memory (then [`Config::config_path`] is used).
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     /// Interception mode.
     #[serde(default)]
     pub mode: Mode,
@@ -688,6 +728,10 @@ pub struct Config {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// Coding-agent reader options (extra Aider scan roots).
+    #[serde(default)]
+    pub agents: AgentsConfig,
+
     /// Opt-in local monitor rules + desktop notifications (G6). Off by default.
     #[serde(default)]
     pub monitors: MonitorsConfig,
@@ -724,6 +768,7 @@ fn default_data_dir() -> PathBuf {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            source_path: None,
             mode: Mode::default(),
             ports: PortsConfig::default(),
             payload_storage: false,
@@ -738,6 +783,7 @@ impl Default for Config {
             policy_file: None,
             export_dir: None,
             archive: ArchiveConfig::default(),
+            agents: AgentsConfig::default(),
             monitors: MonitorsConfig::default(),
         }
     }
@@ -833,19 +879,25 @@ impl Config {
             }
             cfg.validate()?;
             cfg.save_to(path)?;
+            cfg.source_path = Some(path.to_path_buf());
             return Ok(cfg);
         }
 
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("reading config {}: {e}", path.display())))?;
-        let cfg: Config = toml::from_str(&text)?;
+        let mut cfg: Config = toml::from_str(&text)?;
         cfg.validate()?;
+        cfg.source_path = Some(path.to_path_buf());
         Ok(cfg)
     }
 
-    /// Persist this config back to its TOML file (Settings write-through).
+    /// Persist this config back to the TOML file it was loaded from (Settings
+    /// write-through); a config built in memory goes to `data_dir/saffev.toml`.
     pub fn save(&self) -> Result<()> {
-        let path = self.config_path();
+        let path = self
+            .source_path
+            .clone()
+            .unwrap_or_else(|| self.config_path());
         self.save_to(&path)
     }
 
@@ -1045,6 +1097,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `--config` file whose folder is not `data_dir` must be the file that
+    /// Settings writes back to — it used to save to `data_dir/saffev.toml`
+    /// and silently leave the loaded file untouched.
+    #[test]
+    fn save_writes_back_to_the_loaded_path() {
+        let root = std::env::temp_dir().join(format!("saffev-cfg-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let file = root.join("conf").join("custom.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "data_dir = {:?}\n[ports]\nproxy = 18088\nstudio = 17100\n",
+                root.join("data")
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::load_from(&file).unwrap();
+        assert_eq!(cfg.source_path.as_deref(), Some(file.as_path()));
+        cfg.archive.enabled = true;
+        cfg.save().unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("enabled = true"),
+            "loaded file not updated: {text}"
+        );
+        assert!(
+            !root.join("data").join("saffev.toml").exists(),
+            "wrote to data_dir instead"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Unique throwaway directory under the OS temp dir. The counter keeps paths
     /// distinct even within a single test process (process id alone is shared).

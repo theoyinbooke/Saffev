@@ -3,8 +3,10 @@
 # Build Saffev.app — a double-click macOS menu-bar launcher.
 #
 # It bundles the release `saffev` binary (built with the `tray` feature) and runs
-# `saffev tray`: a menu-bar item that keeps the proxy + Studio running and offers
-# Open Studio / Start-Stop-Restart / Open at Login / Quit. No terminal required.
+# `saffev tray`: a menu-bar item that keeps the proxy + Studio running. Left-click
+# opens the drop-down panel (stats, preservation aging, privacy, spend, alerts,
+# quick settings, and service controls — a WKWebView loading /menubar.html from
+# the local Studio). No terminal required and no Dock tile.
 #
 # Usage:
 #   scripts/package-macos-app.sh [--sign "Developer ID Application: NAME (TEAMID)"]
@@ -77,42 +79,32 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-# App icon (best-effort): draw the Saffev target as a PNG (pure-stdlib Python),
-# fan out to an .iconset with sips, then iconutil -> .icns. Skipped if tools are
-# missing (the app still works, just with a generic icon).
-if command -v python3 >/dev/null && command -v sips >/dev/null && command -v iconutil >/dev/null; then
-  echo "==> Generating app icon…"
-  TMP="$(mktemp -d)"
-  python3 - "$TMP/icon.png" <<'PY'
-import zlib, struct, sys, math
-W = H = 1024
-rows = bytearray()
-cx = cy = W / 2.0
-for y in range(H):
-    rows.append(0)  # PNG filter type 0 per scanline
-    for x in range(W):
-        d = math.hypot(x - cx, y - cy)
-        ring = (W * 0.27) <= d <= (W * 0.40)
-        dot = d <= (W * 0.13)
-        rows += bytes((15, 118, 110, 255)) if (ring or dot) else bytes((0, 0, 0, 0))
-def chunk(t, d):
-    return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
-png = b'\x89PNG\r\n\x1a\n'
-png += chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 6, 0, 0, 0))
-png += chunk(b'IDAT', zlib.compress(bytes(rows), 9))
-png += chunk(b'IEND', b'')
-open(sys.argv[1], 'wb').write(png)
-PY
-  ICONSET="$TMP/Saffev.iconset"; mkdir -p "$ICONSET"
-  for s in 16 32 128 256 512; do
-    sips -z "$s" "$s" "$TMP/icon.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
-    sips -z "$((s * 2))" "$((s * 2))" "$TMP/icon.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
-  done
-  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Saffev.icns"
-  rm -rf "$TMP"
-else
-  echo "   (skipping icon: python3/sips/iconutil not all available)"
+# A menu-bar app must remain an agent bundle. Fail the package rather than
+# quietly shipping a build that appears in the Dock after login or restart.
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")" != "true" ]]; then
+  echo "packaging error: LSUIElement is not true" >&2
+  exit 1
 fi
+
+# App icon: rasterize the checked-in production artwork, fan out to an iconset,
+# then compile the format macOS expects. A missing icon is a packaging failure,
+# never a silent fallback to the generic executable tile.
+ICON_SOURCE="packaging/macos/Saffev-AppIcon.svg"
+for tool in sips iconutil; do
+  command -v "$tool" >/dev/null || { echo "packaging error: missing $tool" >&2; exit 1; }
+done
+[[ -f "$ICON_SOURCE" ]] || { echo "packaging error: missing $ICON_SOURCE" >&2; exit 1; }
+echo "==> Generating app icon from ${ICON_SOURCE}…"
+TMP="$(mktemp -d)"
+sips -s format png "$ICON_SOURCE" --out "$TMP/icon.png" >/dev/null
+ICONSET="$TMP/Saffev.iconset"; mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+  sips -z "$s" "$s" "$TMP/icon.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z "$((s * 2))" "$((s * 2))" "$TMP/icon.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Saffev.icns"
+rm -rf "$TMP"
+[[ -s "$APP/Contents/Resources/Saffev.icns" ]] || { echo "packaging error: Saffev.icns was not created" >&2; exit 1; }
 
 # Codesign if a Developer ID was supplied (unsigned still runs after a
 # right-click -> Open on first launch). --timestamp is required: notarytool

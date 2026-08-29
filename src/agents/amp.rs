@@ -39,7 +39,9 @@ impl AmpReader {
     /// Fixture seam: read an explicit threads dir. See
     /// `tests/agents_bench.rs`.
     pub fn with_root(threads_dir: PathBuf) -> Self {
-        Self { threads: threads_dir }
+        Self {
+            threads: threads_dir,
+        }
     }
 
     /// `$AMP_DATA_DIR/threads` else `$XDG_DATA_HOME/amp/threads` else
@@ -77,9 +79,11 @@ impl AmpReader {
     fn parse(path: &Path, with_messages: bool) -> Option<AgentSessionDetail> {
         let text = fs::read_to_string(path).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
-        let raw_id = v.get("id").and_then(Value::as_str).map(String::from).or_else(|| {
-            path.file_stem().map(|s| s.to_string_lossy().to_string())
-        })?;
+        let raw_id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))?;
         let created = v.get("created").and_then(Value::as_i64).unwrap_or(0);
         let title = v
             .get("title")
@@ -99,7 +103,9 @@ impl AmpReader {
                     .and_then(Value::as_str)
                     .and_then(|u| u.strip_prefix("file://").map(String::from))
                     .or_else(|| {
-                        t.get("displayName").and_then(Value::as_str).map(String::from)
+                        t.get("displayName")
+                            .and_then(Value::as_str)
+                            .map(String::from)
                     })
             });
 
@@ -221,10 +227,7 @@ impl AmpReader {
                                     2000,
                                 ),
                                 ts,
-                                tool_name: b
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
+                                tool_name: b.get("name").and_then(Value::as_str).map(String::from),
                             });
                         }
                     }

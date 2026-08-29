@@ -251,7 +251,10 @@ mod tests {
         assert_eq!(s.cache_tokens, 5000);
         assert_eq!(s.output_tokens, 812);
         assert_eq!(s.project.as_deref(), Some("/home/dev/p"));
-        assert!(s.model.is_none(), "Roo does not persist the model — never guess");
+        assert!(
+            s.model.is_none(),
+            "Roo does not persist the model — never guess"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

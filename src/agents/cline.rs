@@ -131,9 +131,7 @@ impl ClineReader {
     /// Fallbacks from `ui_messages.json`: title (first `say:"task"`), token
     /// sums (`api_req_started` JSON payloads), and last activity ts. Shared
     /// with the Roo Code reader (same file heritage).
-    pub(super) fn ui_fallback(
-        task_dir: &Path,
-    ) -> (Option<String>, u64, u64, u64, u64, i64) {
+    pub(super) fn ui_fallback(task_dir: &Path) -> (Option<String>, u64, u64, u64, u64, i64) {
         let (mut title, mut inp, mut outp, mut cache, mut cache_w, mut last_ts) =
             (None, 0u64, 0u64, 0u64, 0u64, 0i64);
         let Ok(text) = fs::read_to_string(task_dir.join("ui_messages.json")) else {
@@ -252,7 +250,9 @@ impl ClineReader {
                                         role: Role::Assistant,
                                         kind: MessageKind::ToolUse,
                                         content: super::claude_code::truncate(
-                                            &b.get("input").map(Value::to_string).unwrap_or_default(),
+                                            &b.get("input")
+                                                .map(Value::to_string)
+                                                .unwrap_or_default(),
                                             2000,
                                         ),
                                         ts,
@@ -269,9 +269,7 @@ impl ClineReader {
                                         Some(Value::String(s)) => s.clone(),
                                         Some(Value::Array(parts)) => parts
                                             .iter()
-                                            .filter_map(|p| {
-                                                p.get("text").and_then(Value::as_str)
-                                            })
+                                            .filter_map(|p| p.get("text").and_then(Value::as_str))
                                             .collect::<Vec<_>>()
                                             .join("\n"),
                                         _ => String::new(),
@@ -307,8 +305,7 @@ impl ClineReader {
         let task_dir = root.join("tasks").join(task_id);
         let (messages, msg_count, tool_count, tmodel, tlast, tfirst) =
             Self::transcript(&task_dir, with_messages);
-        let (ui_title, ui_in, ui_out, ui_cache, ui_cache_w, ui_last) =
-            Self::ui_fallback(&task_dir);
+        let (ui_title, ui_in, ui_out, ui_cache, ui_cache_w, ui_last) = Self::ui_fallback(&task_dir);
         // A task with a corrupt transcript still lists via its history row /
         // ui stream; a task with neither transcript nor metadata is nothing.
         if msg_count == 0 && row.is_none() && ui_title.is_none() {
@@ -400,7 +397,11 @@ impl AgentReader for ClineReader {
         for root in &self.roots {
             files.push(root.join("state/taskHistory.json"));
             for t in Self::tasks(root) {
-                files.push(root.join("tasks").join(&t).join("api_conversation_history.json"));
+                files.push(
+                    root.join("tasks")
+                        .join(&t)
+                        .join("api_conversation_history.json"),
+                );
                 files.push(root.join("tasks").join(&t).join("ui_messages.json"));
             }
         }
@@ -446,7 +447,10 @@ mod tests {
         assert_eq!(s.cache_tokens, 150);
         assert_eq!(s.project.as_deref(), Some("/home/dev/p"));
         assert_eq!(s.started_ts, 1753600100000);
-        assert_eq!(s.message_count, 0, "corrupt transcript honestly has no turns");
+        assert_eq!(
+            s.message_count, 0,
+            "corrupt transcript honestly has no turns"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

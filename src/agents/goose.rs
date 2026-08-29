@@ -172,8 +172,14 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         id: r.get(0)?,
         name: r.get(1).unwrap_or(None),
         working_dir: r.get(2).unwrap_or(None),
-        created_at: r.get::<_, Option<String>>(3).unwrap_or(None).unwrap_or_default(),
-        updated_at: r.get::<_, Option<String>>(4).unwrap_or(None).unwrap_or_default(),
+        created_at: r
+            .get::<_, Option<String>>(3)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        updated_at: r
+            .get::<_, Option<String>>(4)
+            .unwrap_or(None)
+            .unwrap_or_default(),
         provider: r.get(5).unwrap_or(None),
         model_name: r.get(6).unwrap_or(None),
         inp: r.get(7).unwrap_or(0),

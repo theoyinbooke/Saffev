@@ -58,7 +58,12 @@ pub fn commits_for(
 
 /// One `git log` invocation. `None` = the command failed (caller decides
 /// whether to retry without the branch).
-fn run_log(project: &Path, branch: Option<&str>, since: i64, until: i64) -> Option<Vec<CommitLink>> {
+fn run_log(
+    project: &Path,
+    branch: Option<&str>,
+    since: i64,
+    until: i64,
+) -> Option<Vec<CommitLink>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(project).arg("log");
     // All OUR options first — `@<unix>` is git's own unix-epoch date form, so
@@ -91,7 +96,9 @@ fn run_log(project: &Path, branch: Option<&str>, since: i64, until: i64) -> Opti
         else {
             continue; // malformed line — skip it, keep the rest
         };
-        let Ok(secs) = ct.parse::<i64>() else { continue };
+        let Ok(secs) = ct.parse::<i64>() else {
+            continue;
+        };
         if hash.is_empty() {
             continue;
         }

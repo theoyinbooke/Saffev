@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="color-scheme" content="light dark" />
+<title>Saffev</title>
+<style>
+  /* Self-contained: shown while the service (and so the Studio, which serves
+     the real panel) is down. Mirrors the Studio tokens (warm paper / warm ink)
+     so the two states look like one product. */
+  :root {
+    --bg: transparent; --surface: #FFFFFF; --surface-2: #FBF8F2; --surface-3: #EFE9DE;
+    --border: #E6E0D5; --divider: #EEE7DB;
+    --brand: #11766E; --brand-fill: #11766E; --brand-soft: #DDEDEB; --on-brand: #FFFFFF;
+    --warn: #B0821F; --warn-soft: #F3E6C9; --danger: #BD564E; --danger-soft: #F5DDD7;
+    --text: #1C1A16; --text-2: #6F6A60; --text-3: #9A9388;
+    --shadow: 0 18px 50px -16px rgba(28,26,22,.45), 0 2px 8px rgba(28,26,22,.12);
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --surface: #1A1610; --surface-2: #201B15; --surface-3: #272118;
+    --border: #2C261E; --divider: #241F18;
+    --brand: #5CC4B3; --brand-fill: #11766E; --brand-soft: #16332E;
+    --warn: #D7A24E; --warn-soft: #38301D; --danger: #E08A80; --danger-soft: #3A231F;
+    --text: #F1EBE0; --text-2: #B3AA9A; --text-3: #7E7566;
+    --shadow: 0 18px 50px -14px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --surface: #1A1610; --surface-2: #201B15; --surface-3: #272118;
+      --border: #2C261E; --divider: #241F18;
+      --brand: #5CC4B3; --brand-fill: #11766E; --brand-soft: #16332E;
+      --warn: #D7A24E; --warn-soft: #38301D; --danger: #E08A80; --danger-soft: #3A231F;
+      --text: #F1EBE0; --text-2: #B3AA9A; --text-3: #7E7566;
+      --shadow: 0 18px 50px -14px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.4);
+      color-scheme: dark;
+    }
+  }
+  html, body { margin: 0; background: transparent; }
+  body {
+    font: 14px/1.45 "Geist", system-ui, -apple-system, sans-serif; color: var(--text);
+    -webkit-font-smoothing: antialiased; -webkit-user-select: none; user-select: none; overflow: hidden;
+  }
+  .pop { padding: 14px 16px 16px; position: relative; }
+  .tip {
+    position: absolute; top: 8px; left: 50%; width: 14px; height: 14px; z-index: 2;
+    background: var(--surface); border-left: 1px solid var(--border); border-top: 1px solid var(--border);
+    transform: translateX(-50%) rotate(45deg); border-radius: 2px 0 0 0;
+  }
+  .panel {
+    width: 380px; box-sizing: border-box; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .hd { display: flex; align-items: center; gap: 10px; padding: 14px 16px 12px; border-bottom: 1px solid var(--divider); }
+  .mark { width: 26px; height: 26px; color: var(--brand); flex: none; }
+  .mark svg { width: 100%; height: 100%; display: block; }
+  .wm { line-height: 1.1; }
+  .wm b { font-weight: 600; letter-spacing: -.01em; }
+  .wm small { display: block; color: var(--text-3); font-size: 11px; margin-top: 2px; }
+  .status { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+  .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--text-3); }
+  .dot.starting { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+  .dot.failed { background: var(--danger); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .body { padding: 18px 16px 16px; }
+  .msg { font-size: 15px; font-weight: 600; letter-spacing: -.01em; margin: 0 0 4px; }
+  .sub { color: var(--text-2); font-size: 13px; margin: 0 0 16px; }
+  .sub.err { color: var(--danger); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    appearance: none; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+    font: inherit; font-size: 13px; font-weight: 500; padding: 7px 12px; border-radius: 8px; cursor: pointer;
+  }
+  .btn:hover { background: var(--surface-3); }
+  .btn.primary { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); }
+  .btn.primary:hover { filter: brightness(1.06); }
+  .btn.quiet { border-color: transparent; background: transparent; color: var(--text-2); }
+  .btn.quiet:hover { background: var(--surface-3); color: var(--text); }
+  .ft { display: flex; align-items: center; gap: 8px; padding: 10px 16px 12px; border-top: 1px solid var(--divider); color: var(--text-3); font-size: 11.5px; }
+  .ft label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-2); }
+  .ft .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<div class="pop">
+  <div class="tip"></div>
+  <section class="panel" role="dialog" aria-label="Saffev">
+    <header class="hd">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 512 512" fill="currentColor"><path d="M34 242H52C68 242 78 230 81 214L96 100C102 54 139 24 186 24H326C373 24 410 54 416 100L431 214C434 230 444 242 460 242H478V250H442C414 250 396 268 382 294C368 320 354 336 330 336C306 336 291 315 276 283L246 219C232 188 220 164 196 164C172 164 158 183 144 207C126 238 110 250 82 250H34Z"/><path d="M34 270H82C110 270 126 258 144 227C158 203 172 192 196 192C220 192 232 216 246 247L276 311C291 343 306 364 330 364C354 364 368 348 382 322C396 296 414 278 442 278H478V270H460C444 270 434 282 431 298L416 412C410 458 373 488 326 488H186C139 488 102 458 96 412L81 298C78 282 68 270 52 270Z"/></svg>
+      </div>
+      <div class="wm"><b id="name">Saffev</b><small>local ai studio</small></div>
+      <div class="status"><span class="dot" id="dot"></span><span id="statusText">Connecting…</span></div>
+    </header>
+    <div class="body">
+      <p class="msg" id="msg">The service is not running</p>
+      <p class="sub" id="sub">Start it to see your stats here.</p>
+      <div class="actions">
+        <button class="btn primary" id="btnStart">Start</button>
+        <button class="btn" id="btnLogs">Open logs</button>
+        <button class="btn quiet" id="btnQuit">Quit</button>
+      </div>
+    </div>
+    <footer class="ft">
+      <label><input type="checkbox" id="login" /> Open at login</label>
+      <span class="spacer"></span>
+      <span id="ver"></span>
+    </footer>
+  </section>
+</div>
+<script>
+(function () {
+  'use strict';
+  var ipc = function (m) { try { window.ipc && window.ipc.postMessage(JSON.stringify(m)); } catch (e) {} };
+  var $ = function (s) { return document.querySelector(s); };
+  var host = { status: 'starting', statusText: 'Connecting…' };
+
+  function render() {
+    var dot = $('#dot'), s = host.status || 'stopped';
+    dot.className = 'dot ' + s;
+    $('#statusText').textContent = host.statusText || '';
+    $('#name').textContent = host.appName || 'Saffev';
+    $('#ver').textContent = host.version ? 'v' + host.version : '';
+    $('#login').checked = !!host.loginEnabled;
+    var msg = $('#msg'), sub = $('#sub'), start = $('#btnStart');
+    sub.className = 'sub';
+    if (s === 'starting' || s === 'running') {
+      msg.textContent = s === 'running' ? 'Loading the panel…' : 'Starting the service…';
+      sub.textContent = 'Coming up. If macOS asks for the “saffev” keychain item, allow it.';
+      start.textContent = 'Starting…'; start.disabled = true;
+    } else if (s === 'failed') {
+      msg.textContent = 'The service failed to start';
+      sub.textContent = 'See the log for the cause.';
+      sub.className = 'sub err';
+      start.textContent = 'Try again'; start.disabled = false;
+    } else {
+      msg.textContent = 'The service is not running';
+      sub.textContent = 'Start it to see your stats here.';
+      start.textContent = 'Start'; start.disabled = false;
+    }
+  }
+
+  window.__saffevHost = {
+    setState: function (s) {
+      host = s || host;
+      if (host.theme === 'light' || host.theme === 'dark') document.documentElement.setAttribute('data-theme', host.theme);
+      else document.documentElement.removeAttribute('data-theme');
+      render();
+    },
+    onShow: function () {},
+    onHide: function () {},
+    notice: function () {}
+  };
+  $('#btnStart').addEventListener('click', function () { ipc({ cmd: 'start' }); });
+  $('#btnLogs').addEventListener('click', function () { ipc({ cmd: 'logs' }); });
+  $('#btnQuit').addEventListener('click', function () { ipc({ cmd: 'quit' }); });
+  $('#login').addEventListener('change', function (e) { ipc({ cmd: 'set_login', enabled: !!e.target.checked }); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') ipc({ cmd: 'close' }); });
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  // Report our height so the window hugs the card.
+  var report = function () { var p = document.querySelector('.panel'); if (p) ipc({ cmd: 'resize', height: p.offsetHeight + 30 }); };
+  if (window.ResizeObserver) new ResizeObserver(report).observe(document.querySelector('.panel'));
+  render(); report();
+  ipc({ cmd: 'ready' });
+})();
+</script>
+</body>
+</html>

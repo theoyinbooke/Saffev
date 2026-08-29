@@ -30,6 +30,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::{
     home, AgentMessage, AgentReader, AgentSession, AgentSessionDetail, AgentTool, MessageKind, Role,
@@ -41,29 +43,70 @@ const SESSION_HEADER: &str = "# aider chat started at ";
 const MAX_DEPTH: u8 = 4;
 const MAX_DIRS: usize = 20_000;
 
+/// How long the default reader trusts its last home walk before walking
+/// again. The walk (up to `MAX_DIRS` directories) runs behind every
+/// `source_fingerprint()`, i.e. every list of every tool; without a memo a
+/// polling client (the Studio, the menu-bar panel) stacked walks faster than
+/// they finished and each one held directory handles open until the daemon hit
+/// its fd limit. Fixture readers (`with_roots`) don't memoize.
+const WALK_MEMO_TTL: Duration = Duration::from_secs(60);
+
 /// Reads Aider's per-project markdown transcripts.
 pub struct AiderReader {
     /// Directories to walk for `.aider.chat.history.md` files.
     roots: Vec<PathBuf>,
+    /// Last walk result + when it was taken; `None` TTL = never memoize.
+    walk_memo: Mutex<Option<(Instant, Vec<PathBuf>)>>,
+    memo_ttl: Option<Duration>,
 }
 
 impl AiderReader {
     /// Fixture seam: walk explicit roots. See `tests/agents_bench.rs`.
     pub fn with_roots(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
+        Self {
+            roots,
+            walk_memo: Mutex::new(None),
+            memo_ttl: None,
+        }
     }
 
-    /// Default: bounded walk under the home directory.
+    /// Default: bounded walk under the home directory (minus its protected
+    /// top-level folders) plus any `[agents] aider_roots`.
     pub fn new() -> Self {
-        Self { roots: vec![home()] }
+        let mut roots = vec![home()];
+        if let Some(extra) = EXTRA_ROOTS.get() {
+            roots.extend(extra.iter().cloned());
+        }
+        Self {
+            roots,
+            walk_memo: Mutex::new(None),
+            memo_ttl: Some(WALK_MEMO_TTL),
+        }
     }
 
     /// All `.aider.chat.history.md` files under the roots (bounded walk).
     fn history_files(&self) -> Vec<PathBuf> {
+        if let Some(ttl) = self.memo_ttl {
+            if let Ok(memo) = self.walk_memo.lock() {
+                if let Some((at, files)) = memo.as_ref() {
+                    if at.elapsed() < ttl {
+                        return files.clone();
+                    }
+                }
+            }
+        }
         let mut out = Vec::new();
         let mut visited = 0usize;
+        let home_dir = home();
         for root in &self.roots {
-            walk(root, 0, &mut visited, &mut out);
+            // Only the home root has its protected children fenced off; an
+            // explicitly configured root is walked as given.
+            walk(root, 0, *root == home_dir, &mut visited, &mut out);
+        }
+        if self.memo_ttl.is_some() {
+            if let Ok(mut memo) = self.walk_memo.lock() {
+                *memo = Some((Instant::now(), out.clone()));
+            }
         }
         out
     }
@@ -74,9 +117,7 @@ impl AiderReader {
         let Ok(text) = fs::read_to_string(path) else {
             return Vec::new();
         };
-        let project = path
-            .parent()
-            .map(|p| p.to_string_lossy().to_string());
+        let project = path.parent().map(|p| p.to_string_lossy().to_string());
         let file_mtime = fs::metadata(path)
             .and_then(|m| m.modified())
             .ok()
@@ -187,12 +228,31 @@ impl AiderReader {
 
             for line in lines {
                 if let Some(user) = line.strip_prefix("#### ") {
-                    flush_asst(&mut asst_buf, &mut messages, &mut msg_count, with_messages, *start_ts);
+                    flush_asst(
+                        &mut asst_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        with_messages,
+                        *start_ts,
+                    );
                     // Markdown hard-break continuation of multi-line input.
                     user_buf.push(user.trim_end_matches("  ").to_string());
                 } else if let Some(tool) = line.strip_prefix("> ") {
-                    flush_user(&mut user_buf, &mut messages, &mut msg_count, &mut title, with_messages, *start_ts);
-                    flush_asst(&mut asst_buf, &mut messages, &mut msg_count, with_messages, *start_ts);
+                    flush_user(
+                        &mut user_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        &mut title,
+                        with_messages,
+                        *start_ts,
+                    );
+                    flush_asst(
+                        &mut asst_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        with_messages,
+                        *start_ts,
+                    );
                     let tool = tool.trim_end();
                     // Model announcements: `Model: X with …` / `Main model: X …`.
                     if let Some(rest) = tool
@@ -234,15 +294,48 @@ impl AiderReader {
                     // Other announcements (repo, costs, commits) are noise.
                 } else if line.starts_with("# ") {
                     // A stray heading (aider's own parser skips these).
-                    flush_user(&mut user_buf, &mut messages, &mut msg_count, &mut title, with_messages, *start_ts);
-                    flush_asst(&mut asst_buf, &mut messages, &mut msg_count, with_messages, *start_ts);
+                    flush_user(
+                        &mut user_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        &mut title,
+                        with_messages,
+                        *start_ts,
+                    );
+                    flush_asst(
+                        &mut asst_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        with_messages,
+                        *start_ts,
+                    );
                 } else {
-                    flush_user(&mut user_buf, &mut messages, &mut msg_count, &mut title, with_messages, *start_ts);
+                    flush_user(
+                        &mut user_buf,
+                        &mut messages,
+                        &mut msg_count,
+                        &mut title,
+                        with_messages,
+                        *start_ts,
+                    );
                     asst_buf.push((*line).to_string());
                 }
             }
-            flush_user(&mut user_buf, &mut messages, &mut msg_count, &mut title, with_messages, *start_ts);
-            flush_asst(&mut asst_buf, &mut messages, &mut msg_count, with_messages, *start_ts);
+            flush_user(
+                &mut user_buf,
+                &mut messages,
+                &mut msg_count,
+                &mut title,
+                with_messages,
+                *start_ts,
+            );
+            flush_asst(
+                &mut asst_buf,
+                &mut messages,
+                &mut msg_count,
+                with_messages,
+                *start_ts,
+            );
 
             if msg_count == 0 {
                 continue; // header with no content — not a session
@@ -270,7 +363,7 @@ impl AiderReader {
                 input_tokens: inp,
                 output_tokens: outp,
                 cache_tokens: 0, // never reported by the format
-            cache_write_tokens: 0,
+                cache_write_tokens: 0,
                 source_path: path.to_string_lossy().to_string(),
             };
             let _ = count;
@@ -287,9 +380,40 @@ impl AiderReader {
     }
 }
 
-/// Bounded directory walk: hidden dirs, VCS internals, and dependency/build
-/// trees are skipped; depth and total-dirs capped.
-fn walk(dir: &Path, depth: u8, visited: &mut usize, out: &mut Vec<PathBuf>) {
+/// Directories never entered at any depth: they cannot hold a project root,
+/// and on macOS several are TCC-protected — descending into `Music` or
+/// `Pictures` made the OS ask "Allow Saffev to access Apple Music / your photo
+/// library?" on first launch, a prompt no code tool should ever cause.
+const NEVER_WALK: &[&str] = &[
+    "Library",
+    "AppData",
+    "snap",
+    "Music",
+    "Movies",
+    "Pictures",
+    "Public",
+    "Applications",
+];
+
+/// Top-level home folders that ARE plausible project locations but are
+/// TCC-protected on macOS (each one prompts). The default home walk skips
+/// them so a first launch asks for nothing; a user who keeps Aider projects
+/// there opts in with `[agents] aider_roots` (see [`configure_extra_roots`]),
+/// which walks exactly the listed directories.
+const PROTECTED_HOME_CHILDREN: &[&str] = &["Desktop", "Documents", "Downloads"];
+
+/// Extra roots from `[agents] aider_roots`, installed once at startup.
+static EXTRA_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Install the user's opt-in Aider roots. First call wins; later calls are
+/// no-ops (the config is read once per process).
+pub fn configure_extra_roots(roots: Vec<PathBuf>) {
+    let _ = EXTRA_ROOTS.set(roots);
+}
+
+/// Bounded directory walk: hidden dirs, VCS internals, dependency/build trees
+/// and [`NEVER_WALK`] folders are skipped; depth and total-dirs capped.
+fn walk(dir: &Path, depth: u8, fence_home: bool, visited: &mut usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH || *visited >= MAX_DIRS {
         return;
     }
@@ -303,12 +427,13 @@ fn walk(dir: &Path, depth: u8, visited: &mut usize, out: &mut Vec<PathBuf>) {
                 || matches!(
                     name.as_str(),
                     "node_modules" | "target" | "dist" | "build" | "venv" | "__pycache__"
-                        | "Library" | "AppData" | "snap"
                 )
+                || NEVER_WALK.contains(&name.as_str())
+                || (fence_home && depth == 0 && PROTECTED_HOME_CHILDREN.contains(&name.as_str()))
             {
                 continue;
             }
-            walk(&p, depth + 1, visited, out);
+            walk(&p, depth + 1, fence_home, visited, out);
         } else if name == ".aider.chat.history.md" {
             out.push(p);
         }
@@ -397,6 +522,79 @@ impl AgentReader for AiderReader {
 mod tests {
     use super::*;
 
+    /// Media/system folders are never entered: on macOS each one is a
+    /// TCC-protected location whose first access triggers a permission
+    /// prompt, and none of them can hold a project root.
+    #[test]
+    fn walk_never_enters_media_or_system_folders() {
+        let root = std::env::temp_dir().join(format!("saffev-aider-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in [
+            "Music",
+            "Movies",
+            "Pictures",
+            "Public",
+            "Library",
+            "Applications",
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "code",
+        ] {
+            let d = root.join(dir).join("proj");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join(".aider.chat.history.md"),
+                "# aider chat started at 2026-01-01 00:00:00\n",
+            )
+            .unwrap();
+        }
+        // As the home root: media/system folders AND the protected top-level
+        // folders are skipped.
+        let mut out = Vec::new();
+        let mut visited = 0;
+        walk(&root, 0, true, &mut visited, &mut out);
+        let found: Vec<String> = out
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec!["code".to_string()],
+            "walked into a never-walk folder: {found:?}"
+        );
+        // As an opt-in root (not fenced): Desktop/Documents/Downloads are
+        // walked, media/system folders still never are.
+        let mut out = Vec::new();
+        let mut visited = 0;
+        walk(&root, 0, false, &mut visited, &mut out);
+        let mut found: Vec<String> = out
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["Desktop", "Documents", "Downloads", "code"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn parses_sessions_by_aiders_own_rules() {
         let dir = std::env::temp_dir().join(format!("saffev-aider-{}", uuid::Uuid::new_v4()));
@@ -416,7 +614,9 @@ mod tests {
         assert!(s1.title.as_deref().unwrap().contains("add a retry"));
         assert!(s1.project.as_deref().unwrap().ends_with("myproj"));
         // Multi-line #### input is ONE user message.
-        let d = reader.session_detail(s1.id.split_once(':').unwrap().1).expect("detail");
+        let d = reader
+            .session_detail(s1.id.split_once(':').unwrap().1)
+            .expect("detail");
         let users: Vec<_> = d.messages.iter().filter(|m| m.role == Role::User).collect();
         assert_eq!(users.len(), 1);
         assert!(users[0].content.contains("make it exponential"));
@@ -441,10 +641,7 @@ mod tests {
         let reader = AiderReader::with_roots(vec![dir.clone()]);
         let sessions = reader.list_sessions();
         assert_eq!(sessions.len(), 1, "fenced header split a phantom session");
-        assert_eq!(
-            sessions[0].started_ts,
-            header_millis("2026-07-27 17:00:00")
-        );
+        assert_eq!(sessions[0].started_ts, header_millis("2026-07-27 17:00:00"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

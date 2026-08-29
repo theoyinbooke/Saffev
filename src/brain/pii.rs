@@ -110,8 +110,7 @@ static RE_PRIVATE_KEY: Lazy<Regex> = Lazy::new(|| {
 /// (base64url of `{"`). The strong prefix makes this deterministic without an
 /// entropy gate.
 static RE_JWT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}")
-        .expect("jwt regex")
+    Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}").expect("jwt regex")
 });
 
 /// Connection string with embedded credentials: `scheme://user:password@rest`.
@@ -129,8 +128,7 @@ static RE_CONN_STRING: Lazy<Regex> = Lazy::new(|| {
 /// US SSN, dashed form only (`AAA-GG-SSSS`). The bare 9-digit form is far too
 /// FP-prone for a deterministic v0 detector. Candidates are structurally
 /// validated by [`ssn_valid`] before a finding is emitted.
-static RE_SSN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn regex"));
+static RE_SSN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn regex"));
 
 /// IBAN candidate: canonical uppercase (spaced groups or compact), plus a
 /// COMPACT-only lowercase branch (lowercase pastes are real — G1 round-9
@@ -150,10 +148,8 @@ static RE_IBAN: Lazy<Regex> = Lazy::new(|| {
 /// MAC address — six colon- or hyphen-separated hex pairs. (The regex crate
 /// has no backreferences, hence the two spelled-out branches.)
 static RE_MAC: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b|(?i)\b(?:[0-9a-f]{2}-){5}[0-9a-f]{2}\b",
-    )
-    .expect("mac regex")
+    Regex::new(r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b|(?i)\b(?:[0-9a-f]{2}-){5}[0-9a-f]{2}\b")
+        .expect("mac regex")
 });
 
 /// `.env`-style assignment candidate (`KEY=value`, `KEY="value"`). The regex
@@ -291,8 +287,8 @@ static RE_SSN_LOOSE: Lazy<Regex> =
 /// (`image@2x.png`), so an email hit ending in one is a filename, not an
 /// address. Deliberately excludes every real ccTLD (`.md`, `.sh`, `.rs`, …).
 const NON_TLD_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif", "tiff", "mp3", "mp4",
-    "mov", "avi", "wav", "woff", "woff2", "ttf", "eot", "otf",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif", "tiff", "mp3", "mp4", "mov",
+    "avi", "wav", "woff", "woff2", "ttf", "eot", "otf",
 ];
 
 /// A compiled, ready-to-run set of detectors.
@@ -475,8 +471,7 @@ impl Detector {
                 // participating group is always the key, the second the
                 // value, whichever quote branch matched.
                 let mut participating = (1..caps.len()).filter_map(|i| caps.get(i));
-                let (Some(key), Some(value)) = (participating.next(), participating.next())
-                else {
+                let (Some(key), Some(value)) = (participating.next(), participating.next()) else {
                     continue;
                 };
                 // The YAML form is the only grammar whose value is unquoted
@@ -517,9 +512,7 @@ impl Detector {
             // prefix defer made both vanish entirely). A real JWT shape or an
             // accepted key keeps its specific label; everything else stays a
             // config credential.
-            let v = value
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'');
+            let v = value.trim().trim_matches(|c| c == '"' || c == '\'');
             if RE_JWT.is_match(v)
                 || RE_API_KEY
                     .find(v)
@@ -897,7 +890,12 @@ fn conn_password_is_real(pw: &str) -> bool {
         .to_ascii_lowercase();
     !matches!(
         normalized.as_str(),
-        "password" | "passwd" | "pwd" | "your-password" | "yourpassword" | "example"
+        "password"
+            | "passwd"
+            | "pwd"
+            | "your-password"
+            | "yourpassword"
+            | "example"
             | "placeholder"
     )
 }
@@ -988,7 +986,14 @@ fn env_key_is_secret(key: &str) -> bool {
         "CREDENTIALS",
     ];
     const KEY_QUALIFIERS: &[&str] = &[
-        "API", "ACCESS", "PRIVATE", "SIGNING", "ENCRYPTION", "MASTER", "LICENSE", "SSH",
+        "API",
+        "ACCESS",
+        "PRIVATE",
+        "SIGNING",
+        "ENCRYPTION",
+        "MASTER",
+        "LICENSE",
+        "SSH",
     ];
     if segments.iter().any(|s| SECRET_WORDS.contains(s)) {
         return true;
@@ -1118,7 +1123,10 @@ fn env_value_is_real(value: &str) -> bool {
         "placeholder",
         "changeme",
     ];
-    if segments.first().is_some_and(|s| NON_MATERIAL_LEADS.contains(s)) {
+    if segments
+        .first()
+        .is_some_and(|s| NON_MATERIAL_LEADS.contains(s))
+    {
         return false;
     }
     if !segments.is_empty() && segments.iter().all(|s| NON_MATERIAL.contains(s)) {
@@ -1206,7 +1214,13 @@ fn base58check_valid(s: &str) -> bool {
 /// validate.
 fn bech32_valid(s: &str) -> bool {
     const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
     let Some((hrp, data)) = s.rsplit_once('1') else {
         return false;
     };
@@ -1389,11 +1403,8 @@ fn looks_like_phone(text: &str, m: &regex::Match) -> bool {
     let nanp_dots = {
         let groups: Vec<&str> = s.split('.').collect();
         groups.len() == 3
-            && [3, 3, 4]
-                == [groups[0].len(), groups[1].len(), groups[2].len()]
-            && groups
-                .iter()
-                .all(|g| g.bytes().all(|b| b.is_ascii_digit()))
+            && [3, 3, 4] == [groups[0].len(), groups[1].len(), groups[2].len()]
+            && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_digit()))
     };
     if !has_plus && !has_space_or_dash && !nanp_dots {
         return false;
@@ -1878,7 +1889,8 @@ mod tests {
     #[test]
     fn detects_private_key_block_whole_span() {
         let d = det();
-        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----";
+        let text =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7bq4\n-----END RSA PRIVATE KEY-----";
         let f = d.scan(Side::Request, text);
         let k = f
             .iter()
@@ -1892,7 +1904,10 @@ mod tests {
     #[test]
     fn detects_truncated_private_key_header() {
         let d = det();
-        let f = d.scan(Side::Request, "paste: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNz");
+        let f = d.scan(
+            Side::Request,
+            "paste: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNz",
+        );
         assert!(has_kind(&f, PiiKind::PrivateKey), "header alone is a leak");
     }
 
@@ -1903,7 +1918,10 @@ mod tests {
             Side::Request,
             "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----",
         );
-        assert!(!has_kind(&f, PiiKind::PrivateKey), "public keys are not secrets");
+        assert!(
+            !has_kind(&f, PiiKind::PrivateKey),
+            "public keys are not secrets"
+        );
     }
 
     // --- JWT -------------------------------------------------------------------
@@ -1915,7 +1933,10 @@ mod tests {
         let f = d.scan(Side::Request, text);
         let j = f.iter().find(|f| f.kind == PiiKind::Jwt).expect("jwt");
         assert!(&text[j.start..j.end].starts_with("eyJhbGciOi"));
-        assert!(&text[j.start..j.end].ends_with("THsR8U"), "full three-part span");
+        assert!(
+            &text[j.start..j.end].ends_with("THsR8U"),
+            "full three-part span"
+        );
     }
 
     #[test]
@@ -1987,7 +2008,10 @@ mod tests {
             let f = d.scan(Side::Request, &format!("id {bad} noted"));
             assert!(!has_kind(&f, PiiKind::Ssn), "must reject {bad}");
             // …and the rejected 3-2-4 run must not fall through to phone.
-            assert!(!has_kind(&f, PiiKind::Phone), "SSN shape mislabeled as phone: {bad}");
+            assert!(
+                !has_kind(&f, PiiKind::Phone),
+                "SSN shape mislabeled as phone: {bad}"
+            );
         }
     }
 
@@ -2014,7 +2038,10 @@ mod tests {
         assert!(!has_kind(&f, PiiKind::Iban), "mod-97 must gate candidates");
         // The typo'd IBAN's digit tail passes Luhn by luck — it must not be
         // relabeled as a credit card either.
-        assert!(!has_kind(&f, PiiKind::CreditCard), "IBAN tail is not a card");
+        assert!(
+            !has_kind(&f, PiiKind::CreditCard),
+            "IBAN tail is not a card"
+        );
     }
 
     // --- MAC ---------------------------------------------------------------------
@@ -2297,16 +2324,19 @@ mod tests {
     fn env_assignment_rejects_config_and_placeholders() {
         let d = det();
         for benign in [
-            "DEBUG=true",                    // key names no credential
-            "PORT=8080",                     // ditto
-            "PASSWORD=changeme",             // placeholder value
-            "API_TOKEN=${VAULT_TOKEN}",      // interpolation, not a secret
-            "AUTHOR=JohnSmith99",            // AUTH must not match inside AUTHOR
-            "PUBLIC_KEY=abcdef1234567890",   // public halves are not secrets
-            "SECRET_KEY=xxxxxxxxxxxxxxxx",   // zero-entropy template filler
+            "DEBUG=true",                  // key names no credential
+            "PORT=8080",                   // ditto
+            "PASSWORD=changeme",           // placeholder value
+            "API_TOKEN=${VAULT_TOKEN}",    // interpolation, not a secret
+            "AUTHOR=JohnSmith99",          // AUTH must not match inside AUTHOR
+            "PUBLIC_KEY=abcdef1234567890", // public halves are not secrets
+            "SECRET_KEY=xxxxxxxxxxxxxxxx", // zero-entropy template filler
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign}"
+            );
         }
     }
 
@@ -2337,7 +2367,10 @@ mod tests {
     #[test]
     fn kv_pairs_without_password_are_not_a_connection_string() {
         let d = det();
-        let f = d.scan(Side::Request, "Server=db.internal;Database=app;Encrypt=true");
+        let f = d.scan(
+            Side::Request,
+            "Server=db.internal;Database=app;Encrypt=true",
+        );
         assert!(!has_kind(&f, PiiKind::ConnectionString));
     }
 
@@ -2360,7 +2393,10 @@ mod tests {
     #[test]
     fn ssn_dashless_and_spaced_need_context() {
         let d = det();
-        for hit in ["SSN: 078051120", "her social security number is 078 05 1120"] {
+        for hit in [
+            "SSN: 078051120",
+            "her social security number is 078 05 1120",
+        ] {
             let f = d.scan(Side::Request, hit);
             assert!(has_kind(&f, PiiKind::Ssn), "missed {hit:?}");
         }
@@ -2435,7 +2471,10 @@ mod tests {
         }
         // One flipped letter breaks the Keccak casing — must not fire.
         let f = d.scan(Side::Request, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD");
-        assert!(!has_kind(&f, PiiKind::CryptoWallet), "case-corrupted EIP-55 accepted");
+        assert!(
+            !has_kind(&f, PiiKind::CryptoWallet),
+            "case-corrupted EIP-55 accepted"
+        );
         // Single-case addresses carry no checksum info — accepted on shape.
         let f = d.scan(Side::Request, "0xde709f2102306220921060314715629080e2fb77");
         assert!(has_kind(&f, PiiKind::CryptoWallet));
@@ -2447,9 +2486,18 @@ mod tests {
     fn detects_json_yaml_toml_config_secrets() {
         let d = det();
         let cases = [
-            (r#"{"password": "hunter2secret99", "user": "svc"}"#, r#""password": "hunter2secret99""#),
-            ("db:\n  host: localhost\n  db_password: hunter2secret99\n", "db_password: hunter2secret99"),
-            ("[database]\napi_token = \"tok_9f8e7d6c5b4a\"\n", "api_token = \"tok_9f8e7d6c5b4a\""),
+            (
+                r#"{"password": "hunter2secret99", "user": "svc"}"#,
+                r#""password": "hunter2secret99""#,
+            ),
+            (
+                "db:\n  host: localhost\n  db_password: hunter2secret99\n",
+                "db_password: hunter2secret99",
+            ),
+            (
+                "[database]\napi_token = \"tok_9f8e7d6c5b4a\"\n",
+                "api_token = \"tok_9f8e7d6c5b4a\"",
+            ),
         ];
         for (text, want) in cases {
             let f = d.scan(Side::Request, text);
@@ -2472,7 +2520,10 @@ mod tests {
             "[build]\nversion = \"1.2.3-beta.4\"\n",      // not a credential key
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
     }
 
@@ -2488,12 +2539,18 @@ mod tests {
             "secret: the cake is a lie",
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
         // A QUOTED multi-word value is deliberate config, not prose.
         let text = "password: \"correct horse battery staple\"";
         let f = d.scan(Side::Request, text);
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "quoted multi-word secret missed");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "quoted multi-word secret missed"
+        );
     }
 
     #[test]
@@ -2501,7 +2558,10 @@ mod tests {
         let d = det();
         for (text, want) in [
             ("DB_PASS=q9v2x7mplt44", "DB_PASS=q9v2x7mplt44"),
-            ("client_secret = 'cs_4f9a2b7c1d'", "client_secret = 'cs_4f9a2b7c1d'"),
+            (
+                "client_secret = 'cs_4f9a2b7c1d'",
+                "client_secret = 'cs_4f9a2b7c1d'",
+            ),
         ] {
             let f = d.scan(Side::Request, text);
             let m = f
@@ -2519,14 +2579,17 @@ mod tests {
     fn redaction_markers_and_status_words_are_not_secrets() {
         let d = det();
         for benign in [
-            "password: [FILTERED]",         // Rails/Rack log scrubbing
+            "password: [FILTERED]", // Rails/Rack log scrubbing
             "password: [REDACTED]",
-            "password: incorrect",          // status word, not material
+            "password: incorrect", // status word, not material
             "token: expired",
-            "export PASSWORD=incorrect",    // same class in the shell form
+            "export PASSWORD=incorrect", // same class in the shell form
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
     }
 
@@ -2546,7 +2609,10 @@ mod tests {
             "{\"password\": \"[FILTERED]\"}", // marker check reaches quoted grammars
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
     }
 
@@ -2580,7 +2646,10 @@ mod tests {
         // Round-7 critic: serials/placeholders where every group is one
         // repeated digit must not read as phones.
         let d = det();
-        for benign in ["serial 1111-2222-3333 registered", "card PIN block 0000-0000-0000"] {
+        for benign in [
+            "serial 1111-2222-3333 registered",
+            "card PIN block 0000-0000-0000",
+        ] {
             let f = d.scan(Side::Request, benign);
             assert!(!has_kind(&f, PiiKind::Phone), "must reject {benign:?}");
         }
@@ -2600,7 +2669,10 @@ mod tests {
             "password: \"MASKED (by proxy)\"",
         ] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
         // Scrub verbs gate on the FIRST segment only — a passphrase merely
         // containing one is material.
@@ -2618,10 +2690,7 @@ mod tests {
                 r#"logger.info({password: "hunter2xyz99", user: "svc"})"#,
                 r#"password: "hunter2xyz99""#,
             ),
-            (
-                "opts = {password: 'railsKw99x'}",
-                "password: 'railsKw99x'",
-            ),
+            ("opts = {password: 'railsKw99x'}", "password: 'railsKw99x'"),
             (
                 "{'db_password': 'py2repr99x'}",
                 "'db_password': 'py2repr99x'",
@@ -2662,7 +2731,10 @@ mod tests {
         // JS template literal.
         let text = "{password: `tpl99secret`}";
         let f = d.scan(Side::Request, text);
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "template literal missed");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "template literal missed"
+        );
     }
 
     #[test]
@@ -2679,7 +2751,10 @@ mod tests {
     fn filler_leads_are_not_secrets() {
         let d = det();
         let f = d.scan(Side::Request, "password: \"TBD-final\"");
-        assert!(!has_kind(&f, PiiKind::EnvAssignment), "TBD-annotation is filler");
+        assert!(
+            !has_kind(&f, PiiKind::EnvAssignment),
+            "TBD-annotation is filler"
+        );
         // But a value merely CONTAINING a filler word later stays material.
         let f = d.scan(Side::Request, "password: was-removed-x9q");
         assert!(has_kind(&f, PiiKind::EnvAssignment));
@@ -2693,12 +2768,21 @@ mod tests {
         let d = det();
         let text = "PASSWORD=eyJ0eXBlIjoiYWNjb3VudCJ9";
         let f = d.scan(Side::Request, text);
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "base64-JSON credential vanished");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "base64-JSON credential vanished"
+        );
         assert!(!has_kind(&f, PiiKind::Jwt));
         let f = d.scan(Side::Request, "PASSWORD=sk-abcdabcdabcdabcdabcd");
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "below-entropy sk- value vanished");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "below-entropy sk- value vanished"
+        );
         // A REAL key or JWT still keeps its specific label.
-        let f = d.scan(Side::Request, "GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a");
+        let f = d.scan(
+            Side::Request,
+            "GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+        );
         assert!(has_kind(&f, PiiKind::ApiKey));
         assert!(!has_kind(&f, PiiKind::EnvAssignment));
     }
@@ -2735,7 +2819,10 @@ mod tests {
     fn passphrase_keys_and_lowercase_ibans_and_plus_phones() {
         let d = det();
         let f = d.scan(Side::Request, "GPG_PASSPHRASE=correct-horse-battery-x99");
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "PASSPHRASE key missed");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "PASSPHRASE key missed"
+        );
         let f = d.scan(Side::Request, "iban de89370400440532013000 on the invoice");
         assert!(has_kind(&f, PiiKind::Iban), "lowercase IBAN missed");
         // A '+' country prefix exempts degenerate-looking real numbers from
@@ -2745,7 +2832,10 @@ mod tests {
         // Status-vocab synonyms are non-material.
         for benign in ["password: rejected", "token: unauthorized"] {
             let f = d.scan(Side::Request, benign);
-            assert!(!has_kind(&f, PiiKind::EnvAssignment), "must reject {benign:?}");
+            assert!(
+                !has_kind(&f, PiiKind::EnvAssignment),
+                "must reject {benign:?}"
+            );
         }
     }
 
@@ -2794,18 +2884,24 @@ mod tests {
             .iter()
             .find(|f| f.kind == PiiKind::EnvAssignment)
             .expect("block scalar secret");
-        assert_eq!(
-            &text[m.start..m.end],
-            "db_password: |\n    hunter2block99x"
-        );
+        assert_eq!(&text[m.start..m.end], "db_password: |\n    hunter2block99x");
         // Folded style and chomping indicators too.
         let f = d.scan(Side::Request, "api_token: >-\n  tok9f8e7d6c5b4a\n");
-        assert!(has_kind(&f, PiiKind::EnvAssignment), "folded/chomped block missed");
+        assert!(
+            has_kind(&f, PiiKind::EnvAssignment),
+            "folded/chomped block missed"
+        );
         // Value gates still apply inside a block.
         let f = d.scan(Side::Request, "password: |\n  changeme\n");
-        assert!(!has_kind(&f, PiiKind::EnvAssignment), "placeholder in block fired");
+        assert!(
+            !has_kind(&f, PiiKind::EnvAssignment),
+            "placeholder in block fired"
+        );
         // Non-secret keys don't fire regardless of block style.
-        let f = d.scan(Side::Request, "description: |\n  a long paragraph of text\n");
+        let f = d.scan(
+            Side::Request,
+            "description: |\n  a long paragraph of text\n",
+        );
         assert!(!has_kind(&f, PiiKind::EnvAssignment));
     }
 
@@ -2826,7 +2922,10 @@ mod tests {
             );
         }
         // A weak-but-real password is still a leak — no entropy gate here.
-        let f = d.scan(Side::Request, "db at mysql://root:p4ss@10.1.2.3:3306/app up");
+        let f = d.scan(
+            Side::Request,
+            "db at mysql://root:p4ss@10.1.2.3:3306/app up",
+        );
         assert!(has_kind(&f, PiiKind::ConnectionString));
     }
 
