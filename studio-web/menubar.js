@@ -605,7 +605,10 @@
     // One action: Back up = preserve anything new, then export the archive to
     // the chosen folder. Only offered while the archive has changed since the
     // last backup.
-    const needs = ar.changedSinceBackup || (!ar.lastBackupTs && ar.count > 0);
+    // Never backed up = always offer it (on a fresh install the archive is
+    // still empty, but the store already holds history and settings worth a
+    // copy, and Back up turns preservation on first).
+    const needs = ar.changedSinceBackup || !ar.lastBackupTs;
     const backupBtn = busy.backup || ar.backupRunning
       ? `<button class="btn primary sm" disabled>${ICON.backup} Backing up…</button>`
       : needs
