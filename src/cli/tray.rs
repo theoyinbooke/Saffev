@@ -39,7 +39,9 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::daemon;
-use super::tray_panel::{sanitize_route, sanitize_theme, HostState, Panel, PanelMsg};
+use super::tray_panel::{
+    sanitize_reveal_path, sanitize_route, sanitize_theme, HostState, Panel, PanelMsg,
+};
 use crate::config::Config;
 
 /// How many times the supervisor retries a daemon that died on its own before
@@ -246,6 +248,7 @@ enum Action {
     Logs,
     Update,
     Backup,
+    Reveal(PathBuf),
     ChooseExportDir,
     SetLogin(Option<bool>),
     Quit,
@@ -278,6 +281,7 @@ fn panel_action(msg: &PanelMsg) -> Option<Action> {
         PanelMsg::Logs => Action::Logs,
         PanelMsg::Update => Action::Update,
         PanelMsg::Backup => Action::Backup,
+        PanelMsg::Reveal { path } => Action::Reveal(sanitize_reveal_path(path)?),
         PanelMsg::ChooseExportDir => Action::ChooseExportDir,
         PanelMsg::SetLogin { enabled } => Action::SetLogin(Some(*enabled)),
         PanelMsg::Quit => Action::Quit,
@@ -391,10 +395,14 @@ pub fn run_tray() -> ExitCode {
     // Re-arming `WaitUntil(now + refresh)` per event would let a busy webview
     // starve the timer (each event pushes the deadline out again).
     let mut next_tick = Instant::now() + refresh;
+    // What the status item currently shows, so it is only touched on change.
+    let mut shown_icon: Option<bool> = None;
+    let mut shown_status: &'static str = "";
 
     event_loop.run(move |event, target, control_flow| {
         let now = Instant::now();
-        if now >= next_tick {
+        let ticked = now >= next_tick;
+        if ticked {
             next_tick = now + refresh;
             sup.tick();
             if let Some(p) = panel.as_mut() {
@@ -402,6 +410,15 @@ pub fn run_tray() -> ExitCode {
             }
         }
         *control_flow = ControlFlow::WaitUntil(next_tick);
+        // Only a tick, a click/IPC/job result, or startup can change what the
+        // status item and panel show. Window chatter (every mouse move over the
+        // panel is an event) used to re-read the pid file several times,
+        // re-rasterize and re-set the icon, and rebuild the host state each time.
+        let refresh_ui = ticked
+            || matches!(
+                event,
+                Event::UserEvent(_) | Event::NewEvents(StartCause::Init)
+            );
 
         let mut act: Option<Action> = None;
 
@@ -463,6 +480,9 @@ pub fn run_tray() -> ExitCode {
                     if let Some(p) = panel.as_mut() {
                         p.mark_ready();
                         p.push_state(&state);
+                        // The page boots hidden; if the panel is already open
+                        // (a reload while visible), let it start fetching.
+                        p.announce_visibility();
                     }
                 }
                 PanelMsg::Close => {
@@ -489,14 +509,22 @@ pub fn run_tray() -> ExitCode {
                 backup_running = false;
                 let js = match &result {
                     Ok(dir) => {
-                        // Show the folder: the point of a backup is knowing where it is.
-                        let _ = std::process::Command::new("open").arg(dir).spawn();
+                        // Never pop Finder open by itself: it takes focus, and a
+                        // panel that loses focus closes — the backup looked like
+                        // it had closed the app, and its result landed in a
+                        // hidden panel. The notice offers "Show in Finder"
+                        // instead. Without a panel (the plain menu), revealing
+                        // the folder is the only way to show the result.
+                        if panel.is_none() {
+                            reveal(dir);
+                        }
                         format!(
                             "window.__saffevHost&&window.__saffevHost.notice&&window.__saffevHost.notice({});",
                             serde_json::json!({
                                 "kind": "ok",
                                 "title": "Backup written",
                                 "detail": dir.display().to_string(),
+                                "revealPath": dir.display().to_string(),
                             })
                         )
                     }
@@ -576,6 +604,7 @@ pub fn run_tray() -> ExitCode {
                         }
                     }
                 }
+                Action::Reveal(dir) => reveal(&dir),
                 Action::ChooseExportDir => {
                     if !picker_open {
                         picker_open = true;
@@ -599,16 +628,26 @@ pub fn run_tray() -> ExitCode {
             }
         }
 
+        if !refresh_ui {
+            return;
+        }
         // Refresh the icon + fallback menu, and push state to the panel only
         // when something changed (the page re-renders on every push).
         let running = sup.is_running();
-        if let Some(t) = &tray {
-            let _ = t.set_icon_with_as_template(
-                Some(status_icon(running)),
-                cfg!(target_os = "macos"),
-            );
+        if shown_icon != Some(running) {
+            if let Some(t) = &tray {
+                let _ = t.set_icon_with_as_template(
+                    Some(status_icon(running)),
+                    cfg!(target_os = "macos"),
+                );
+                shown_icon = Some(running);
+            }
         }
-        status_item.set_text(sup.status_text());
+        let status = sup.status_text();
+        if status != shown_status {
+            status_item.set_text(status);
+            shown_status = status;
+        }
         start_item.set_enabled(!running);
         stop_item.set_enabled(running);
         restart_item.set_enabled(running);
@@ -648,8 +687,28 @@ fn spawn_folder_picker(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
     });
 }
 
+/// Show a folder in Finder. Callers pass only paths this process produced or
+/// [`sanitize_reveal_path`] accepted.
+fn reveal(dir: &Path) {
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+}
+
+/// The folder `saffev backup --print-dir` reported: the whole remainder of its
+/// `SAFFEV_BACKUP_DIR=` line, so a path with spaces (iCloud's "Mobile
+/// Documents", "My Backups") survives intact. Splitting on whitespace used to
+/// turn a successful backup into "its folder was not reported".
+fn reported_backup_dir(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("SAFFEV_BACKUP_DIR="))
+        .map(|p| PathBuf::from(p.trim_end_matches(['\r', '\n'])))
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// Run `saffev backup` as a child (it needs the store + keyring key, which the
-/// daemon path owns) on a worker thread, and report the created folder.
+/// daemon path owns) on a worker thread, and report the created folder. Used
+/// by the plain menu; the panel backs up through the Studio API instead.
 fn spawn_backup(config_path: PathBuf, proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         let result = (|| -> Result<PathBuf, String> {
@@ -659,6 +718,7 @@ fn spawn_backup(config_path: PathBuf, proxy: tao::event_loop::EventLoopProxy<Use
                 .arg(&config_path)
                 .arg("--no-color")
                 .arg("backup")
+                .arg("--print-dir")
                 .output()
                 .map_err(|e| e.to_string())?;
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -671,14 +731,8 @@ fn spawn_backup(config_path: PathBuf, proxy: tao::event_loop::EventLoopProxy<Use
                     .unwrap_or("backup exited with an error");
                 return Err(msg.trim().to_string());
             }
-            // The command prints the folder it wrote; find the path on any line.
-            stdout
-                .lines()
-                .flat_map(|l| l.split_whitespace())
-                .map(|w| w.trim_matches(|c: char| c == '"' || c == '\'' || c == ':' || c == ','))
-                .filter(|w| w.contains("Saffev-Backup-"))
-                .map(PathBuf::from)
-                .find(|p| p.is_dir())
+            reported_backup_dir(&stdout)
+                .filter(|p| p.is_dir())
                 .ok_or_else(|| "backup finished but its folder was not reported".to_string())
         })();
         let _ = proxy.send_event(UserEvent::BackupDone(result));
@@ -878,6 +932,36 @@ mod tests {
         // Panel-internal messages are not actions.
         assert_eq!(panel_action(&PanelMsg::Ready), None);
         assert_eq!(panel_action(&PanelMsg::Resize { height: 1.0 }), None);
+    }
+
+    #[test]
+    fn backup_dir_with_spaces_is_reported_intact() {
+        let out = "● backup incremental backup written to /Users/x/Library/Mobile Documents/Saffev-Backup-20261019-120000-incr\n\
+                   · delta.db 0.1 MB\n\
+                   SAFFEV_BACKUP_DIR=/Users/x/Library/Mobile Documents/Saffev-Backup-20261019-120000-incr\n";
+        assert_eq!(
+            reported_backup_dir(out),
+            Some(PathBuf::from(
+                "/Users/x/Library/Mobile Documents/Saffev-Backup-20261019-120000-incr"
+            ))
+        );
+        assert_eq!(
+            reported_backup_dir("written to /tmp/Saffev-Backup-1\n"),
+            None
+        );
+        assert_eq!(reported_backup_dir("SAFFEV_BACKUP_DIR=\n"), None);
+    }
+
+    #[test]
+    fn reveal_needs_a_backup_folder() {
+        let bad = PanelMsg::Reveal {
+            path: "/Applications/Calculator.app".into(),
+        };
+        assert_eq!(
+            panel_action(&bad),
+            None,
+            "a rejected path is no action at all"
+        );
     }
 
     #[test]

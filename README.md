@@ -268,7 +268,12 @@ record + `saffev report`, local monitors + notifications, all benchmarked in
   transcripts live next to the code. Redaction applies; commit them or gitignore
   them, your choice.
 - **`saffev backup`.** A consistent, still-encrypted copy of the whole store
-  plus a restore README — the answer to "my laptop died".
+  plus a restore README — the answer to "my laptop died". Backups are
+  **incremental**: the first is a full copy, each later one holds only what
+  changed since the previous one (`--full` starts a new chain). Turn on
+  `[backup] auto` (or the panel's *Back up automatically*) to run them every
+  `interval_hours`; `saffev restore <folder>` replays a chain into a new
+  database.
 - **llama.cpp** joins Ollama and LM Studio as a recognized engine (identified by
   `/props`, so a dev server on `:8080` is never mistaken for one).
 - **Database size is visible** in Settings and the Preservation banner (no more

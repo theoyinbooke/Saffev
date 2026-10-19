@@ -38,6 +38,7 @@
 
 pub mod agents;
 pub mod attribution;
+pub mod backup;
 pub mod brain;
 pub mod brand;
 pub mod cli;

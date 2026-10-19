@@ -462,6 +462,12 @@ pub struct SettingsView {
     /// (`<repo>/.saffev/sessions/`, opt-in).
     #[serde(default)]
     pub archive_mirror_repos: bool,
+    /// Scheduled incremental backups to the export destination.
+    #[serde(default)]
+    pub backup_auto: bool,
+    /// Hours between scheduled backups.
+    #[serde(default)]
+    pub backup_interval_hours: u32,
     /// On-disk size of the store database (+WAL), for the System panel.
     #[serde(default)]
     pub db_bytes: u64,
@@ -534,6 +540,12 @@ pub struct SettingsUpdate {
     /// rejected). Empty string clears it back to the home-folder default.
     #[serde(default)]
     pub export_dir: Option<String>,
+    /// Toggle scheduled backups.
+    #[serde(default)]
+    pub backup_auto: Option<bool>,
+    /// Hours between scheduled backups (1..=720). Applies from the next check.
+    #[serde(default)]
+    pub backup_interval_hours: Option<u32>,
 }
 
 /// SSE payload pushed on `/api/stream`. Tagged by `type` so the SPA can switch.
@@ -734,6 +746,39 @@ pub struct ArchiveStatusView {
     /// worth offering.
     #[serde(default)]
     pub changed_since_backup: bool,
+    /// Why the last backup failed (e.g. the destination drive is unplugged);
+    /// `None` after a success.
+    #[serde(default)]
+    pub last_backup_error: Option<String>,
+    /// Automatic backups are on (`[backup] auto`).
+    #[serde(default)]
+    pub backup_auto: bool,
+    /// A backup is running in the Studio process right now.
+    #[serde(default)]
+    pub backup_running: bool,
+}
+
+/// `POST /api/backup` — what one backup run did.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupResultView {
+    /// `full` | `incremental` | `unchanged` (nothing new since the last one).
+    pub kind: String,
+    /// The folder written (or, when unchanged, the backup that is still current).
+    pub dir: String,
+    /// Size of the database file written (0 when unchanged).
+    pub bytes: u64,
+    /// Older backup folders removed under `[backup] keep_chains`.
+    pub pruned: u32,
+}
+
+/// `POST /api/backup` body. Empty = incremental when possible.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupRequest {
+    /// Start a new chain with a full copy.
+    #[serde(default)]
+    pub full: bool,
 }
 
 /// `GET /api/agents` — the Agents overview.

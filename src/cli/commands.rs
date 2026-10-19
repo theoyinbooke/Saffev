@@ -278,113 +278,167 @@ pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Resu
     Ok(())
 }
 
-/// `saffev backup [--out DIR]` — write a consistent copy of the encrypted
-/// database (+ the config file) into a timestamped folder under the export
-/// destination. The durable-product answer to "my laptop died": SQLite's
-/// `VACUUM INTO` snapshots the store safely while the daemon runs, and the
-/// copy stays SQLCipher-encrypted under the SAME key — which lives in the OS
-/// keychain, not in the folder, so the README spells out how to carry it.
-pub async fn backup(cli: &Cli, out: Option<std::path::PathBuf>) -> Result<()> {
+/// `saffev backup [--out DIR] [--full]` — write an encrypted backup folder
+/// under the export destination. See [`crate::backup`]: the first backup is a
+/// full `VACUUM INTO` snapshot (safe while the daemon runs); later ones are
+/// incremental links holding only what changed. The key stays in the OS
+/// keychain, never in the folder; each folder's README says how to carry it.
+pub async fn backup(
+    cli: &Cli,
+    out: Option<std::path::PathBuf>,
+    full: bool,
+    print_dir: bool,
+) -> Result<()> {
     let p = painter(cli);
     let cfg = load_config(cli).await;
-
-    let base = out.unwrap_or_else(|| cfg.export_base());
-    let now = time::OffsetDateTime::now_utc();
-    let stamp = format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    );
-    let dir = base.join(format!("Saffev-Backup-{stamp}"));
-    std::fs::create_dir_all(&dir).map_err(crate::Error::Io)?;
-
     let store = crate::store::Store::open(&cfg.db_path()).await?;
-    let schema = store.backup_to(dir.join("saffev.db")).await?;
-    let db_bytes = std::fs::metadata(dir.join("saffev.db"))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let req = if full {
+        crate::backup::Request::Full
+    } else {
+        crate::backup::Request::Auto
+    };
+    let outcome = crate::backup::run(&store, &cfg, out, req).await?;
 
-    // Best-effort config copy: a zero-config install has nothing to copy.
-    let cfg_copied = std::fs::copy(cfg.config_path(), dir.join("saffev.toml")).is_ok();
+    match &outcome {
+        crate::backup::Outcome::Unchanged { dir } => {
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("backup"),
+                p.success("nothing changed since the last backup")
+            );
+            println!(
+                "{} {}",
+                p.prompt("·"),
+                p.muted(&format!("still current: {}", dir.display()))
+            );
+        }
+        crate::backup::Outcome::Written {
+            dir,
+            manifest,
+            pruned,
+        } => {
+            let what = match manifest.kind {
+                crate::backup::Kind::Full => "full backup".to_string(),
+                crate::backup::Kind::Incremental => {
+                    format!("incremental backup (link {} of its chain)", manifest.depth)
+                }
+            };
+            println!(
+                "{} {} {}",
+                p.dot(Level::Ok),
+                p.label("backup"),
+                p.success(&format!("{what} written to {}", dir.display()))
+            );
+            println!(
+                "{} {}",
+                p.prompt("·"),
+                p.muted(&format!(
+                    "{} {:.1} MB · schema v{} · encrypted with your existing key",
+                    manifest.db_file,
+                    manifest.db_bytes as f64 / 1e6,
+                    manifest.schema
+                ))
+            );
+            if !pruned.is_empty() {
+                println!(
+                    "{} {}",
+                    p.prompt("·"),
+                    p.muted(&format!(
+                        "removed {} older backup folder(s) (keep_chains)",
+                        pruned.len()
+                    ))
+                );
+            }
+            println!(
+                "{} {}",
+                p.prompt("·"),
+                p.muted("the key is NOT in the folder — see README.md inside for how to carry it"),
+            );
+        }
+    }
+    if print_dir {
+        // Last line, whole path, no decoration: parsed by the menu-bar app.
+        println!("SAFFEV_BACKUP_DIR={}", outcome.dir().display());
+    }
+    Ok(())
+}
 
-    // Remember this backup so the Studio/panel can say "backed up · 3h ago"
-    // and only offer another one once the archive has changed. Flushed
-    // explicitly: this process exits right after.
-    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
-    store.enqueue(crate::store::WriteOp::Setting {
-        key: "last_backup_ts".to_string(),
-        value: now_ms.to_string(),
-    });
-    store.enqueue(crate::store::WriteOp::Setting {
-        key: "last_backup_dir".to_string(),
-        value: dir.to_string_lossy().to_string(),
-    });
-    let _ = store.flush().await;
-
-    let created = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let version = env!("CARGO_PKG_VERSION");
-    let readme = format!(
-        "# Saffev backup — {created}\n\n\
-         Created by `saffev backup` v{version}. Contents:\n\n\
-         - `saffev.db` — the complete store (proxy history, findings, preserved\n\
-         \x20 sessions, integrity chain) as a consistent `VACUUM INTO` snapshot.\n\
-         \x20 Schema version {schema}. In the default build this file is\n\
-         \x20 SQLCipher-encrypted with the SAME key as the source machine — the\n\
-         \x20 backup is useless without that key.\n\
-         {config_line}\n\
-         ## The key — read this before you need it\n\n\
-         The database key is deliberately NOT in this folder (a backup that\n\
-         carries its own key is not encrypted in any meaningful sense). To\n\
-         restore on another machine, bring the key yourself:\n\n\
-         - macOS (on the source machine):\n\
-         \x20 `security find-generic-password -s saffev -a db-key -w`\n\
-         - Linux: the secret service entry with service `saffev`, user `db-key`\n\
-         \x20 (e.g. `secret-tool lookup service saffev username db-key`).\n\
-         - If you run Saffev with the `SAFFEV_DB_KEY` environment variable set,\n\
-         \x20 that value IS the key.\n\n\
-         ## Restore\n\n\
-         1. Install Saffev on the new machine — but do NOT start it yet: a\n\
-         \x20  first start would mint a fresh key that cannot open this file.\n\
-         2. Put the key where Saffev looks: add it to the OS keychain (macOS:\n\
-         \x20  `security add-generic-password -s saffev -a db-key -w '<key>'`)\n\
-         \x20  or export `SAFFEV_DB_KEY` for every start.\n\
-         3. Copy `saffev.db` into the data directory ({data_dir}) and, if\n\
-         \x20  present, `saffev.toml` into the config location.\n\
-         4. `saffev start` — History, Agents, and the archive are exactly as\n\
-         \x20  they were.\n",
-        config_line = if cfg_copied {
-            "- `saffev.toml` — the config file at backup time.\n"
-        } else {
-            "- (no config file existed at backup time — defaults were in use)\n"
-        },
-        data_dir = cfg.data_dir.display(),
-    );
-    std::fs::write(dir.join("README.md"), readme).map_err(crate::Error::Io)?;
-
+/// `saffev restore <DIR> [--to FILE] [--replace]` — rebuild a database from a
+/// backup chain into a new file. Refuses to touch the live database while the
+/// daemon is running.
+pub async fn restore(
+    cli: &Cli,
+    dir: std::path::PathBuf,
+    to: Option<std::path::PathBuf>,
+    replace: bool,
+) -> Result<()> {
+    let p = painter(cli);
+    let cfg = load_config(cli).await;
+    let target = to.unwrap_or_else(|| cfg.db_path());
+    if target == cfg.db_path()
+        && matches!(
+            super::daemon::daemon_state(&super::daemon::pid_path(&cfg)),
+            Ok(Some(true))
+        )
+    {
+        return Err(crate::Error::Config(
+            "Saffev is running — run `saffev stop` (and quit the menu-bar app) before restoring"
+                .into(),
+        ));
+    }
+    if target.exists() {
+        if !replace {
+            return Err(crate::Error::Config(format!(
+                "{} already exists — pass --replace to move it aside, or --to <file>",
+                target.display()
+            )));
+        }
+        let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut aside = target.as_os_str().to_owned();
+        aside.push(format!(".before-restore-{stamp}"));
+        std::fs::rename(&target, &aside).map_err(crate::Error::Io)?;
+        // The WAL sidecars belong to the file just moved, not to the restore.
+        for ext in ["-wal", "-shm"] {
+            let mut side = target.as_os_str().to_owned();
+            side.push(ext);
+            let side = std::path::PathBuf::from(side);
+            if side.exists() {
+                let mut moved = aside.clone();
+                moved.push(ext);
+                let _ = std::fs::rename(&side, moved);
+            }
+        }
+        println!(
+            "{} {}",
+            p.prompt("·"),
+            p.muted(&format!(
+                "moved the existing database to {}",
+                std::path::Path::new(&aside).display()
+            ))
+        );
+    }
+    let (dir2, target2) = (dir.clone(), target.clone());
+    let stats = tokio::task::spawn_blocking(move || crate::backup::restore(&dir2, &target2))
+        .await
+        .map_err(|e| crate::Error::Store(format!("restore join: {e}")))??;
     println!(
         "{} {} {}",
         p.dot(Level::Ok),
-        p.label("backup"),
-        p.success(&format!("written to {}", dir.display()))
-    );
-    println!(
-        "{} {}",
-        p.prompt("·"),
-        p.muted(&format!(
-            "database {:.1} MB · schema v{schema} · encrypted with your existing key",
-            db_bytes as f64 / 1e6
+        p.label("restore"),
+        p.success(&format!(
+            "rebuilt {} from {}",
+            target.display(),
+            dir.display()
         ))
     );
     println!(
         "{} {}",
         p.prompt("·"),
-        p.muted("the key is NOT in the folder — see README.md inside for how to carry it"),
+        p.muted(&format!(
+            "full copy + {} incremental link(s) · schema v{} · integrity check passed",
+            stats.deltas_applied, stats.schema
+        ))
     );
     Ok(())
 }

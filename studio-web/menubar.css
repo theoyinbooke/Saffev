@@ -368,6 +368,8 @@ button { font: inherit; color: inherit; }
 .notice[hidden] { display: none; }
 .notice b { font-weight: 600; }
 .notice span { color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.notice span { flex: 1; }
+.notice .btn { flex: none; margin-left: auto; }
 .notice.ok { border-color: color-mix(in oklab, var(--safe) 40%, var(--border)); background: var(--safe-soft); }
 .notice.error { border-color: color-mix(in oklab, var(--danger) 40%, var(--border)); background: var(--danger-soft); }
 .spin { width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--brand); border-radius: 999px; animation: spin .8s linear infinite; flex: none; }

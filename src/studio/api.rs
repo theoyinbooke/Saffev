@@ -1633,7 +1633,8 @@ pub async fn engines_revert(
 /// Reports the current vs latest released version + whether an update is
 /// available. **Fail-soft**: any network error degrades to `updateAvailable =
 /// false` with a null `latestVersion` (the SPA then just shows no banner). Safe
-/// to call on every Studio load.
+/// to call on every Studio load: the answer is cached (see
+/// [`crate::update::check_cached`]).
 ///
 /// PRIVACY: this is the ONE outbound call the Studio makes besides the local
 /// engine, and it contacts **GitHub release metadata only** — it sends no user
@@ -1641,7 +1642,7 @@ pub async fn engines_revert(
 /// `_state` is unused (the check needs no store/config) but kept for a uniform
 /// handler signature + future auth context.
 pub async fn update_get(State(_state): State<StudioState>) -> Json<dto::UpdateStatus> {
-    let status = crate::update::check().await;
+    let status = crate::update::check_cached().await;
     // Report up front whether POST /api/update can self-apply here, so the SPA
     // offers the right affordance: the one-click button, or honest guidance +
     // a release link (DMG .app installs, dev builds).
@@ -2031,12 +2032,7 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
     // At-risk = past (or within a week of) the tool's deletion line AND not
     // yet in the archive. A preserved session is safe by definition; counting
     // it here kept the "overdue" flag up after the user clicked Preserve.
-    let archived_ids: std::collections::HashSet<String> = state
-        .store
-        .archived_sessions()
-        .await
-        .map(|v| v.into_iter().map(|a| a.id).collect())
-        .unwrap_or_default();
+    let archived_ids = state.store.archived_ids().await.unwrap_or_default();
     let unpreserved: Vec<crate::agents::AgentSession> = sessions
         .iter()
         .filter(|s| !archived_ids.contains(&s.id))
@@ -2060,11 +2056,15 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         .await
         .ok()
         .flatten();
-    let changed_since_backup = match (archived.latest_ts, last_backup_ts) {
-        (Some(latest), Some(backup)) => latest > backup,
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
+    let changed_since_backup =
+        changed_since_backup(&state.store, archived.latest_ts, last_backup_ts).await;
+    let last_backup_error = state
+        .store
+        .get_setting(crate::backup::KEY_LAST_ERROR)
+        .await
+        .ok()
+        .flatten()
+        .filter(|e| !e.is_empty());
     let cfg = state.config.load();
     Json(dto::AgentsOverview {
         tools: tools.iter().map(tool_stat_view).collect(),
@@ -2082,6 +2082,9 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
             last_backup_ts,
             last_backup_dir,
             changed_since_backup,
+            last_backup_error,
+            backup_auto: cfg.backup.auto,
+            backup_running: crate::backup::is_running(),
             enabled: cfg.archive.enabled,
             auto: cfg.archive.auto,
             count: archived.count,
@@ -2090,6 +2093,31 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
             db_bytes: db_size_bytes(&cfg),
         },
     })
+}
+
+/// Has anything been recorded since the last backup? A backup copies proxy
+/// history too, so this compares the store's cursor with the one the last
+/// backup reached — not just the archive. Backups from before cursors were
+/// recorded fall back to the archive timestamp.
+async fn changed_since_backup(
+    store: &crate::store::Store,
+    archive_latest_ts: Option<i64>,
+    last_backup_ts: Option<i64>,
+) -> bool {
+    let last_cursor: Option<crate::store::BackupCursor> = store
+        .get_setting(crate::backup::KEY_LAST_CURSOR)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok());
+    match (last_cursor, store.backup_cursor().await.ok()) {
+        (Some(last), Some(now)) => now != last,
+        _ => match (archive_latest_ts, last_backup_ts) {
+            (Some(latest), Some(backup)) => latest > backup,
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+    }
 }
 
 /// On-disk footprint of the store: the database file plus its WAL (checkpoint
@@ -2488,6 +2516,64 @@ pub async fn archive_run(
     Ok(Json(summary))
 }
 
+/// `POST /api/backup` — back up the store to the export destination, in this
+/// process (no second store open, no child process). Incremental when a usable
+/// chain exists; `{"full": true}` starts a new one. `409` while another backup
+/// runs; `503` when the destination is missing (e.g. an unplugged drive).
+pub async fn backup_run(
+    State(state): State<StudioState>,
+    body: Option<Json<dto::BackupRequest>>,
+) -> Result<Json<dto::BackupResultView>, Response> {
+    if crate::backup::is_running() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "backup_running",
+            "A backup is already running.",
+        ));
+    }
+    let full = body.map(|b| b.0.full).unwrap_or(false);
+    let cfg = state.config.load_full();
+    let req = if full {
+        crate::backup::Request::Full
+    } else {
+        crate::backup::Request::Auto
+    };
+    let outcome = crate::backup::run(&state.store, &cfg, None, req)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            let status = if msg.contains("not available") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if msg.contains("already running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            api_error(status, "backup_failed", &msg)
+        })?;
+    Ok(Json(match outcome {
+        crate::backup::Outcome::Unchanged { dir } => dto::BackupResultView {
+            kind: "unchanged".into(),
+            dir: dir.display().to_string(),
+            bytes: 0,
+            pruned: 0,
+        },
+        crate::backup::Outcome::Written {
+            dir,
+            manifest,
+            pruned,
+        } => dto::BackupResultView {
+            kind: match manifest.kind {
+                crate::backup::Kind::Full => "full".into(),
+                crate::backup::Kind::Incremental => "incremental".into(),
+            },
+            dir: dir.display().to_string(),
+            bytes: manifest.db_bytes,
+            pruned: pruned.len() as u32,
+        },
+    }))
+}
+
 /// Query params for `GET /api/timeline`.
 #[derive(serde::Deserialize)]
 pub struct TimelineParams {
@@ -2663,11 +2749,33 @@ pub async fn timeline(
     }))
 }
 
+/// Query params for `GET /api/archive/verify`.
+#[derive(serde::Deserialize, Default)]
+pub struct VerifyParams {
+    /// `1`/`true` forces a full re-verification now.
+    pub fresh: Option<String>,
+}
+
+/// How long a polling view may reuse an integrity verdict while the archive
+/// is unchanged. Any archival moves the chain head and re-verifies at once.
+const VERIFY_REUSE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// `GET /api/archive/verify` — walk the integrity chain and report the result.
+///
+/// The walk re-hashes every archived message, so a verdict is reused while
+/// the archive is unchanged (up to [`VERIFY_REUSE`]); `?fresh=1` (the
+/// Studio's explicit Verify) always recomputes.
 pub async fn archive_verify(
     State(state): State<StudioState>,
+    Query(params): Query<VerifyParams>,
 ) -> Result<Json<dto::ArchiveIntegrityView>, Response> {
-    let v = state.store.verify_archive().await.map_err(internal)?;
+    let fresh = matches!(params.fresh.as_deref(), Some("1" | "true"));
+    let v = if fresh {
+        state.store.verify_archive().await
+    } else {
+        state.store.verify_archive_cached(VERIFY_REUSE).await
+    }
+    .map_err(internal)?;
     Ok(Json(dto::ArchiveIntegrityView {
         proof_statement: proof_statement(&v),
         entries: v.entries,
@@ -3516,6 +3624,24 @@ pub async fn settings_put(
         live.archive.mirror_repos = v;
     }
 
+    // backup.* — HOT-RELOADABLE: the backup schedule reads the live config on
+    // every check, so both apply without a restart.
+    if let Some(v) = body.backup_auto {
+        persisted.backup.auto = v;
+        live.backup.auto = v;
+    }
+    if let Some(h) = body.backup_interval_hours {
+        if !(1..=720).contains(&h) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_backup_interval",
+                "Backup interval must be between 1 and 720 hours.",
+            ));
+        }
+        persisted.backup.interval_hours = h;
+        live.backup.interval_hours = h;
+    }
+
     // export_dir — HOT-RELOADABLE. Validated here rather than at export time:
     // a user pointing exports at an SD card wants to find out about a typo (or
     // an unmounted card) when they hit Save, not when tonight's export silently
@@ -3662,6 +3788,8 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         archive_auto: cfg.archive.auto,
         archive_redact: cfg.archive.redact,
         archive_mirror_repos: cfg.archive.mirror_repos,
+        backup_auto: cfg.backup.auto,
+        backup_interval_hours: cfg.backup.interval_hours,
         db_bytes: db_size_bytes(&cfg),
         export_dir: cfg.export_dir.as_deref().map(|p| p.display().to_string()),
         export_dir_effective: cfg.export_base().display().to_string(),
@@ -4226,6 +4354,98 @@ mod tests {
         assert!(resp.0.export_dir.is_none());
         assert!(handle.load().export_dir.is_none());
         assert_eq!(handle.load().export_base(), crate::agents::home());
+    }
+
+    /// `POST /api/backup` writes in-process to the export destination, then
+    /// reports "unchanged" until something new lands — and the Agents view's
+    /// `changedSinceBackup` follows the same cursor, proxy history included.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // takes turns with the backup tests
+    async fn backup_endpoint_is_incremental_and_drives_changed_since_backup() {
+        let _serial = crate::backup::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        let dest = handle.load().data_dir.join("backups");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut cfg = (*handle.load_full()).clone();
+        cfg.export_dir = Some(dest.clone());
+        handle.store(std::sync::Arc::new(cfg));
+
+        let first = backup_run(State(state.clone()), None)
+            .await
+            .expect("backup ok")
+            .0;
+        assert_eq!(first.kind, "full");
+        assert!(std::path::Path::new(&first.dir).starts_with(&dest));
+        let second = backup_run(State(state.clone()), None)
+            .await
+            .expect("backup ok")
+            .0;
+        assert_eq!(second.kind, "unchanged");
+        assert_eq!(second.dir, first.dir);
+        // (Not via `agents()`: that lists the real machine's coding-tool history.)
+        assert!(!changed_since_backup(&state.store, None, None).await);
+
+        state.store.enqueue(crate::store::WriteOp::Setting {
+            key: "unrelated".into(),
+            value: "settings alone are not new history".into(),
+        });
+        state
+            .store
+            .enqueue(crate::store::WriteOp::Request(crate::store::RequestMeta {
+                id: "r-new".into(),
+                ts: 5,
+                source_app: None,
+                source_confidence: crate::store::SourceConfidence::Pid,
+                engine: "ollama".into(),
+                model: None,
+                endpoint: "/api/chat".into(),
+                stream: false,
+                input_tokens: None,
+                input_tokens_src: crate::store::TokenSource::Estimated,
+                latency_ms: None,
+                request_hash: String::new(),
+                req_bytes: None,
+                user_agent: None,
+                content_type: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                msg_count: None,
+                has_system: None,
+                tool_count: None,
+            }));
+        state.store.flush().await.unwrap();
+        assert!(
+            changed_since_backup(&state.store, None, None).await,
+            "new proxy history counts as a change"
+        );
+        let third = backup_run(State(state.clone()), None)
+            .await
+            .expect("backup ok")
+            .0;
+        assert_eq!(third.kind, "incremental");
+    }
+
+    #[tokio::test]
+    async fn settings_put_backup_schedule_applies_live_and_validates() {
+        let (state, handle) = test_state(crate::config::Config::default()).await;
+        let bad = dto::SettingsUpdate {
+            backup_interval_hours: Some(0),
+            ..Default::default()
+        };
+        assert!(settings_put(State(state.clone()), Json(bad)).await.is_err());
+        let ok = dto::SettingsUpdate {
+            backup_auto: Some(true),
+            backup_interval_hours: Some(6),
+            ..Default::default()
+        };
+        let resp = settings_put(State(state), Json(ok)).await.expect("valid").0;
+        assert!(resp.backup_auto);
+        assert_eq!(resp.backup_interval_hours, 6);
+        assert!(handle.load().backup.auto);
+        assert_eq!(handle.load().backup.interval_hours, 6);
     }
 
     /// A destination that does not exist (an unmounted card, a typo) or is not

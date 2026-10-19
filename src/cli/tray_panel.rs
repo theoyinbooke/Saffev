@@ -52,8 +52,14 @@ pub enum PanelMsg {
     Restart,
     Logs,
     Update,
-    /// Run `saffev backup` (encrypted copy + restore notes) and reveal it.
+    /// Run `saffev backup` as a child (the menu fallback; the panel itself
+    /// backs up through `POST /api/backup`).
     Backup,
+    /// Show a backup folder in Finder. The path comes from the page, so it is
+    /// checked by [`sanitize_reveal_path`] before `open` sees it.
+    Reveal {
+        path: String,
+    },
     /// Open the native folder picker for the export/backup destination; the
     /// result comes back to the page as `exportDirChosen(path|null)`, which
     /// saves it through the Studio API (validated there).
@@ -104,6 +110,26 @@ pub fn sanitize_route(route: &str) -> Option<String> {
         return None;
     }
     Some(format!("#/{body}"))
+}
+
+/// Accept a page-supplied folder for "Show in Finder" only if it is an
+/// absolute path to an existing directory whose name marks it as a Saffev
+/// backup (`Saffev-Backup-…`). The page is ours, but whatever it sends still
+/// becomes an argument to `open`, so it must not be able to name an
+/// arbitrary file or app, or a dash-leading option.
+pub fn sanitize_reveal_path(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() || path.len() > 4096 {
+        return None;
+    }
+    let name = p.file_name()?.to_str()?;
+    if !name.starts_with(crate::backup::DIR_PREFIX) {
+        return None;
+    }
+    if !p.is_dir() {
+        return None;
+    }
+    Some(p.to_path_buf())
 }
 
 /// Clamp the height the page asked for into the host's bounds.
@@ -222,9 +248,10 @@ mod imp {
     const REOPEN_DEBOUNCE: Duration = Duration::from_millis(350);
     /// Don't hammer `load_url` while Studio is still coming up.
     const RELOAD_BACKOFF: Duration = Duration::from_secs(6);
-    /// TCP probe budget on the main thread. Only paid while the service is
-    /// running but the Studio page isn't loaded yet.
-    const PROBE_TIMEOUT: Duration = Duration::from_millis(120);
+    /// TCP probe budget. Runs on a worker thread so the menu-bar UI never
+    /// waits on it; only paid while the service is running but the Studio page
+    /// isn't loaded yet.
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Page {
@@ -247,6 +274,10 @@ mod imp {
         pub pinned: bool,
         panel_url: String,
         studio_port: u16,
+        /// Result of the last background Studio probe.
+        probe_ok: Arc<AtomicBool>,
+        /// A probe is in flight (at most one at a time).
+        probe_busy: Arc<AtomicBool>,
     }
 
     impl Panel {
@@ -327,6 +358,8 @@ mod imp {
                 pinned: false,
                 panel_url,
                 studio_port,
+                probe_ok: Arc::new(AtomicBool::new(false)),
+                probe_busy: Arc::new(AtomicBool::new(false)),
             })
         }
 
@@ -503,9 +536,41 @@ mod imp {
         /// Cheap loopback probe: is anything listening on the Studio port? The
         /// daemon writes its pid file before Studio binds, so "running" alone
         /// is not "serving".
+        ///
+        /// Non-blocking: returns the last probe's answer and starts a new probe
+        /// on a worker thread, so the run loop (and every click on the menu
+        /// bar) never waits on a connect. The page loads one tick later than a
+        /// blocking probe would allow — two seconds, invisible in practice.
         fn studio_answers(&self) -> bool {
-            let addr = SocketAddr::from(([127, 0, 0, 1], self.studio_port));
-            TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+            let answer = self.probe_ok.swap(false, Ordering::AcqRel);
+            if !self.probe_busy.swap(true, Ordering::AcqRel) {
+                let (ok, busy, port) = (
+                    self.probe_ok.clone(),
+                    self.probe_busy.clone(),
+                    self.studio_port,
+                );
+                std::thread::spawn(move || {
+                    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                    ok.store(
+                        TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok(),
+                        Ordering::Release,
+                    );
+                    busy.store(false, Ordering::Release);
+                });
+            }
+            answer
+        }
+
+        /// Tell the page whether it is on screen. Called after the page boots:
+        /// the page starts hidden (it is loaded into a hidden window at launch
+        /// and after a service restart) and only fetches once told it is shown.
+        pub fn announce_visibility(&self) {
+            let js = if self.is_visible() {
+                "window.__saffevHost&&window.__saffevHost.onShow&&window.__saffevHost.onShow();"
+            } else {
+                "window.__saffevHost&&window.__saffevHost.onHide&&window.__saffevHost.onHide();"
+            };
+            self.eval(js);
         }
 
         /// The monitor under the status item (physical bounds + scale), falling
@@ -585,6 +650,7 @@ mod stub {
         pub fn sync(&mut self, _running: bool) {}
         pub fn push_state(&self, _state: &HostState) {}
         pub fn mark_ready(&mut self) {}
+        pub fn announce_visibility(&self) {}
         pub fn eval(&self, _js: &str) {}
     }
 }
@@ -652,6 +718,39 @@ mod tests {
         assert_eq!(parse_msg(r#"{"cmd":"format_disk"}"#), None);
         assert_eq!(parse_msg(r#"{"cmd":"set_login"}"#), None);
         assert_eq!(parse_msg(r#"{"cmd":"resize","height":"tall"}"#), None);
+    }
+
+    #[test]
+    fn reveal_paths_are_restricted_to_backup_folders() {
+        assert_eq!(
+            parse_msg(r#"{"cmd":"reveal","path":"/x"}"#),
+            Some(PanelMsg::Reveal { path: "/x".into() })
+        );
+        assert_eq!(parse_msg(r#"{"cmd":"reveal"}"#), None);
+
+        let base = std::env::temp_dir().join(format!("saffev-reveal-{}", std::process::id()));
+        let good = base.join("Saffev-Backup-20261019-120000");
+        let other = base.join("Documents");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(
+            sanitize_reveal_path(good.to_str().unwrap()),
+            Some(good.clone())
+        );
+        // Not a backup folder, not absolute, not existing, an app, an option.
+        assert_eq!(sanitize_reveal_path(other.to_str().unwrap()), None);
+        assert_eq!(sanitize_reveal_path("Saffev-Backup-20261019-120000"), None);
+        assert_eq!(sanitize_reveal_path("/nope/Saffev-Backup-1"), None);
+        assert_eq!(sanitize_reveal_path("/Applications/Calculator.app"), None);
+        assert_eq!(sanitize_reveal_path("--args"), None);
+        let file = base.join("Saffev-Backup-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            sanitize_reveal_path(file.to_str().unwrap()),
+            None,
+            "directories only"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

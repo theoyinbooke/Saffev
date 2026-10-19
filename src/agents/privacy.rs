@@ -249,6 +249,105 @@ fn report_cache() -> &'static std::sync::Mutex<Option<(ReportKey, PrivacyReport)
     C.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Per-session scan results, keyed by session id and validated by the
+/// session's `content_hash` (which changes whenever its stored text does, the
+/// redaction setting included). Cleared when the detector changes.
+type SessionScans = std::collections::HashMap<String, (String, Option<ArchivePiiRow>)>;
+
+fn session_scans() -> &'static std::sync::Mutex<(u64, SessionScans)> {
+    static C: std::sync::OnceLock<std::sync::Mutex<(u64, SessionScans)>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new((0, SessionScans::new())))
+}
+
+/// The archive's PII rollups for sessions updated since `since_ts`, scanning
+/// only sessions that are new or changed since the last report.
+///
+/// The archive changes every few minutes while someone is coding (the
+/// snapshot loop re-archives the active session), and each change used to
+/// trigger a full rescan of every preserved message. Now one changed session
+/// costs one session's scan.
+async fn scan_incremental(
+    store: &Store,
+    detector: std::sync::Arc<crate::brain::pii::Detector>,
+    detector_sig: u64,
+    since_ts: i64,
+) -> Vec<ArchivePiiRow> {
+    let sessions = store.archived_sessions().await.unwrap_or_default();
+    let stale: Vec<String> = {
+        let Ok(mut guard) = session_scans().lock() else {
+            return Vec::new();
+        };
+        let (sig, cache) = &mut *guard;
+        if *sig != detector_sig {
+            cache.clear();
+            *sig = detector_sig;
+        }
+        let live: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.id.as_str()).collect();
+        cache.retain(|id, _| live.contains(id.as_str()));
+        sessions
+            .iter()
+            .filter(|s| s.updated_ts >= since_ts)
+            .filter(|s| {
+                cache
+                    .get(&s.id)
+                    .map(|(h, _)| h != &s.content_hash)
+                    .unwrap_or(true)
+            })
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    if !stale.is_empty() {
+        let fresh = store
+            .scan_archive_pii_sessions(detector, stale.clone())
+            .await
+            .unwrap_or_default();
+        let mut by_id: std::collections::HashMap<String, ArchivePiiRow> = fresh
+            .into_iter()
+            .map(|r| (r.session_id.clone(), r))
+            .collect();
+        if let Ok(mut guard) = session_scans().lock() {
+            let hashes: std::collections::HashMap<&str, &str> = sessions
+                .iter()
+                .map(|s| (s.id.as_str(), s.content_hash.as_str()))
+                .collect();
+            for id in stale {
+                let hash = hashes
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string();
+                let row = by_id.remove(&id);
+                guard.1.insert(id, (hash, row));
+            }
+        }
+    }
+    let Ok(guard) = session_scans().lock() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ArchivePiiRow> = sessions
+        .iter()
+        .filter(|s| s.updated_ts >= since_ts)
+        .filter_map(|s| {
+            let mut r = guard.1.get(&s.id)?.1.clone()?;
+            // Metadata from the current listing (a title can change without
+            // the text changing).
+            r.tool = s.tool.clone();
+            r.title = s.title.clone();
+            r.project = s.project.clone();
+            r.updated_ts = s.updated_ts;
+            Some(r)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.findings
+            .cmp(&a.findings)
+            .then(b.updated_ts.cmp(&a.updated_ts))
+    });
+    rows
+}
+
 /// Stable signature of the user's custom-pattern list, so editing a pattern
 /// invalidates a cached report instead of silently serving stale findings.
 pub fn detector_signature(custom: &[crate::config::CustomPattern]) -> u64 {
@@ -294,10 +393,7 @@ pub async fn report(store: &Store, cfg: &crate::config::Config, range_ms: i64) -
     } else {
         0
     };
-    let rows = store
-        .scan_archive_pii(std::sync::Arc::new(detector), since_ts)
-        .await
-        .unwrap_or_default();
+    let rows = scan_incremental(store, std::sync::Arc::new(detector), key.detector, since_ts).await;
 
     let coverage = Coverage {
         preserved: stats.count as u32,

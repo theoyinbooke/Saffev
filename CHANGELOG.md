@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### Backups: incremental, scheduled, and restorable
+- **Incremental backups.** After the first full copy, each backup writes only
+  what changed since the previous one (new chain entries plus the current text
+  of every session they touch, new proxy history, settings) into a small
+  sibling folder. `[backup] full_every` (default 7) starts a fresh chain.
+- **Scheduled backups** (`[backup] auto`, `interval_hours`, off by default;
+  also in the panel's quick settings and Studio Settings). A backup missed while
+  asleep or unplugged runs soon after.
+- **`saffev restore <folder>`** rebuilds a database from any link of a chain,
+  into a new file, after an integrity check. Never overwrites.
+- Optional retention: `[backup] keep_chains` (0 = keep everything).
+
+### Fixes
+- **Back up no longer closes the panel.** It used to open Finder by itself,
+  which stole focus and hid the panel (and its result). The panel now backs up
+  through the Studio and offers *Show in Finder*.
+- A backup folder path containing a space (e.g. iCloud Drive) was reported as
+  a failed backup.
+- Backups are atomic (built in a hidden `.partial` folder, renamed when done);
+  two in the same second no longer collide; an unplugged destination is
+  refused instead of being recreated on the internal disk.
+- "Changed since last backup" now counts new proxy history, not only the archive.
+- Alerts for sessions near their deletion line offer **Preserve now** (what
+  protects them) instead of a full backup.
+
+### Performance
+- The menu-bar panel no longer fetches or streams while hidden (it used to,
+  from launch and after every service restart).
+- The integrity check is reused while the archive is unchanged (any archival
+  re-verifies; Studio's explicit check always recomputes) and streams instead
+  of holding each transcript twice in memory.
+- The archive size total, the privacy report and the update check are cached;
+  the privacy report rescans only sessions that changed.
+- Re-archiving a growing session keeps its stored prefix instead of deleting
+  and re-indexing the whole transcript every few minutes.
+- Claude Code and Codex transcripts are parsed **incrementally**: a session
+  file that only grew is read from where the last parse stopped, so one new
+  message costs one line instead of the whole file (64 MB transcript: 219 ms →
+  4 ms). Cached parse state is capped at 64 MB and dropped after 15 idle
+  minutes, so only sessions that are actively growing stay in memory.
+- The menu-bar run loop no longer redraws the icon and re-reads the pid file on
+  every mouse move, and the Studio probe runs off the UI thread.
+
 ## v0.8.0
 
 **The menu-bar panel release.**

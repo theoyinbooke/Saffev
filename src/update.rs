@@ -243,6 +243,38 @@ pub async fn check() -> UpdateStatus {
     }
 }
 
+/// [`check`], reusing a recent answer: a confirmed result for six hours, a
+/// failed check for thirty minutes. The Studio and the menu-bar panel ask on
+/// every load and poll; without this every panel open (and every 6 seconds on
+/// the panel's Alerts tab) was a request to GitHub — needless traffic for a
+/// tool that promises to stay quiet, and enough to hit GitHub's anonymous rate
+/// limit within minutes. The CLI's explicit `saffev update --check` still
+/// calls [`check`] directly.
+pub async fn check_cached() -> UpdateStatus {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<(Instant, UpdateStatus)>> = Mutex::new(None);
+    const KNOWN_TTL: Duration = Duration::from_secs(6 * 3600);
+    const UNKNOWN_TTL: Duration = Duration::from_secs(30 * 60);
+    if let Ok(last) = LAST.lock() {
+        if let Some((at, status)) = last.as_ref() {
+            let ttl = if status.latest_version.is_some() {
+                KNOWN_TTL
+            } else {
+                UNKNOWN_TTL
+            };
+            if at.elapsed() < ttl {
+                return status.clone();
+            }
+        }
+    }
+    let status = check().await;
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((Instant::now(), status.clone()));
+    }
+    status
+}
+
 /// Apply an available update by re-running the shipped installer. Requires the
 /// install receipt (a real installer install); without it returns
 /// [`UpdateError::NoReceipt`] so callers can show the friendly guidance. On

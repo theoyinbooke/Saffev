@@ -413,8 +413,8 @@ pub async fn at_risk_observation(
     if sessions.is_empty() {
         return None;
     }
-    let archived_ids: std::collections::HashSet<String> = match store.archived_sessions().await {
-        Ok(rows) => rows.into_iter().map(|a| a.id).collect(),
+    let archived_ids: std::collections::HashSet<String> = match store.archived_ids().await {
+        Ok(ids) => ids,
         Err(e) => {
             tracing::debug!(target: "saffev::signals", "at-risk archive read failed: {e}");
             return None;

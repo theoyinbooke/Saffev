@@ -132,6 +132,7 @@ impl StudioServer {
             .route("/archive/export", post(api::archive_export))
             // Preservation: integrity chain — verify, and export an audit bundle.
             .route("/archive/verify", get(api::archive_verify))
+            .route("/backup", post(api::backup_run))
             .route("/archive/audit", post(api::archive_audit))
             .route("/stream", get(api::stream))
             // Order matters: layers run outermost-first on the way in. We want
@@ -198,12 +199,15 @@ impl StudioServer {
         // Signals (G6): the monitor loop is a sibling of the archiver for the
         // same reason — alive exactly as long as the control plane.
         let monitors = spawn_monitor_scheduler(self.state.clone());
+        // Scheduled backups (`[backup] auto`): same lifetime as the others.
+        let backups = spawn_backup_scheduler(self.state.clone());
 
         let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await;
         scheduler.abort();
         monitors.abort();
+        backups.abort();
         served.map_err(|e| Error::Studio(format!("Studio server error: {e}")))?;
         Ok(())
     }
@@ -267,6 +271,72 @@ fn spawn_archive_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
                         ),
                     }
                 }
+            }
+        }
+    })
+}
+
+/// How often the backup schedule checks whether a backup is due. Cheap when
+/// nothing is due (a settings read); the interval itself is `[backup]
+/// interval_hours`. Checking often is what makes a backup missed while the
+/// laptop slept (or the drive was unplugged) catch up soon after.
+const BACKUP_CHECK_SECS: u64 = 10 * 60;
+
+/// Spawn the backup schedule: when `[backup] auto` is on and the last backup
+/// (or the last "nothing changed" check) is older than `interval_hours`, run
+/// one — incremental when the chain allows, so each run copies only what is
+/// new since the previous one.
+///
+/// The first check waits one period so a fresh start (the archiver's own
+/// on-start snapshot, the Studio's first page loads) is not competing with a
+/// backup for the disk. Failures — most often an unplugged destination — are
+/// recorded (`last_backup_error`, shown in the panel) and retried at the next
+/// check; this loop never takes the Studio down.
+fn spawn_backup_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(BACKUP_CHECK_SECS);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let cfg = state.config.load_full();
+            if !cfg.backup.auto {
+                continue;
+            }
+            let setting = |k: &'static str| {
+                let store = state.store.clone();
+                async move {
+                    store
+                        .get_setting(k)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<i64>().ok())
+                }
+            };
+            let last = setting(crate::backup::KEY_LAST_TS)
+                .await
+                .max(setting(crate::backup::KEY_LAST_CHECK_TS).await);
+            let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+            if !crate::backup::due(&cfg, last, now) {
+                continue;
+            }
+            match crate::backup::run(&state.store, &cfg, None, crate::backup::Request::Auto).await {
+                Ok(crate::backup::Outcome::Written { dir, manifest, .. }) => tracing::info!(
+                    target: "saffev::backup",
+                    "scheduled {:?} backup written to {} ({} bytes)",
+                    manifest.kind,
+                    dir.display(),
+                    manifest.db_bytes
+                ),
+                Ok(crate::backup::Outcome::Unchanged { .. }) => tracing::debug!(
+                    target: "saffev::backup",
+                    "scheduled backup: nothing changed since the last one"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "saffev::backup",
+                    "scheduled backup failed (will retry at the next check): {e}"
+                ),
             }
         }
     })

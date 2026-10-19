@@ -103,10 +103,36 @@ pub enum Command {
         out: Option<std::path::PathBuf>,
     },
     /// Back up the encrypted database + config (for safekeeping or moving machines).
+    ///
+    /// Incremental by default: after the first (full) backup, each run writes
+    /// only what changed since the previous one, as a new folder in the same
+    /// chain. `--full` starts a new chain.
     Backup {
         /// Directory to create the backup folder in (default: the export destination).
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Write a complete copy and start a new chain, even if an incremental
+        /// backup is possible.
+        #[arg(long)]
+        full: bool,
+        /// Print the backup folder as one machine-readable line
+        /// (`SAFFEV_BACKUP_DIR=<path>`), for the menu-bar app.
+        #[arg(long, hide = true)]
+        print_dir: bool,
+    },
+    /// Rebuild the database from a backup folder (any folder of a chain).
+    ///
+    /// Writes a NEW database; it never overwrites one. Stop Saffev first.
+    Restore {
+        /// The backup folder to restore (a full or incremental one).
+        dir: std::path::PathBuf,
+        /// Where to write the database (default: the data directory's saffev.db).
+        #[arg(long)]
+        to: Option<std::path::PathBuf>,
+        /// If the target exists, move it aside (`saffev.db.before-restore-<ts>`)
+        /// instead of refusing.
+        #[arg(long)]
+        replace: bool,
     },
     /// Stream activity.
     Logs {
@@ -198,9 +224,21 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let out = out.clone();
             commands::report(&cli, days, out.as_deref()).await
         }
-        Command::Backup { ref out } => {
+        Command::Backup {
+            ref out,
+            full,
+            print_dir,
+        } => {
             let out = out.clone();
-            commands::backup(&cli, out).await
+            commands::backup(&cli, out, full, print_dir).await
+        }
+        Command::Restore {
+            ref dir,
+            ref to,
+            replace,
+        } => {
+            let (dir, to) = (dir.clone(), to.clone());
+            commands::restore(&cli, dir, to, replace).await
         }
         Command::Logs { follow } => commands::logs(&cli, follow).await,
         Command::Update { check } => commands::update(&cli, check).await,

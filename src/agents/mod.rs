@@ -37,6 +37,7 @@ pub mod opencode;
 pub mod privacy;
 pub mod retention;
 pub mod roo;
+pub(crate) mod tail;
 pub mod usage;
 pub mod vscode;
 
@@ -1002,6 +1003,70 @@ mod perf {
                 warm
             );
         }
+    }
+
+    /// Manual: what one new message costs to re-snapshot on a big, growing
+    /// Claude Code transcript — a full re-parse (the old behaviour, and still
+    /// the first parse) versus the incremental tail parse.
+    /// `cargo test --release growing_session_reparse_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn growing_session_reparse_timing() {
+        use std::io::Write;
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agents/claude_code/fixture-proj/aaaaaaaa-aaaa-4aaa-8aaa-000000000001.jsonl"
+        ))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("saffev-tailperf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let path = dir
+            .join("proj")
+            .join("aaaaaaaa-aaaa-4aaa-8aaa-0000000000ee.jsonl");
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            while f.get_ref().metadata().unwrap().len() < 60 * 1024 * 1024 {
+                for _ in 0..1000 {
+                    f.write_all(fixture.as_bytes()).unwrap();
+                }
+                f.flush().unwrap();
+            }
+        }
+        let mb = std::fs::metadata(&path).unwrap().len() as f64 / 1e6;
+        let reader = claude_code::ClaudeCodeReader::with_root(dir.clone());
+        let id = path.file_stem().unwrap().to_string_lossy().to_string();
+
+        let t = std::time::Instant::now();
+        let first = reader.session_detail(&id).unwrap();
+        let full = t.elapsed();
+
+        let line = fixture
+            .lines()
+            .find(|l| l.contains("\"assistant\""))
+            .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+        let t = std::time::Instant::now();
+        let grown = reader.session_detail(&id).unwrap();
+        let inc = t.elapsed();
+        assert!(grown.messages.len() > first.messages.len());
+
+        tail::forget(&path);
+        let t = std::time::Instant::now();
+        let again = reader.session_detail(&id).unwrap();
+        let full_again = t.elapsed();
+        assert_eq!(again.messages.len(), grown.messages.len());
+
+        eprintln!(
+            "{mb:.0} MB transcript, {} messages: first parse {full:.2?} · \
+             +1 line incremental {inc:.2?} · +1 line full re-parse {full_again:.2?}",
+            grown.messages.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The per-file cache must return an identical result to an uncached parse,

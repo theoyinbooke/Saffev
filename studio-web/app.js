@@ -2164,6 +2164,24 @@
             ? 'On · each preserved session is also written as Markdown to .saffev/sessions/ inside the git repository it belongs to, so transcripts live next to the code. Commit them or add .saffev/ to .gitignore · your choice. Redaction (above) applies to these files too.'
             : 'Off · preserved sessions live only in the encrypted archive. Turn on to also write Markdown transcripts into each project repo (.saffev/sessions/).',
         el('div', { class: 'ctl' }, [arMirror])));
+      // Scheduled backups — encrypted copies OUTSIDE the data directory (the
+      // export destination). Incremental: each run copies only what changed.
+      const bkAuto = switchBtn(s.backupAuto, 'Toggle automatic backups');
+      bkAuto.addEventListener('click', () => this.save(view, { backupAuto: !bkAuto.classList.contains('on') }));
+      arCard.appendChild(setRow('Automatic backups',
+        s.backupAuto
+          ? 'On · every ' + (s.backupIntervalHours || 24) + ' h Saffev writes a backup to ' + s.exportDirEffective + ' (the export destination). After the first full copy each backup holds only what changed since the previous one; restore any of them with `saffev restore <folder>`.'
+          : 'Off · back up from the menu-bar panel or with `saffev backup`. Turn on to back up on a schedule, incrementally, to the export destination.',
+        el('div', { class: 'ctl' }, [bkAuto])));
+      const bkEvery = el('select', { class: 'input', 'aria-label': 'Backup frequency' });
+      [[1, 'Every hour'], [6, 'Every 6 hours'], [24, 'Daily'], [168, 'Weekly']].forEach(([h, label]) => {
+        const o = el('option', { value: String(h), text: label });
+        if ((s.backupIntervalHours || 24) === h) o.selected = true;
+        bkEvery.appendChild(o);
+      });
+      bkEvery.disabled = !s.backupAuto;
+      bkEvery.addEventListener('change', () => this.save(view, { backupIntervalHours: parseInt(bkEvery.value, 10) }));
+      arCard.appendChild(setRow('Backup frequency', !s.backupAuto ? 'Turn on automatic backups first.' : 'A backup missed while the machine slept (or the drive was unplugged) runs soon after.', el('div', { class: 'ctl' }, [bkEvery])));
       panel.appendChild(arCard);
     },
 

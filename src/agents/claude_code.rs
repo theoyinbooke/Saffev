@@ -7,7 +7,6 @@
 //! Verified against real transcripts on-disk. Tolerant: bad lines are skipped.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -66,154 +65,207 @@ impl ClaudeCodeReader {
 
     /// Parse one session file. `with_messages` toggles building the transcript
     /// (skip it for fast list summaries).
+    ///
+    /// Incremental: a file that only grew since the last parse is read from
+    /// where that parse stopped ([`super::tail`]), so a long active session
+    /// costs its new lines, not its whole transcript, on every snapshot.
     fn parse(&self, path: &Path, with_messages: bool) -> Option<AgentSessionDetail> {
-        // Stream line-by-line: sessions can be tens of MB — never load whole.
-        let file = fs::File::open(path).ok()?;
-        let reader = BufReader::new(file);
         let raw_id = path.file_stem()?.to_string_lossy().to_string();
+        let flavour = if with_messages { "cc:full" } else { "cc:meta" };
+        let state = super::tail::parse(path, flavour, || ParseState::new(with_messages))?;
+        Some(state.finish(&raw_id, path))
+    }
+}
 
-        let mut cwd: Option<String> = None;
-        let mut git_branch: Option<String> = None;
-        let mut title: Option<String> = None;
-        let mut first_user: Option<String> = None;
-        let mut model_counts: std::collections::HashMap<String, u32> = Default::default();
-        let (mut inp, mut outp, mut cache, mut cache_w) = (0u64, 0u64, 0u64, 0u64);
-        let (mut msg_count, mut tool_count) = (0u32, 0u32);
-        let mut first_ts = i64::MAX;
-        let mut last_ts = 0i64;
-        let mut messages: Vec<AgentMessage> = Vec::new();
+/// Everything a Claude Code parse accumulates, fed one line at a time — so it
+/// can be resumed when the file grows.
+#[derive(Clone)]
+struct ParseState {
+    with_messages: bool,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    title: Option<String>,
+    first_user: Option<String>,
+    model_counts: std::collections::HashMap<String, u32>,
+    inp: u64,
+    outp: u64,
+    cache: u64,
+    cache_w: u64,
+    msg_count: u32,
+    tool_count: u32,
+    first_ts: i64,
+    last_ts: i64,
+    messages: Vec<AgentMessage>,
+}
 
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue; // tolerate a truncated/interleaved line
-            };
-            let rtype = v.get("type").and_then(Value::as_str).unwrap_or("");
-
-            // Session-level context (present on message records).
-            if cwd.is_none() {
-                cwd = v.get("cwd").and_then(Value::as_str).map(String::from);
-            }
-            if git_branch.is_none() {
-                git_branch = v
-                    .get("gitBranch")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-            }
-            if let Some(ts) = v.get("timestamp").and_then(Value::as_str) {
-                let ms = super::rfc3339_millis(ts);
-                if ms > 0 {
-                    first_ts = first_ts.min(ms);
-                    last_ts = last_ts.max(ms);
-                }
-            }
-
-            match rtype {
-                "summary" => {
-                    if let Some(s) = v.get("summary").and_then(Value::as_str) {
-                        title = Some(s.to_string());
-                    }
-                }
-                "ai-title" => {
-                    if let Some(s) = v
-                        .get("aiTitle")
-                        .or_else(|| v.get("title"))
-                        .and_then(Value::as_str)
-                    {
-                        title = Some(s.to_string());
-                    }
-                }
-                "user" | "assistant" => {
-                    let msg = v.get("message");
-                    let ts = v
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(super::rfc3339_millis)
-                        .filter(|m| *m > 0);
-                    if rtype == "assistant" {
-                        if let Some(m) = msg {
-                            if let Some(model) = m.get("model").and_then(Value::as_str) {
-                                *model_counts.entry(model.to_string()).or_default() += 1;
-                            }
-                            if let Some(u) = m.get("usage") {
-                                inp += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                                outp += u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                                let cr = u
-                                    .get("cache_read_input_tokens")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                let cw = u
-                                    .get("cache_creation_input_tokens")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                cache += cr + cw;
-                                cache_w += cw;
-                            }
-                        }
-                    }
-                    let role = if rtype == "assistant" {
-                        Role::Assistant
-                    } else {
-                        Role::User
-                    };
-                    let blocks = extract_blocks(msg, role, ts);
-                    // Count a "message" per record; tool blocks bump the tool count.
-                    if blocks.iter().any(|b| b.role != Role::Tool) {
-                        msg_count += 1;
-                    }
-                    tool_count += blocks
-                        .iter()
-                        .filter(|b| matches!(b.kind, MessageKind::ToolUse))
-                        .count() as u32;
-                    if first_user.is_none() && role == Role::User {
-                        first_user = blocks
-                            .iter()
-                            .find(|b| {
-                                matches!(b.kind, MessageKind::Text)
-                                    && !is_injected_prompt(&b.content)
-                            })
-                            .map(|b| b.content.clone());
-                    }
-                    if with_messages {
-                        messages.extend(blocks);
-                    }
-                }
-                _ => {}
-            }
+impl ParseState {
+    fn new(with_messages: bool) -> Self {
+        ParseState {
+            with_messages,
+            cwd: None,
+            git_branch: None,
+            title: None,
+            first_user: None,
+            model_counts: Default::default(),
+            inp: 0,
+            outp: 0,
+            cache: 0,
+            cache_w: 0,
+            msg_count: 0,
+            tool_count: 0,
+            first_ts: i64::MAX,
+            last_ts: 0,
+            messages: Vec::new(),
         }
+    }
 
-        if first_ts == i64::MAX {
-            first_ts = last_ts;
-        }
-        let model = model_counts
+    fn finish(self, raw_id: &str, path: &Path) -> AgentSessionDetail {
+        let first_ts = if self.first_ts == i64::MAX {
+            self.last_ts
+        } else {
+            self.first_ts
+        };
+        // Highest count wins; ties go to the lexically smallest name so the
+        // answer never depends on hash order.
+        let model = self
+            .model_counts
             .into_iter()
-            .max_by_key(|(_, c)| *c)
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
             .map(|(m, _)| m);
-        let title = title.or_else(|| first_user.map(|s| truncate(&s, 80)));
+        let title = self
+            .title
+            .or_else(|| self.first_user.map(|s| truncate(&s, 80)));
 
         let session = AgentSession {
-            id: AgentSession::make_id(AgentTool::ClaudeCode, &raw_id),
+            id: AgentSession::make_id(AgentTool::ClaudeCode, raw_id),
             tool: AgentTool::ClaudeCode,
             title,
-            project: cwd,
-            git_branch,
+            project: self.cwd,
+            git_branch: self.git_branch,
             model,
             started_ts: first_ts,
-            updated_ts: last_ts,
-            message_count: msg_count,
-            tool_call_count: tool_count,
-            input_tokens: inp,
-            output_tokens: outp,
-            cache_tokens: cache,
-            cache_write_tokens: cache_w,
+            updated_ts: self.last_ts,
+            message_count: self.msg_count,
+            tool_call_count: self.tool_count,
+            input_tokens: self.inp,
+            output_tokens: self.outp,
+            cache_tokens: self.cache,
+            cache_write_tokens: self.cache_w,
             source_path: path.to_string_lossy().to_string(),
         };
-        Some(AgentSessionDetail { session, messages })
+        AgentSessionDetail {
+            session,
+            messages: self.messages,
+        }
+    }
+}
+
+impl super::tail::LineState for ParseState {
+    fn weight(&self) -> usize {
+        super::tail::messages_weight(&self.messages)
+    }
+
+    fn feed(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return; // tolerate a truncated/interleaved line
+        };
+        let rtype = v.get("type").and_then(Value::as_str).unwrap_or("");
+
+        // Session-level context (present on message records).
+        if self.cwd.is_none() {
+            self.cwd = v.get("cwd").and_then(Value::as_str).map(String::from);
+        }
+        if self.git_branch.is_none() {
+            self.git_branch = v
+                .get("gitBranch")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+        }
+        if let Some(ts) = v.get("timestamp").and_then(Value::as_str) {
+            let ms = super::rfc3339_millis(ts);
+            if ms > 0 {
+                self.first_ts = self.first_ts.min(ms);
+                self.last_ts = self.last_ts.max(ms);
+            }
+        }
+
+        match rtype {
+            "summary" => {
+                if let Some(s) = v.get("summary").and_then(Value::as_str) {
+                    self.title = Some(s.to_string());
+                }
+            }
+            "ai-title" => {
+                if let Some(s) = v
+                    .get("aiTitle")
+                    .or_else(|| v.get("title"))
+                    .and_then(Value::as_str)
+                {
+                    self.title = Some(s.to_string());
+                }
+            }
+            "user" | "assistant" => {
+                let msg = v.get("message");
+                let ts = v
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(super::rfc3339_millis)
+                    .filter(|m| *m > 0);
+                if rtype == "assistant" {
+                    if let Some(m) = msg {
+                        if let Some(model) = m.get("model").and_then(Value::as_str) {
+                            *self.model_counts.entry(model.to_string()).or_default() += 1;
+                        }
+                        if let Some(u) = m.get("usage") {
+                            self.inp += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            self.outp +=
+                                u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            let cr = u
+                                .get("cache_read_input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let cw = u
+                                .get("cache_creation_input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            self.cache += cr + cw;
+                            self.cache_w += cw;
+                        }
+                    }
+                }
+                let role = if rtype == "assistant" {
+                    Role::Assistant
+                } else {
+                    Role::User
+                };
+                let blocks = extract_blocks(msg, role, ts);
+                // Count a "message" per record; tool blocks bump the tool count.
+                if blocks.iter().any(|b| b.role != Role::Tool) {
+                    self.msg_count += 1;
+                }
+                self.tool_count += blocks
+                    .iter()
+                    .filter(|b| matches!(b.kind, MessageKind::ToolUse))
+                    .count() as u32;
+                if self.first_user.is_none() && role == Role::User {
+                    self.first_user = blocks
+                        .iter()
+                        .find(|b| {
+                            matches!(b.kind, MessageKind::Text) && !is_injected_prompt(&b.content)
+                        })
+                        .map(|b| b.content.clone());
+                }
+                if self.with_messages {
+                    self.messages.extend(blocks);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -401,6 +453,76 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grow a transcript the way a live session does — line by line, each
+    /// line written in two halves so a read can land mid-line — and after every
+    /// write require the incremental parse to equal a fresh full parse (in
+    /// both modes). The fresh parse reads a copy at a new path, so it cannot
+    /// reuse any cached state.
+    #[test]
+    fn incremental_parse_matches_a_full_parse_as_the_file_grows() {
+        let root = std::env::temp_dir().join(format!("saffev-tailcmp-{}", uuid::Uuid::new_v4()));
+        let (live_dir, ref_dir) = (root.join("live"), root.join("ref"));
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&ref_dir).unwrap();
+        let name = "aaaaaaaa-aaaa-4aaa-8aaa-0000000000ff.jsonl";
+        let live = live_dir.join(name);
+        let reference = ref_dir.join(name);
+        let mut text = String::new();
+        for f in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/agents/claude_code/fixture-proj/aaaaaaaa-aaaa-4aaa-8aaa-000000000001.jsonl"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/agents/claude_code/fixture-proj/bbbbbbbb-bbbb-4bbb-8bbb-000000000002.jsonl"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/costs/home/.claude/projects/-home-dev-fixture-proj/dddd0004-0000-4000-8000-000000000004.jsonl"),
+        ] {
+            text.push_str(&std::fs::read_to_string(f).unwrap());
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        let parse = |p: &Path, m: bool| ClaudeCodeReader::with_root(PathBuf::new()).parse(p, m);
+        let check = |label: &str| {
+            std::fs::copy(&live, &reference).unwrap();
+            for with_messages in [true, false] {
+                let mut inc = parse(&live, with_messages).expect("incremental parse");
+                let mut full = parse(&reference, with_messages).expect("full parse");
+                inc.session.source_path.clear();
+                full.session.source_path.clear();
+                assert_eq!(
+                    serde_json::to_value(&inc).unwrap(),
+                    serde_json::to_value(&full).unwrap(),
+                    "{label} (messages: {with_messages})"
+                );
+            }
+            // A new reference path each time: never a cached state.
+            let _ = std::fs::remove_file(&reference);
+            super::super::tail::forget(&reference);
+        };
+        std::fs::write(&live, b"").unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let cut = line
+                .char_indices()
+                .nth(line.chars().count() / 2)
+                .map(|(b, _)| b)
+                .unwrap_or(0);
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .unwrap();
+            use std::io::Write;
+            f.write_all(&line.as_bytes()[..cut]).unwrap();
+            drop(f);
+            check(&format!("line {i}, first half"));
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .unwrap();
+            f.write_all(&line.as_bytes()[cut..]).unwrap();
+            f.write_all(b"\n").unwrap();
+            drop(f);
+            check(&format!("line {i}, complete"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use std::io::Write;
 
     #[test]

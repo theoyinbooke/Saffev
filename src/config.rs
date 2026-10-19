@@ -435,6 +435,54 @@ fn default_archive_interval_minutes() -> u32 {
     5
 }
 
+/// Backups: encrypted copies of the store written to the export destination
+/// (`saffev backup`, the panel's Back up, and the optional schedule).
+///
+/// A chain is one **full** copy followed by **incremental** ones that carry
+/// only what changed since the previous link, so frequent backups stay small
+/// and fast. Restore with `saffev restore <folder>`, which replays the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupConfig {
+    /// Back up automatically every `interval_hours`. **Off by default**: it
+    /// writes to the export destination, which is the user's choice to make.
+    #[serde(default)]
+    pub auto: bool,
+    /// Hours between automatic backups (clamped to ≥1). A backup missed while
+    /// the machine slept or the destination was unplugged runs at the next
+    /// check once it is due.
+    #[serde(default = "default_backup_interval_hours")]
+    pub interval_hours: u32,
+    /// Incremental backups before the next one is a fresh full copy. Bounds
+    /// how many files a restore replays and how much one damaged link can
+    /// cost. `0` = every backup is full.
+    #[serde(default = "default_backup_full_every")]
+    pub full_every: u32,
+    /// Keep this many most-recent chains and delete older ones after a new
+    /// full backup. `0` (default) keeps everything — Saffev never deletes a
+    /// backup unless told to.
+    #[serde(default)]
+    pub keep_chains: u32,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        BackupConfig {
+            auto: false,
+            interval_hours: default_backup_interval_hours(),
+            full_every: default_backup_full_every(),
+            keep_chains: 0,
+        }
+    }
+}
+
+fn default_backup_interval_hours() -> u32 {
+    24
+}
+
+fn default_backup_full_every() -> u32 {
+    7
+}
+
 /// Local monitor rules — signals when something needs attention (G6).
 ///
 /// **Off by default** (observe-only ethos: nothing pings the user until they
@@ -728,6 +776,10 @@ pub struct Config {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// Scheduled, incremental backups of the store to the export destination.
+    #[serde(default)]
+    pub backup: BackupConfig,
+
     /// Coding-agent reader options (extra Aider scan roots).
     #[serde(default)]
     pub agents: AgentsConfig,
@@ -783,6 +835,7 @@ impl Default for Config {
             policy_file: None,
             export_dir: None,
             archive: ArchiveConfig::default(),
+            backup: BackupConfig::default(),
             agents: AgentsConfig::default(),
             monitors: MonitorsConfig::default(),
         }

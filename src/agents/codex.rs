@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -99,211 +98,66 @@ impl CodexReader {
         m
     }
 
+    /// Parse one rollout. Incremental like the Claude Code reader: a rollout
+    /// that only grew is read from where the last parse stopped
+    /// ([`super::tail`]); rollouts reach gigabytes on real machines.
     fn parse(
         &self,
         path: &Path,
         titles: &HashMap<String, String>,
         with_messages: bool,
     ) -> Option<AgentSessionDetail> {
-        let file = fs::File::open(path).ok()?;
-        let reader = BufReader::new(file);
+        let flavour = if with_messages {
+            "codex:full"
+        } else {
+            "codex:meta"
+        };
+        let state = super::tail::parse(path, flavour, || ParseState::new(with_messages))?;
+        Some(state.finish(path, titles))
+    }
+}
 
-        let mut id: Option<String> = None;
-        let mut cwd: Option<String> = None;
-        let mut git_branch: Option<String> = None;
-        let mut model: Option<String> = None;
-        let mut first_user: Option<String> = None;
-        let (mut inp, mut outp, mut cache) = (0u64, 0u64, 0u64);
-        let (mut msg_count, mut tool_count) = (0u32, 0u32);
-        let mut first_ts = 0i64;
-        let mut last_ts = 0i64;
-        let mut messages: Vec<AgentMessage> = Vec::new();
+/// Everything a rollout parse accumulates, fed one line at a time.
+#[derive(Clone)]
+struct ParseState {
+    with_messages: bool,
+    id: Option<String>,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    model: Option<String>,
+    first_user: Option<String>,
+    inp: u64,
+    outp: u64,
+    cache: u64,
+    msg_count: u32,
+    tool_count: u32,
+    first_ts: i64,
+    last_ts: i64,
+    messages: Vec<AgentMessage>,
+}
 
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let rtype = v.get("type").and_then(Value::as_str).unwrap_or("");
-            let outer_ts = v
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .map(super::rfc3339_millis)
-                .filter(|m| *m > 0);
-            if let Some(ts) = outer_ts {
-                last_ts = last_ts.max(ts);
-            }
-            let payload = v.get("payload");
-
-            match rtype {
-                "session_meta" => {
-                    if let Some(p) = payload {
-                        if id.is_none() {
-                            id = p
-                                .get("id")
-                                .or_else(|| p.get("session_id"))
-                                .and_then(Value::as_str)
-                                .map(String::from);
-                        }
-                        if cwd.is_none() {
-                            cwd = p.get("cwd").and_then(Value::as_str).map(String::from);
-                        }
-                        if git_branch.is_none() {
-                            git_branch = p
-                                .get("git")
-                                .and_then(|g| g.get("branch"))
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .map(String::from);
-                        }
-                        if first_ts == 0 {
-                            first_ts = p
-                                .get("timestamp")
-                                .and_then(Value::as_str)
-                                .map(super::rfc3339_millis)
-                                .filter(|m| *m > 0)
-                                .or(outer_ts)
-                                .unwrap_or(0);
-                        }
-                    }
-                }
-                "turn_context" => {
-                    if let Some(m) = payload.and_then(|p| p.get("model")).and_then(Value::as_str) {
-                        model = Some(m.to_string()); // last wins
-                    }
-                }
-                "event_msg" => {
-                    if let Some(p) = payload {
-                        if p.get("type").and_then(Value::as_str) == Some("token_count") {
-                            if let Some(info) = p.get("info").filter(|i| !i.is_null()) {
-                                if let Some(t) = info.get("total_token_usage") {
-                                    // Running totals — last non-null wins (overwrite).
-                                    //
-                                    // Codex follows the OpenAI convention where
-                                    // `input_tokens` is the TOTAL prompt and
-                                    // `cached_input_tokens` is a subset of it.
-                                    // `AgentSession::input_tokens` means
-                                    // non-cached input, so subtract. Without this
-                                    // the cached portion is counted twice — once
-                                    // at full price and again as cache — which
-                                    // overstated a real history's estimated cost
-                                    // by more than 10x.
-                                    let total_in = t
-                                        .get("input_tokens")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(inp + cache);
-                                    outp = t
-                                        .get("output_tokens")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(outp);
-                                    cache = t
-                                        .get("cached_input_tokens")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(cache);
-                                    inp = total_in.saturating_sub(cache);
-                                }
-                            }
-                        }
-                    }
-                }
-                "response_item" => {
-                    if let Some(p) = payload {
-                        let ptype = p.get("type").and_then(Value::as_str).unwrap_or("");
-                        match ptype {
-                            "message" => {
-                                let role_s = p.get("role").and_then(Value::as_str).unwrap_or("");
-                                if role_s == "developer" {
-                                    continue; // instructions preamble, not a turn
-                                }
-                                msg_count += 1;
-                                let role = if role_s == "assistant" {
-                                    Role::Assistant
-                                } else {
-                                    Role::User
-                                };
-                                let text = extract_text(p.get("content"));
-                                if !text.is_empty() {
-                                    if first_user.is_none() && role == Role::User {
-                                        first_user = Some(text.clone());
-                                    }
-                                    if with_messages {
-                                        messages.push(AgentMessage {
-                                            role,
-                                            kind: MessageKind::Text,
-                                            content: text,
-                                            ts: outer_ts,
-                                            tool_name: None,
-                                        });
-                                    }
-                                }
-                            }
-                            "function_call"
-                            | "custom_tool_call"
-                            | "web_search_call"
-                            | "tool_search_call"
-                            | "image_generation_call" => {
-                                tool_count += 1;
-                                if with_messages {
-                                    let name = p
-                                        .get("name")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or(ptype)
-                                        .to_string();
-                                    let args = p
-                                        .get("arguments")
-                                        .or_else(|| p.get("input"))
-                                        .map(|a| match a {
-                                            Value::String(s) => s.clone(),
-                                            other => other.to_string(),
-                                        })
-                                        .unwrap_or_default();
-                                    messages.push(AgentMessage {
-                                        role: Role::Assistant,
-                                        kind: MessageKind::ToolUse,
-                                        content: super::claude_code::truncate(&args, 2000),
-                                        ts: outer_ts,
-                                        tool_name: Some(name),
-                                    });
-                                }
-                            }
-                            "reasoning" => {
-                                if with_messages {
-                                    if let Some(sum) = p
-                                        .get("summary")
-                                        .and_then(Value::as_array)
-                                        .map(|a| {
-                                            a.iter()
-                                                .filter_map(|s| {
-                                                    s.get("text").and_then(Value::as_str)
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n")
-                                        })
-                                        .filter(|s| !s.is_empty())
-                                    {
-                                        messages.push(AgentMessage {
-                                            role: Role::Assistant,
-                                            kind: MessageKind::Thinking,
-                                            content: sum,
-                                            ts: outer_ts,
-                                            tool_name: None,
-                                        });
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
+impl ParseState {
+    fn new(with_messages: bool) -> Self {
+        ParseState {
+            with_messages,
+            id: None,
+            cwd: None,
+            git_branch: None,
+            model: None,
+            first_user: None,
+            inp: 0,
+            outp: 0,
+            cache: 0,
+            msg_count: 0,
+            tool_count: 0,
+            first_ts: 0,
+            last_ts: 0,
+            messages: Vec::new(),
         }
+    }
 
-        let id = id.unwrap_or_else(|| {
+    fn finish(self, path: &Path, titles: &HashMap<String, String>) -> AgentSessionDetail {
+        let id = self.id.unwrap_or_else(|| {
             // Fallback for rollouts without a session_meta record. The
             // filename is `rollout-<timestamp>-<uuid>`; the id is the
             // trailing uuid — keeping the timestamp prefix broke the
@@ -323,32 +177,224 @@ impl CodexReader {
                 _ => stem,
             }
         });
-        if first_ts == 0 {
-            first_ts = last_ts;
-        }
-        let title = titles
-            .get(&id)
-            .cloned()
-            .or_else(|| first_user.map(|s| super::claude_code::truncate(&s, 80)));
+        let first_ts = if self.first_ts == 0 {
+            self.last_ts
+        } else {
+            self.first_ts
+        };
+        let title = titles.get(&id).cloned().or_else(|| {
+            self.first_user
+                .map(|s| super::claude_code::truncate(&s, 80))
+        });
 
         let session = AgentSession {
             id: AgentSession::make_id(AgentTool::Codex, &id),
             tool: AgentTool::Codex,
             title,
-            project: cwd,
-            git_branch,
-            model,
+            project: self.cwd,
+            git_branch: self.git_branch,
+            model: self.model,
             started_ts: first_ts,
-            updated_ts: last_ts.max(first_ts),
-            message_count: msg_count,
-            tool_call_count: tool_count,
-            input_tokens: inp,
-            output_tokens: outp,
-            cache_tokens: cache,
+            updated_ts: self.last_ts.max(first_ts),
+            message_count: self.msg_count,
+            tool_call_count: self.tool_count,
+            input_tokens: self.inp,
+            output_tokens: self.outp,
+            cache_tokens: self.cache,
             cache_write_tokens: 0, // Codex reports cached (read) only
             source_path: path.to_string_lossy().to_string(),
         };
-        Some(AgentSessionDetail { session, messages })
+        AgentSessionDetail {
+            session,
+            messages: self.messages,
+        }
+    }
+}
+
+impl super::tail::LineState for ParseState {
+    fn weight(&self) -> usize {
+        super::tail::messages_weight(&self.messages)
+    }
+
+    fn feed(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let rtype = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let outer_ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(super::rfc3339_millis)
+            .filter(|m| *m > 0);
+        if let Some(ts) = outer_ts {
+            self.last_ts = self.last_ts.max(ts);
+        }
+        let payload = v.get("payload");
+
+        match rtype {
+            "session_meta" => {
+                if let Some(p) = payload {
+                    if self.id.is_none() {
+                        self.id = p
+                            .get("id")
+                            .or_else(|| p.get("session_id"))
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                    }
+                    if self.cwd.is_none() {
+                        self.cwd = p.get("cwd").and_then(Value::as_str).map(String::from);
+                    }
+                    if self.git_branch.is_none() {
+                        self.git_branch = p
+                            .get("git")
+                            .and_then(|g| g.get("branch"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                    }
+                    if self.first_ts == 0 {
+                        self.first_ts = p
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .map(super::rfc3339_millis)
+                            .filter(|m| *m > 0)
+                            .or(outer_ts)
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            "turn_context" => {
+                if let Some(m) = payload.and_then(|p| p.get("model")).and_then(Value::as_str) {
+                    self.model = Some(m.to_string()); // last wins
+                }
+            }
+            "event_msg" => {
+                if let Some(p) = payload {
+                    if p.get("type").and_then(Value::as_str) == Some("token_count") {
+                        if let Some(info) = p.get("info").filter(|i| !i.is_null()) {
+                            if let Some(t) = info.get("total_token_usage") {
+                                // Running totals — last non-null wins (overwrite).
+                                //
+                                // Codex follows the OpenAI convention where
+                                // `input_tokens` is the TOTAL prompt and
+                                // `cached_input_tokens` is a subset of it.
+                                // `AgentSession::input_tokens` means
+                                // non-cached input, so subtract. Without this
+                                // the cached portion is counted twice — once
+                                // at full price and again as cache — which
+                                // overstated a real history's estimated cost
+                                // by more than 10x.
+                                let total_in = t
+                                    .get("input_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(self.inp + self.cache);
+                                self.outp = t
+                                    .get("output_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(self.outp);
+                                self.cache = t
+                                    .get("cached_input_tokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(self.cache);
+                                self.inp = total_in.saturating_sub(self.cache);
+                            }
+                        }
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(p) = payload {
+                    let ptype = p.get("type").and_then(Value::as_str).unwrap_or("");
+                    match ptype {
+                        "message" => {
+                            let role_s = p.get("role").and_then(Value::as_str).unwrap_or("");
+                            if role_s == "developer" {
+                                return; // instructions preamble, not a turn
+                            }
+                            self.msg_count += 1;
+                            let role = if role_s == "assistant" {
+                                Role::Assistant
+                            } else {
+                                Role::User
+                            };
+                            let text = extract_text(p.get("content"));
+                            if !text.is_empty() {
+                                if self.first_user.is_none() && role == Role::User {
+                                    self.first_user = Some(text.clone());
+                                }
+                                if self.with_messages {
+                                    self.messages.push(AgentMessage {
+                                        role,
+                                        kind: MessageKind::Text,
+                                        content: text,
+                                        ts: outer_ts,
+                                        tool_name: None,
+                                    });
+                                }
+                            }
+                        }
+                        "function_call"
+                        | "custom_tool_call"
+                        | "web_search_call"
+                        | "tool_search_call"
+                        | "image_generation_call" => {
+                            self.tool_count += 1;
+                            if self.with_messages {
+                                let name = p
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(ptype)
+                                    .to_string();
+                                let args = p
+                                    .get("arguments")
+                                    .or_else(|| p.get("input"))
+                                    .map(|a| match a {
+                                        Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    })
+                                    .unwrap_or_default();
+                                self.messages.push(AgentMessage {
+                                    role: Role::Assistant,
+                                    kind: MessageKind::ToolUse,
+                                    content: super::claude_code::truncate(&args, 2000),
+                                    ts: outer_ts,
+                                    tool_name: Some(name),
+                                });
+                            }
+                        }
+                        "reasoning" => {
+                            if self.with_messages {
+                                if let Some(sum) = p
+                                    .get("summary")
+                                    .and_then(Value::as_array)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| s.get("text").and_then(Value::as_str))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    })
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    self.messages.push(AgentMessage {
+                                        role: Role::Assistant,
+                                        kind: MessageKind::Thinking,
+                                        content: sum,
+                                        ts: outer_ts,
+                                        tool_name: None,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -409,4 +455,79 @@ fn extract_text(content: Option<&Value>) -> String {
         .filter_map(|c| c.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grow a transcript the way a live session does — line by line, each
+    /// line written in two halves so a read can land mid-line — and after every
+    /// write require the incremental parse to equal a fresh full parse (in
+    /// both modes). The fresh parse reads a copy at a new path, so it cannot
+    /// reuse any cached state.
+    #[test]
+    fn incremental_parse_matches_a_full_parse_as_the_file_grows() {
+        let root = std::env::temp_dir().join(format!("saffev-tailcmp-{}", uuid::Uuid::new_v4()));
+        let (live_dir, ref_dir) = (root.join("live"), root.join("ref"));
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&ref_dir).unwrap();
+        let name = "rollout-2026-07-15T10-22-33-cccccccc-cccc-4ccc-8ccc-0000000000ff.jsonl";
+        let live = live_dir.join(name);
+        let reference = ref_dir.join(name);
+        let mut text = String::new();
+        for f in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/agents/codex/sessions/2026/07/15/rollout-2026-07-15T10-22-33-cccccccc-cccc-4ccc-8ccc-000000000003.jsonl"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/agents/codex/sessions/2026/07/15/rollout-2026-07-15T11-00-00-dddddddd-dddd-4ddd-8ddd-000000000004.jsonl"),
+        ] {
+            text.push_str(&std::fs::read_to_string(f).unwrap());
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        let parse =
+            |p: &Path, m: bool| CodexReader::with_root(PathBuf::new()).parse(p, &HashMap::new(), m);
+        let check = |label: &str| {
+            std::fs::copy(&live, &reference).unwrap();
+            for with_messages in [true, false] {
+                let mut inc = parse(&live, with_messages).expect("incremental parse");
+                let mut full = parse(&reference, with_messages).expect("full parse");
+                inc.session.source_path.clear();
+                full.session.source_path.clear();
+                assert_eq!(
+                    serde_json::to_value(&inc).unwrap(),
+                    serde_json::to_value(&full).unwrap(),
+                    "{label} (messages: {with_messages})"
+                );
+            }
+            // A new reference path each time: never a cached state.
+            let _ = std::fs::remove_file(&reference);
+            super::super::tail::forget(&reference);
+        };
+        std::fs::write(&live, b"").unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let cut = line
+                .char_indices()
+                .nth(line.chars().count() / 2)
+                .map(|(b, _)| b)
+                .unwrap_or(0);
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .unwrap();
+            use std::io::Write;
+            f.write_all(&line.as_bytes()[..cut]).unwrap();
+            drop(f);
+            check(&format!("line {i}, first half"));
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .unwrap();
+            f.write_all(&line.as_bytes()[cut..]).unwrap();
+            f.write_all(b"\n").unwrap();
+            drop(f);
+            check(&format!("line {i}, complete"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

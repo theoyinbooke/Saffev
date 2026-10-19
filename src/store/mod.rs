@@ -471,24 +471,49 @@ fn sha256_hex(parts: &[&str]) -> String {
 
 /// Digest over an archived session's stored content: its identifying metadata
 /// plus every message, in order. This is what the chain commits to.
+///
+/// Fed straight into the hasher — byte-for-byte the same digest as
+/// [`sha256_hex`] over the joined parts, without first cloning every message
+/// (which doubled peak memory on a 66MB transcript).
 fn session_content_digest(s: &ArchivedSession) -> String {
-    let mut parts: Vec<String> = vec![
-        s.id.clone(),
-        s.tool.clone(),
-        s.title.clone().unwrap_or_default(),
-        s.project.clone().unwrap_or_default(),
-        s.model.clone().unwrap_or_default(),
-        s.started_ts.to_string(),
-        s.updated_ts.to_string(),
-        s.message_count.to_string(),
-    ];
+    let mut h = session_digest_start(s);
     for m in &s.messages {
-        parts.push(m.role.clone());
-        parts.push(m.kind.clone());
-        parts.push(m.content.clone());
+        digest_feed(&mut h, &m.role);
+        digest_feed(&mut h, &m.kind);
+        digest_feed(&mut h, &m.content);
     }
-    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-    sha256_hex(&refs)
+    digest_finish(h)
+}
+
+/// The metadata half of [`session_content_digest`]; messages are fed after it.
+fn session_digest_start(s: &ArchivedSession) -> sha2::Sha256 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for p in [
+        s.id.as_str(),
+        s.tool.as_str(),
+        s.title.as_deref().unwrap_or_default(),
+        s.project.as_deref().unwrap_or_default(),
+        s.model.as_deref().unwrap_or_default(),
+        &s.started_ts.to_string(),
+        &s.updated_ts.to_string(),
+        &s.message_count.to_string(),
+    ] {
+        digest_feed(&mut h, p);
+    }
+    h
+}
+
+/// One part, with the same separator [`sha256_hex`] uses.
+fn digest_feed(h: &mut sha2::Sha256, part: &str) {
+    use sha2::Digest;
+    h.update(part.as_bytes());
+    h.update([0u8]);
+}
+
+fn digest_finish(h: sha2::Sha256) -> String {
+    use sha2::Digest;
+    format!("{:x}", h.finalize())
 }
 
 /// Digest of one chain entry, committing to its own fields and to the entry
@@ -591,6 +616,50 @@ pub struct ArchiveStats {
     pub latest_ts: Option<i64>,
 }
 
+/// High-water marks of the store's append-mostly tables at one moment: the
+/// position an incremental backup starts from. Every archival appends a chain
+/// entry (`archive_seq`); proxy rows only ever get larger rowids (an
+/// `INSERT OR REPLACE` lands on a fresh rowid), so "everything after the
+/// cursor" is exactly what changed. Deletions (retention purges) are not
+/// carried forward: a backup keeps history the live store has since pruned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BackupCursor {
+    /// Newest request timestamp. `RequestUsage` fills a request's token count
+    /// in place (same rowid) once its response finishes, so a delta also
+    /// re-copies requests from the last few minutes before the previous
+    /// cursor — the ones that were still in flight when it was taken.
+    pub requests_ts: i64,
+    pub archive_seq: i64,
+    pub requests: i64,
+    pub responses: i64,
+    pub payloads: i64,
+    pub pii_findings: i64,
+    pub safety_findings: i64,
+    pub eval_scores: i64,
+}
+
+impl BackupCursor {
+    /// `(table, from, to)` for every rowid-ranged proxy table.
+    fn ranges(&self, to: &BackupCursor) -> [(&'static str, i64, i64); 6] {
+        [
+            ("requests", self.requests, to.requests),
+            ("responses", self.responses, to.responses),
+            ("payloads", self.payloads, to.payloads),
+            ("pii_findings", self.pii_findings, to.pii_findings),
+            ("safety_findings", self.safety_findings, to.safety_findings),
+            ("eval_scores", self.eval_scores, to.eval_scores),
+        ]
+    }
+}
+
+/// What [`restore_backup_chain`] did.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreStats {
+    pub deltas_applied: u32,
+    pub schema: u32,
+}
+
 /// A cloneable handle the proxy and control plane use to enqueue writes and run
 /// reads. Cheap to clone; sending never blocks the request path (bounded,
 /// best-effort enqueue — drops are logged, never surfaced).
@@ -615,6 +684,38 @@ struct StoreInner {
     /// connection, which once exhausted the 256-fd limit macOS gives a
     /// launchd-spawned app. Capped at [`READ_POOL_MAX`].
     readers: std::sync::Mutex<Vec<Connection>>,
+    /// Archive byte total, keyed by [`ArchiveShape`]. Summing `LENGTH(content)`
+    /// reads (and decrypts) every archived message, and the panel asked for it
+    /// on every 6-second poll.
+    bytes_cache: std::sync::Mutex<Option<(ArchiveShape, u64)>>,
+    /// Last full integrity verdict, for [`Store::verify_archive_cached`].
+    verify_cache: std::sync::Mutex<Option<(ArchiveShape, std::time::Instant, ArchiveIntegrity)>>,
+}
+
+/// A cheap fingerprint of the archive: every archival appends a chain entry,
+/// so any legitimate change moves `head_seq`. Used only to key caches of
+/// expensive whole-archive reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchiveShape {
+    head_seq: i64,
+    sessions: u64,
+    messages: u64,
+}
+
+fn archive_shape(conn: &Connection) -> Result<ArchiveShape> {
+    Ok(conn.query_row(
+        "SELECT (SELECT COALESCE(MAX(seq),0) FROM archive_log), \
+                (SELECT COUNT(*) FROM archived_sessions), \
+                (SELECT COALESCE(SUM(message_count),0) FROM archived_sessions)",
+        [],
+        |r| {
+            Ok(ArchiveShape {
+                head_seq: r.get(0)?,
+                sessions: r.get::<_, i64>(1)? as u64,
+                messages: r.get::<_, i64>(2)? as u64,
+            })
+        },
+    )?)
 }
 
 /// Idle read connections kept for reuse; extra ones are simply dropped.
@@ -656,6 +757,8 @@ impl Store {
                 tx,
                 path,
                 readers: std::sync::Mutex::new(Vec::new()),
+                bytes_cache: std::sync::Mutex::new(None),
+                verify_cache: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -1145,30 +1248,7 @@ impl Store {
                             kinds: Vec::new(),
                         }),
                 };
-
-                for f in found {
-                    entry.findings += 1;
-                    if f.side == Side::Request {
-                        entry.user_side += 1;
-                    }
-                    let is_user = f.side == Side::Request;
-                    match entry
-                        .kinds
-                        .iter_mut()
-                        .find(|k| k.kind == f.kind && k.label == f.label)
-                    {
-                        Some(k) => {
-                            k.count += 1;
-                            k.user_count += u32::from(is_user);
-                        }
-                        None => entry.kinds.push(ArchivePiiKind {
-                            kind: f.kind,
-                            label: f.label.clone(),
-                            count: 1,
-                            user_count: u32::from(is_user),
-                        }),
-                    }
-                }
+                tally_pii(entry, found);
             }
 
             let mut out: Vec<ArchivePiiRow> = by_session.into_values().collect();
@@ -1177,6 +1257,65 @@ impl Store {
                     .cmp(&a.findings)
                     .then(b.updated_ts.cmp(&a.updated_ts))
             });
+            Ok(out)
+        })
+        .await
+    }
+
+    /// [`Self::scan_archive_pii`] restricted to `ids`: one rollup per listed
+    /// session that has findings (sessions without any are absent). Lets the
+    /// privacy report rescan only the sessions that changed.
+    pub async fn scan_archive_pii_sessions(
+        &self,
+        detector: std::sync::Arc<crate::brain::pii::Detector>,
+        ids: Vec<String>,
+    ) -> Result<Vec<ArchivePiiRow>> {
+        self.read(move |conn| {
+            let mut meta = conn.prepare(
+                "SELECT tool, title, project, updated_ts FROM archived_sessions WHERE id = ?1",
+            )?;
+            let mut msgs =
+                conn.prepare("SELECT role, content FROM archived_messages WHERE session_id = ?1")?;
+            let mut out = Vec::new();
+            for id in ids {
+                let Some(mut row) = meta
+                    .query_row([&id], |r| {
+                        Ok(ArchivePiiRow {
+                            session_id: id.clone(),
+                            tool: r.get(0)?,
+                            title: r.get(1)?,
+                            project: r.get(2)?,
+                            updated_ts: r.get(3)?,
+                            findings: 0,
+                            user_side: 0,
+                            kinds: Vec::new(),
+                        })
+                    })
+                    .optional()?
+                else {
+                    continue;
+                };
+                let mut rows = msgs.query([&id])?;
+                while let Some(r) = rows.next()? {
+                    let role: String = r.get(0)?;
+                    let content: String = r.get(1)?;
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let side = if role == "user" {
+                        Side::Request
+                    } else {
+                        Side::Response
+                    };
+                    let found = detector.scan(side, &content);
+                    if !found.is_empty() {
+                        tally_pii(&mut row, found);
+                    }
+                }
+                if row.findings > 0 {
+                    out.push(row);
+                }
+            }
             Ok(out)
         })
         .await
@@ -1257,8 +1396,12 @@ impl Store {
 
             // 2. Content, for the sessions still present.
             if out.intact {
+                let mut ms = conn.prepare(
+                    "SELECT role,kind,content FROM archived_messages \
+                     WHERE session_id = ?1 ORDER BY seq",
+                )?;
                 for (id, logged) in &latest {
-                    let Some(mut s) = conn
+                    let Some(s) = conn
                         .query_row(
                             "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,\
                              updated_ts,message_count,tool_call_count,input_tokens,output_tokens,\
@@ -1274,22 +1417,23 @@ impl Store {
                         out.altered_sessions.push(id.clone());
                         continue;
                     };
-                    let mut ms = conn.prepare(
-                        "SELECT role,kind,content,ts,tool_name FROM archived_messages \
-                         WHERE session_id = ?1 ORDER BY seq",
-                    )?;
-                    s.messages = ms
-                        .query_map([id], |r| {
-                            Ok(ArchivedMessage {
-                                role: r.get(0)?,
-                                kind: r.get(1)?,
-                                content: r.get(2)?,
-                                ts: r.get(3)?,
-                                tool_name: r.get(4)?,
-                            })
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    if session_content_digest(&s) != *logged {
+                    // Streamed row by row: one session's text is never held
+                    // in memory twice (or at all, beyond the current row).
+                    let mut h = session_digest_start(&s);
+                    let mut rows = ms.query([id])?;
+                    while let Some(r) = rows.next()? {
+                        for i in 0..3 {
+                            match r.get_ref(i)? {
+                                rusqlite::types::ValueRef::Text(b) => {
+                                    use sha2::Digest;
+                                    h.update(b);
+                                    h.update([0u8]);
+                                }
+                                _ => digest_feed(&mut h, ""),
+                            }
+                        }
+                    }
+                    if digest_finish(h) != *logged {
                         out.altered_sessions.push(id.clone());
                     }
                 }
@@ -1309,6 +1453,46 @@ impl Store {
                 out.head_ts = Some(last.ts);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// [`Self::verify_archive`], reusing the last verdict while the archive's
+    /// shape is unchanged and the verdict is younger than `max_age`.
+    ///
+    /// The full check re-reads and re-hashes every archived message, which is
+    /// right for an explicit "verify" and wrong for a panel that polls. A
+    /// legitimate change always moves the chain head and so always re-verifies;
+    /// `max_age` bounds how long an out-of-band edit (someone rewriting rows
+    /// directly) can go unnoticed by a polling view.
+    pub async fn verify_archive_cached(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<ArchiveIntegrity> {
+        let shape = self.read(archive_shape).await?;
+        if let Ok(c) = self.inner.verify_cache.lock() {
+            if let Some((s, at, v)) = c.as_ref() {
+                if *s == shape && at.elapsed() < max_age {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        let v = self.verify_archive().await?;
+        if let Ok(mut c) = self.inner.verify_cache.lock() {
+            *c = Some((shape, std::time::Instant::now(), v.clone()));
+        }
+        Ok(v)
+    }
+
+    /// Ids of every archived session — for "is this session preserved?"
+    /// checks that do not need the rows themselves.
+    pub async fn archived_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM archived_sessions")?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+            Ok(ids)
         })
         .await
     }
@@ -1345,35 +1529,108 @@ impl Store {
     /// overwrite a previous backup). Returns the schema `user_version`, for
     /// the backup manifest.
     pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<u32> {
+        self.backup_full_to(dest).await.map(|(v, _)| v)
+    }
+
+    /// [`Self::backup_to`], also returning the [`BackupCursor`] the copy covers
+    /// — the starting point for the next incremental backup.
+    ///
+    /// The cursor is read just BEFORE the snapshot, so rows written in between
+    /// land in both the copy and the next delta. A delta applies idempotently
+    /// on restore, so that overlap is harmless; a gap would lose data.
+    pub async fn backup_full_to(&self, dest: std::path::PathBuf) -> Result<(u32, BackupCursor)> {
         self.read(move |conn| {
+            let cursor = read_backup_cursor(conn)?;
             let dest_str = dest.to_string_lossy().to_string();
             conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
             let v: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            Ok(v)
+            Ok((v, cursor))
         })
         .await
     }
 
+    /// The store's current high-water marks (cheap: one indexed MAX per table).
+    pub async fn backup_cursor(&self) -> Result<BackupCursor> {
+        self.read(read_backup_cursor).await
+    }
+
+    /// Write an **incremental** backup to `dest`: only what was added or
+    /// re-archived after `from` — the new chain entries plus the full current
+    /// text of every session they touch, new proxy history rows, and the small
+    /// whole tables (archived session metadata, settings, engines) so flags
+    /// such as `source_deleted` stay current. Same schema and same key as the
+    /// store; [`restore_backup_chain`] applies it on top of a full backup.
+    ///
+    /// Read in one transaction, so the delta and the returned cursor describe a
+    /// single consistent moment. Fails if `dest` exists.
+    pub async fn backup_delta_to(
+        &self,
+        dest: std::path::PathBuf,
+        from: BackupCursor,
+    ) -> Result<(u32, BackupCursor)> {
+        self.read(move |conn| {
+            if dest.exists() {
+                return Err(Error::Store(format!("{} already exists", dest.display())));
+            }
+            create_delta_file(&dest)?;
+            attach(conn, &dest, "bk")?;
+            let result = (|| -> Result<BackupCursor> {
+                conn.execute_batch("BEGIN")?;
+                let copied = write_delta(conn, &from);
+                match copied {
+                    Ok(to) => {
+                        conn.execute_batch("COMMIT")?;
+                        Ok(to)
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })();
+            let detached = conn.execute_batch("DETACH DATABASE bk");
+            let to = result?;
+            detached?;
+            let v: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            Ok((v, to))
+        })
+        .await
+    }
+
+    ///
+    /// The byte total is the one expensive figure (it reads every message), so
+    /// it is computed once per archive shape and reused until the next archival.
     pub async fn archive_stats(&self) -> Result<ArchiveStats> {
-        self.read(|conn| {
-            let (count, messages): (u64, u64) = conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(message_count),0) FROM archived_sessions",
-                [],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )?;
-            let bytes: u64 = conn.query_row(
-                "SELECT COALESCE(SUM(LENGTH(content)),0) FROM archived_messages",
-                [],
-                |r| Ok(r.get::<_, i64>(0)? as u64),
-            )?;
+        let inner = self.inner.clone();
+        self.read(move |conn| {
+            let shape = archive_shape(conn)?;
+            let cached = inner
+                .bytes_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.filter(|(s, _)| *s == shape).map(|(_, b)| b));
+            let bytes = match cached {
+                Some(b) => b,
+                None => {
+                    let b: u64 = conn.query_row(
+                        "SELECT COALESCE(SUM(LENGTH(content)),0) FROM archived_messages",
+                        [],
+                        |r| Ok(r.get::<_, i64>(0)? as u64),
+                    )?;
+                    if let Ok(mut c) = inner.bytes_cache.lock() {
+                        *c = Some((shape, b));
+                    }
+                    b
+                }
+            };
             let latest_ts: Option<i64> =
                 conn.query_row("SELECT MAX(archived_ts) FROM archived_sessions", [], |r| {
                     r.get::<_, Option<i64>>(0)
                 })?;
             Ok(ArchiveStats {
                 latest_ts,
-                count,
-                messages,
+                count: shape.sessions,
+                messages: shape.messages,
                 bytes,
             })
         })
@@ -1408,6 +1665,272 @@ impl Store {
         .await
         .map_err(|e| Error::Store(format!("retention join: {e}")))?
     }
+}
+
+// ---------------------------------------------------------------------------
+// Backups (incremental deltas + restore)
+// ---------------------------------------------------------------------------
+
+/// How far before the previous cursor a delta re-copies requests (long
+/// generations can take minutes to report their token counts).
+const IN_FLIGHT_MS: i64 = 15 * 60 * 1000;
+
+/// Tables copied whole into every delta: small, and mutated in place.
+const DELTA_WHOLE_TABLES: [&str; 3] = ["archived_sessions", "settings", "engines"];
+
+fn read_backup_cursor(conn: &Connection) -> Result<BackupCursor> {
+    Ok(conn.query_row(
+        "SELECT (SELECT COALESCE(MAX(seq),0) FROM archive_log), \
+                (SELECT COALESCE(MAX(rowid),0) FROM requests), \
+                (SELECT COALESCE(MAX(rowid),0) FROM responses), \
+                (SELECT COALESCE(MAX(rowid),0) FROM payloads), \
+                (SELECT COALESCE(MAX(rowid),0) FROM pii_findings), \
+                (SELECT COALESCE(MAX(rowid),0) FROM safety_findings), \
+                (SELECT COALESCE(MAX(rowid),0) FROM eval_scores), \
+                (SELECT COALESCE(MAX(ts),0) FROM requests)",
+        [],
+        |r| {
+            Ok(BackupCursor {
+                archive_seq: r.get(0)?,
+                requests: r.get(1)?,
+                responses: r.get(2)?,
+                payloads: r.get(3)?,
+                pii_findings: r.get(4)?,
+                safety_findings: r.get(5)?,
+                eval_scores: r.get(6)?,
+                requests_ts: r.get(7)?,
+            })
+        },
+    )?)
+}
+
+/// Attach the database at `path` as `alias` under the store's key. SQLCipher
+/// does not reliably reuse the main connection's passphrase for an attached
+/// file, so the key is passed explicitly. `alias` is a constant.
+fn attach(conn: &Connection, path: &Path, alias: &str) -> Result<()> {
+    let file = path.to_string_lossy().to_string();
+    #[cfg(feature = "sqlcipher")]
+    {
+        let key = cached_db_key()?;
+        conn.execute(
+            &format!("ATTACH DATABASE ?1 AS {alias} KEY ?2"),
+            rusqlite::params![file, key],
+        )?;
+    }
+    #[cfg(not(feature = "sqlcipher"))]
+    {
+        conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [file])?;
+    }
+    Ok(())
+}
+
+/// Column names of `schema.table`.
+fn table_columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA {schema}.table_info({table})"))?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(cols)
+}
+
+/// `verb INTO to.table (cols) SELECT cols FROM from.table <tail>` over the
+/// columns both sides have (so a delta still applies onto a base the running
+/// binary has since migrated). `keep_rowid` carries the rowid across for
+/// `responses`, the one table with no primary key — that is what makes
+/// re-applying a delta idempotent there. Table and schema names are constants.
+fn copy_rows<P: rusqlite::Params>(
+    conn: &Connection,
+    verb: &str,
+    from: &str,
+    to: &str,
+    table: &str,
+    tail: &str,
+    params: P,
+) -> Result<usize> {
+    let src = table_columns(conn, from, table)?;
+    let cols: Vec<String> = table_columns(conn, to, table)?
+        .into_iter()
+        .filter(|c| src.contains(c))
+        .map(|c| format!("\"{c}\""))
+        .collect();
+    if cols.is_empty() {
+        return Ok(0);
+    }
+    let mut list = cols.join(",");
+    if table == "responses" {
+        list = format!("rowid,{list}");
+    }
+    let sql = format!("{verb} INTO {to}.{table} ({list}) SELECT {list} FROM {from}.{table} {tail}");
+    Ok(conn.execute(&sql, params)?)
+}
+
+/// An empty database with the store's schema, under the store's key, without
+/// the full-text index (a restore rebuilds that from the messages), in
+/// rollback-journal mode so the delta is one self-contained file.
+fn create_delta_file(dest: &Path) -> Result<()> {
+    let conn = open_connection(dest)?;
+    schema::migrate(&conn)?;
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS archived_messages_fts_ai; \
+         DROP TRIGGER IF EXISTS archived_messages_fts_ad; \
+         DROP TRIGGER IF EXISTS archived_messages_fts_au; \
+         DROP TABLE IF EXISTS archived_messages_fts;",
+    )?;
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    Ok(())
+}
+
+/// Copy everything after `from` into the attached `bk`. Runs inside the
+/// caller's transaction; returns the cursor the delta reaches.
+fn write_delta(conn: &Connection, from: &BackupCursor) -> Result<BackupCursor> {
+    let to = read_backup_cursor(conn)?;
+    for t in DELTA_WHOLE_TABLES {
+        copy_rows(conn, "INSERT", "main", "bk", t, "", [])?;
+    }
+    copy_rows(
+        conn,
+        "INSERT",
+        "main",
+        "bk",
+        "archive_log",
+        "WHERE seq > ?1 AND seq <= ?2",
+        rusqlite::params![from.archive_seq, to.archive_seq],
+    )?;
+    // The whole current text of every session re-archived since `from`.
+    copy_rows(
+        conn,
+        "INSERT",
+        "main",
+        "bk",
+        "archived_messages",
+        "WHERE session_id IN (SELECT session_id FROM bk.archive_log)",
+        [],
+    )?;
+    for (table, lo, hi) in from.ranges(&to) {
+        if table == "requests" {
+            // New rows, plus recent ones whose token count may have been
+            // filled in after the previous cursor (see `requests_ts`).
+            let recent = if from.requests_ts > 0 {
+                from.requests_ts - IN_FLIGHT_MS
+            } else {
+                i64::MAX
+            };
+            copy_rows(
+                conn,
+                "INSERT",
+                "main",
+                "bk",
+                table,
+                "WHERE rowid <= ?2 AND (rowid > ?1 OR ts >= ?3)",
+                rusqlite::params![lo, hi, recent],
+            )?;
+            continue;
+        }
+        copy_rows(
+            conn,
+            "INSERT",
+            "main",
+            "bk",
+            table,
+            "WHERE rowid > ?1 AND rowid <= ?2",
+            rusqlite::params![lo, hi],
+        )?;
+    }
+    Ok(to)
+}
+
+/// Rebuild a database from a full backup (`full_db`, a `VACUUM INTO` copy) and
+/// the deltas written after it, oldest first, into a NEW file at `target`.
+///
+/// Works on a temporary sibling and renames it into place only after every
+/// delta applied and `PRAGMA integrity_check` passed, so a failed restore
+/// never leaves a half-built database where Saffev would open it. Refuses an
+/// existing `target`. The files must be readable with this machine's key
+/// (keyring or `SAFFEV_DB_KEY`). Saffev migrates the result on next start.
+pub fn restore_backup_chain(
+    full_db: &Path,
+    deltas: &[std::path::PathBuf],
+    target: &Path,
+) -> Result<RestoreStats> {
+    if target.exists() {
+        return Err(Error::Store(format!(
+            "{} already exists; refusing to overwrite it",
+            target.display()
+        )));
+    }
+    let mut tmp_name = target.as_os_str().to_owned();
+    tmp_name.push(".restoring");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    if tmp.exists() {
+        return Err(Error::Store(format!(
+            "{} exists (an earlier restore was interrupted); remove it and retry",
+            tmp.display()
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Store(format!("creating {}: {e}", parent.display())))?;
+    }
+    std::fs::copy(full_db, &tmp)
+        .map_err(|e| Error::Store(format!("copying {}: {e}", full_db.display())))?;
+
+    let applied = (|| -> Result<RestoreStats> {
+        let conn = open_connection(&tmp)?;
+        let mut stats = RestoreStats::default();
+        for d in deltas {
+            attach(&conn, d, "d")?;
+            conn.execute_batch("BEGIN")?;
+            let r = apply_delta(&conn);
+            match r {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    let _ = conn.execute_batch("DETACH DATABASE d");
+                    return Err(Error::Store(format!("applying {}: {e}", d.display())));
+                }
+            }
+            conn.execute_batch("DETACH DATABASE d")?;
+            stats.deltas_applied += 1;
+        }
+        let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if check != "ok" {
+            return Err(Error::Store(format!(
+                "restored database failed integrity_check: {check}"
+            )));
+        }
+        stats.schema = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        Ok(stats)
+    })();
+    match applied {
+        Ok(stats) => {
+            std::fs::rename(&tmp, target)
+                .map_err(|e| Error::Store(format!("moving restored database into place: {e}")))?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Apply the attached delta `d` onto `main`. Re-applying is a no-op.
+fn apply_delta(conn: &Connection) -> Result<()> {
+    // Replace each touched session's messages with the delta's (complete) copy.
+    conn.execute_batch(
+        "DELETE FROM main.archived_messages WHERE session_id IN \
+           (SELECT session_id FROM d.archive_log UNION SELECT session_id FROM d.archived_messages);",
+    )?;
+    copy_rows(conn, "INSERT", "d", "main", "archived_messages", "", [])?;
+    copy_rows(conn, "INSERT OR IGNORE", "d", "main", "archive_log", "", [])?;
+    for t in DELTA_WHOLE_TABLES {
+        copy_rows(conn, "INSERT OR REPLACE", "d", "main", t, "", [])?;
+    }
+    for (table, _, _) in BackupCursor::default().ranges(&BackupCursor::default()) {
+        copy_rows(conn, "INSERT OR REPLACE", "d", "main", table, "", [])?;
+    }
+    Ok(())
 }
 
 /// Magic settings key used by [`Store::flush`] as an internal fence. Never read
@@ -1682,9 +2205,15 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             // Idempotent upsert: replace the session row + its messages atomically.
             let tx = conn.unchecked_transaction()?;
             {
+                // A growing session only appends, so keep the stored prefix that
+                // still matches and rewrite from the first difference. Deleting
+                // and re-inserting the whole transcript (and its full-text index)
+                // on every new message made a long active session cost its full
+                // size in writes every few minutes.
+                let keep = unchanged_prefix(&tx, &s.id, &s.messages)?;
                 tx.execute(
-                    "DELETE FROM archived_messages WHERE session_id = ?1",
-                    [&s.id],
+                    "DELETE FROM archived_messages WHERE session_id = ?1 AND seq >= ?2",
+                    rusqlite::params![s.id, keep as i64],
                 )?;
                 tx.execute(
                     "INSERT OR REPLACE INTO archived_sessions \
@@ -1718,7 +2247,7 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                      (session_id, seq, role, kind, content, ts, tool_name) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 )?;
-                for (i, m) in s.messages.iter().enumerate() {
+                for (i, m) in s.messages.iter().enumerate().skip(keep) {
                     stmt.execute(rusqlite::params![
                         s.id,
                         i as i64,
@@ -1762,6 +2291,81 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Add one message's findings to a session's PII rollup.
+fn tally_pii(entry: &mut ArchivePiiRow, found: Vec<Finding>) {
+    for f in found {
+        entry.findings += 1;
+        let is_user = f.side == Side::Request;
+        if is_user {
+            entry.user_side += 1;
+        }
+        match entry
+            .kinds
+            .iter_mut()
+            .find(|k| k.kind == f.kind && k.label == f.label)
+        {
+            Some(k) => {
+                k.count += 1;
+                k.user_count += u32::from(is_user);
+            }
+            None => entry.kinds.push(ArchivePiiKind {
+                kind: f.kind,
+                label: f.label.clone(),
+                count: 1,
+                user_count: u32::from(is_user),
+            }),
+        }
+    }
+}
+
+/// How many leading messages of `session_id` are already stored exactly as in
+/// `messages` (same seq, role, kind, content, ts and tool name). Compares the
+/// raw column bytes, so nothing is copied out of SQLite.
+fn unchanged_prefix(
+    conn: &Connection,
+    session_id: &str,
+    messages: &[ArchivedMessage],
+) -> Result<usize> {
+    use rusqlite::types::ValueRef;
+    fn text(v: ValueRef<'_>, s: &str) -> bool {
+        matches!(v, ValueRef::Text(b) if b == s.as_bytes())
+    }
+    fn opt_text(v: ValueRef<'_>, s: Option<&str>) -> bool {
+        match (v, s) {
+            (ValueRef::Null, None) => true,
+            (ValueRef::Text(b), Some(s)) => b == s.as_bytes(),
+            _ => false,
+        }
+    }
+    fn opt_int(v: ValueRef<'_>, n: Option<i64>) -> bool {
+        match (v, n) {
+            (ValueRef::Null, None) => true,
+            (ValueRef::Integer(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, role, kind, content, ts, tool_name FROM archived_messages \
+         WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    let mut keep = 0usize;
+    while let Some(r) = rows.next()? {
+        let Some(m) = messages.get(keep) else { break };
+        let same = opt_int(r.get_ref(0)?, Some(keep as i64))
+            && text(r.get_ref(1)?, &m.role)
+            && text(r.get_ref(2)?, &m.kind)
+            && text(r.get_ref(3)?, &m.content)
+            && opt_int(r.get_ref(4)?, m.ts)
+            && opt_text(r.get_ref(5)?, m.tool_name.as_deref());
+        if !same {
+            break;
+        }
+        keep += 1;
+    }
+    Ok(keep)
 }
 
 // ---------------------------------------------------------------------------
@@ -3084,6 +3688,151 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A growing session keeps its stored prefix (same rows, same rowids —
+    /// no delete/re-insert, no full-text re-index), an edited one is rewritten
+    /// from the first difference, and the chain verifies either way.
+    #[tokio::test]
+    async fn rearchive_keeps_the_unchanged_prefix() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        let rowids = |p: std::path::PathBuf| -> Vec<(i64, String)> {
+            let c = open_connection(&p).unwrap();
+            let mut st = c
+                .prepare("SELECT rowid, content FROM archived_messages WHERE session_id = 'claude_code:p' ORDER BY seq")
+                .unwrap();
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:p",
+            "T",
+            &["one", "two", "three"],
+        ))));
+        store.flush().await.unwrap();
+        let before = rowids(path.clone());
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:p",
+            "T",
+            &["one", "two", "three", "four"],
+        ))));
+        store.flush().await.unwrap();
+        let grown = rowids(path.clone());
+        assert_eq!(
+            &grown[..3],
+            &before[..],
+            "the first three rows were left untouched"
+        );
+        assert_eq!(grown[3].1, "four");
+
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:p",
+            "T",
+            &["one", "TWO (edited)", "three"],
+        ))));
+        store.flush().await.unwrap();
+        let edited = rowids(path.clone());
+        assert_eq!(edited.len(), 3, "a shorter transcript drops the tail");
+        assert_eq!(edited[0], grown[0], "the matching prefix is kept");
+        assert_eq!(edited[1].1, "TWO (edited)");
+        let d = store
+            .archived_detail("claude_code:p")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            d.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "TWO (edited)", "three"]
+        );
+        assert!(store.verify_archive().await.unwrap().intact);
+        let hits = store.search_archive("edited", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "the full-text index follows the rewrite");
+        assert!(store.search_archive("four", 10).await.unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The cached verdict is reused while the archive is unchanged, recomputed
+    /// as soon as anything is archived, and the explicit full check always
+    /// looks again.
+    #[tokio::test]
+    async fn verify_cache_follows_the_archive() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:v",
+            "T",
+            &["hello"],
+        ))));
+        store.flush().await.unwrap();
+        let ttl = std::time::Duration::from_secs(600);
+        assert!(store.verify_archive_cached(ttl).await.unwrap().intact);
+
+        // Out-of-band edit: invisible to the cache until it expires…
+        let c = open_connection(&path).unwrap();
+        c.execute(
+            "UPDATE archived_messages SET content = 'forged' WHERE session_id = 'claude_code:v'",
+            [],
+        )
+        .unwrap();
+        assert!(store.verify_archive_cached(ttl).await.unwrap().intact);
+        // …but the explicit check and a zero max-age both catch it.
+        assert!(!store.verify_archive().await.unwrap().intact);
+        assert!(
+            !store
+                .verify_archive_cached(std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .intact
+        );
+
+        // A legitimate archival moves the head and re-verifies at once.
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:w",
+            "T",
+            &["x"],
+        ))));
+        store.flush().await.unwrap();
+        let v = store.verify_archive_cached(ttl).await.unwrap();
+        assert_eq!(v.entries, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn archive_stats_bytes_track_archivals() {
+        let path = tmp_db();
+        let store = Store::open(&path).await.unwrap();
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:s",
+            "T",
+            &["abcd"],
+        ))));
+        store.flush().await.unwrap();
+        let a = store.archive_stats().await.unwrap();
+        assert_eq!((a.count, a.messages, a.bytes), (1, 1, 4));
+        assert_eq!(store.archive_stats().await.unwrap().bytes, 4, "cached");
+        store.enqueue(WriteOp::ArchiveSession(Box::new(archived(
+            "claude_code:s",
+            "T",
+            &["abcd", "efghij"],
+        ))));
+        store.flush().await.unwrap();
+        let b = store.archive_stats().await.unwrap();
+        assert_eq!(
+            (b.count, b.messages, b.bytes),
+            (1, 2, 10),
+            "a new archival invalidates the cache"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

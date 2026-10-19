@@ -172,7 +172,10 @@
   try { tab = localStorage.getItem('saffev.panel.tab') || 'overview'; } catch (e) { /* storage blocked */ }
   if (!TABS.some((t) => t.id === tab)) tab = 'overview';
   let settingsOpen = false;
-  let visible = true;
+  // Inside the menu-bar app the page loads in a HIDDEN window (at launch and
+  // after every service restart); it must not fetch or hold a stream until the
+  // host says it is on screen (onShow). A plain browser tab is visible.
+  let visible = !window.ipc;
   // Theme: '' follows the OS; 'light' / 'dark' is an explicit choice, kept per
   // viewer and echoed to the host so the offline card matches.
   let theme = '';
@@ -221,9 +224,14 @@
   // Heavy endpoints (agent scans, archive verify, 7-day analytics) are
   // refreshed at most this often; only the cheap `live` read polls every tick.
   const HEAVY_TTL = 45000;
+  // The heaviest reads get longer: the integrity verdict re-hashes the whole
+  // archive (and the server reuses it while nothing changed), the update check
+  // is a network call the server caches for hours, and the privacy rollups
+  // only move when the archive does.
+  const TTL = { verify: 5 * 60000, update: 30 * 60000, privacy: 2 * 60000, aprivacy: 2 * 60000 };
   const fetchedAt = {};
   async function load(keys, force) {
-    const uniq = Array.from(new Set(keys)).filter((k) => force || (!inflight[k] && (k === 'live' || !fetchedAt[k] || Date.now() - fetchedAt[k] > HEAVY_TTL)));
+    const uniq = Array.from(new Set(keys)).filter((k) => force || (!inflight[k] && (k === 'live' || !fetchedAt[k] || Date.now() - fetchedAt[k] > (TTL[k] || HEAVY_TTL))));
     let anyFail = false, anyOk = false;
     await Promise.all(uniq.map(async (k) => {
       const mine = (seq[k] = (seq[k] || 0) + 1);
@@ -329,8 +337,8 @@
 
     if (ag && Array.isArray(ag.atRisk)) {
       ag.atRisk.forEach((r) => {
-        if (r.overdue > 0) push({ key: 'overdue:' + r.tool, sev: 'danger', title: r.overdue + ' ' + r.label + ' session' + (r.overdue === 1 ? '' : 's') + ' past the deletion line', detail: 'Not preserved yet.', action: { label: 'Back up', act: 'backup' } });
-        else if (r.expiringSoon > 0) push({ key: 'expiring:' + r.tool, sev: 'warn', title: r.expiringSoon + ' ' + r.label + ' session' + (r.expiringSoon === 1 ? '' : 's') + ' expiring soon', detail: r.soonestExpiryTs ? 'Soonest ' + (days(r.soonestExpiryTs - Date.now()) || '') : '', action: { label: 'Back up', act: 'backup' } });
+        if (r.overdue > 0) push({ key: 'overdue:' + r.tool, sev: 'danger', title: r.overdue + ' ' + r.label + ' session' + (r.overdue === 1 ? '' : 's') + ' past the deletion line', detail: 'Not preserved yet.', action: { label: 'Preserve now', act: 'preserve' } });
+        else if (r.expiringSoon > 0) push({ key: 'expiring:' + r.tool, sev: 'warn', title: r.expiringSoon + ' ' + r.label + ' session' + (r.expiringSoon === 1 ? '' : 's') + ' expiring soon', detail: r.soonestExpiryTs ? 'Soonest ' + (days(r.soonestExpiryTs - Date.now()) || '') : '', action: { label: 'Preserve now', act: 'preserve' } });
       });
       if (ag.archive && ag.archive.enabled === false) push({ key: 'archive-off', sev: 'warn', title: 'Preservation is off', detail: '', action: { label: 'Turn on', act: 'preserve' } });
     }
@@ -598,18 +606,23 @@
     // the chosen folder. Only offered while the archive has changed since the
     // last backup.
     const needs = ar.changedSinceBackup || (!ar.lastBackupTs && ar.count > 0);
-    const backupBtn = busy.backup
+    const backupBtn = busy.backup || ar.backupRunning
       ? `<button class="btn primary sm" disabled>${ICON.backup} Backing up…</button>`
       : needs
         ? `<button class="btn primary sm" data-act="backup">${ICON.backup} Back up</button>`
         : `<button class="btn sm" disabled title="Nothing changed since the last backup">${ICON.check} Backed up${ar.lastBackupTs ? ' · ' + ago(ar.lastBackupTs) : ''}</button>`;
-    const backupLine = ar.lastBackupTs
+    const backupLine = (ar.lastBackupTs
       ? `Last backup ${ago(ar.lastBackupTs)}${ar.lastBackupDir ? ' · ' + esc(shortPath(ar.lastBackupDir)) : ''}`
-      : (ar.count > 0 ? 'Never backed up' : '');
+      : (ar.count > 0 ? 'Never backed up' : ''))
+      + (ar.backupAuto ? ' · automatic' : '');
+    const backupError = ar.lastBackupError
+      ? `<div class="card warn" style="margin-top:6px"><h4>Last backup failed</h4><p>${esc(ar.lastBackupError)}</p></div>`
+      : '';
     return `${hero}
       ${lbl('Aging · at risk', { label: 'Agents', route: '#/agents' })}<div class="rows">${aging}</div>
       ${tools.length ? lbl('Tools found') + `<div class="chips">${toolChips}</div>` : ''}
       <div class="row-actions" style="margin:0;align-items:center">${backupBtn}<span class="small muted" style="margin-left:4px">${backupLine}</span></div>
+      ${backupError}
       <div class="row" style="border-top:1px solid var(--divider);margin-top:2px"><div class="main"><div class="s">Backup folder</div><div class="t mono" style="font-size:11.5px" title="${esc(st.exportDirEffective || '')}">${esc(shortPath(st.exportDirEffective || '~'))}</div></div><button class="btn sm" data-cmd="choose_export_dir" ${busy.chooseDir ? 'disabled' : ''}>Change…</button></div>`;
   }
 
@@ -711,6 +724,15 @@
         ${settingRow('Preserve automatically', archiveOn ? 'Snapshot on start and periodically.' : 'Turn on preservation first.', settingSwitch('archiveAuto', !!st.archiveAuto, !archiveOn, 'Preserve automatically'))}
       </div>
       <div class="settings-group">
+        ${lbl('Backups')}
+        ${settingRow('Back up automatically', st.backupAuto ? 'Only what changed since the last backup, to ' + shortPath(st.exportDirEffective || '~') + '.' : 'Off. Use Back up on the Keep tab, or turn this on.', settingSwitch('backupAuto', !!st.backupAuto, false, 'Back up automatically'))}
+        <div class="setting-row"><div class="setting-copy"><div class="setting-title">How often</div><div class="setting-detail">A backup missed while asleep runs soon after waking.</div></div>
+          <div class="seg" role="group" aria-label="Backup frequency">
+            ${[[1, 'Hourly'], [6, '6 h'], [24, 'Daily'], [168, 'Weekly']].map(([h, l]) => `<button class="${(st.backupIntervalHours || 24) === h ? 'on' : ''}" data-interval="${h}" ${!st.backupAuto || busy.settings ? 'disabled' : ''}>${l}</button>`).join('')}
+          </div>
+        </div>
+      </div>
+      <div class="settings-group">
         ${lbl('Privacy')}
         ${settingRow('PII masking', maskLocked ? 'Managed by your team policy.' : (maskingOn ? 'On. Detected PII enters the masking pipeline.' : 'Off. Saffev observes but does not alter traffic.'), settingSwitch('maskingEnabled', maskingOn, maskLocked, 'PII masking'))}
         ${settingRow('Dry-run first', dryLocked ? 'Managed by your team policy.' : (!maskingOn ? 'Turn on masking first.' : (st.maskingDryRun ? 'Traffic stays unchanged while matches are recorded.' : 'Off. Matching PII is redacted before forwarding.')), settingSwitch('maskingDryRun', !!st.maskingDryRun, !maskingOn || dryLocked, 'Masking dry-run'))}
@@ -789,13 +811,16 @@
     clearTimeout(noticeTimer);
     if (!n) { el.hidden = true; return; }
     el.className = 'notice ' + (n.kind || '');
-    el.innerHTML = `${n.kind === 'busy' ? '<span class="spin"></span>' : ''}<b>${esc(n.title)}</b><span>${esc(n.detail || '')}</span>`;
+    const reveal = n.revealPath && window.ipc
+      ? `<button class="btn sm" data-reveal="${esc(n.revealPath)}">Show in Finder</button>`
+      : '';
+    el.innerHTML = `${n.kind === 'busy' ? '<span class="spin"></span>' : ''}<b>${esc(n.title)}</b><span>${esc(n.detail || '')}</span>${reveal}`;
     el.hidden = false;
     if (n.kind === 'ok' || n.kind === 'error') {
       const wasBackup = busy.backup;
       busy.backup = false; busy.preserve = false; renderBody(); renderTabs();
       if (wasBackup) load(['agents', 'verify'], true);
-      noticeTimer = setTimeout(() => { el.hidden = true; reportHeight(); }, n.kind === 'error' ? 9000 : 5000);
+      noticeTimer = setTimeout(() => { el.hidden = true; reportHeight(); }, n.kind === 'error' || n.revealPath ? 9000 : 5000);
     }
     reportHeight();
   }
@@ -821,25 +846,32 @@
     busy.preserve = false; renderBody();
   }
 
-  // Back up = make sure everything new is in the archive, then hand the
-  // export to the host (it runs `saffev backup` and reveals the folder).
+  // Back up = make sure everything new is in the archive, then ask the Studio
+  // to write the backup (incremental when a chain exists). It runs in the
+  // service, so the panel stays open and nothing steals focus; the folder is
+  // one click away ("Show in Finder") instead of popping up on its own.
   async function backupNow() {
     if (busy.backup) return;
     busy.backup = true; renderBody();
-    notice({ kind: 'busy', title: 'Backing up…', detail: '' });
+    notice({ kind: 'busy', title: 'Backing up…', detail: 'Preserving new sessions first' });
     try {
       const ag = data.agents;
       if (ag && ag.archive && ag.archive.enabled === false) {
         await api('/settings', { method: 'PUT', body: { archiveEnabled: true, archiveAuto: true } });
       }
       await api('/archive/run', { method: 'POST' });
+      notice({ kind: 'busy', title: 'Backing up…', detail: 'Writing only what changed since the last backup' });
+      const r = await api('/backup', { method: 'POST', body: {} });
+      const what = r.kind === 'unchanged' ? 'Already up to date'
+        : r.kind === 'incremental' ? 'Incremental · ' + bytes(r.bytes)
+        : 'Full copy · ' + bytes(r.bytes);
+      notice({ kind: 'ok', title: r.kind === 'unchanged' ? 'Nothing new to back up' : 'Backup written', detail: what + ' · ' + shortPath(r.dir), revealPath: r.dir });
     } catch (e) {
-      busy.backup = false;
       notice({ kind: 'error', title: 'Backup failed', detail: e.message || String(e) });
-      renderBody();
-      return;
     }
-    ipc({ cmd: 'backup' });
+    busy.backup = false;
+    await load(['agents'], true);
+    renderBody();
   }
 
   async function updateSetting(field, next) {
@@ -866,8 +898,10 @@
   }
 
   document.addEventListener('click', (ev) => {
-    const t = ev.target.closest('[data-tab],[data-route],[data-cmd],[data-act],[data-dismiss],[data-mode],[data-setting],[data-theme-choice]');
+    const t = ev.target.closest('[data-tab],[data-route],[data-cmd],[data-act],[data-dismiss],[data-mode],[data-setting],[data-theme-choice],[data-reveal],[data-interval]');
     if (!t) return;
+    if (t.dataset.reveal) { ipc({ cmd: 'reveal', path: t.dataset.reveal }); return; }
+    if (t.dataset.interval) { updateSetting('backupIntervalHours', parseInt(t.dataset.interval, 10)); return; }
     if (t.dataset.themeChoice) { setTheme(t.dataset.themeChoice); return; }
     if (t.dataset.setting) { updateSetting(t.dataset.setting, t.dataset.next === 'true'); return; }
     if (t.dataset.mode) { spendMode = t.dataset.mode; renderBody(); return; }
@@ -928,7 +962,7 @@
       if (was !== host.status && host.status === 'running') refresh(true);
       if (settingsOpen || tab === 'alerts') renderBody();
     },
-    onShow() { visible = true; refresh(true); startPolling(); },
+    onShow() { const was = visible; visible = true; refresh(true); if (!was || !pollTimer) startPolling(); },
     onHide() { visible = false; stopPolling(); },
     notice,
     // The host's native folder picker returned (null = cancelled). Save it as
@@ -951,6 +985,10 @@
   render();
   ipc({ cmd: 'ready' });
   if (theme) ipc({ cmd: 'set_theme', theme });
-  refresh(true).then(() => { firstPaint = false; });
-  startPolling();
+  // Hosted: wait for onShow (the host calls it when the panel opens, or right
+  // after `ready` if it already is). Browser tab: start now.
+  if (visible) {
+    refresh(true).then(() => { firstPaint = false; });
+    startPolling();
+  }
 })();
