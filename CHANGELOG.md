@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.9.0
+
+**Backups that compound, and a menu bar that's fast to read.**
+
+### A redesigned menu-bar app
+- New panel: one consistent system of tiles, rows and controls, dark first
+  with a light theme, and much shorter copy. Four tabs: **Today**, **Keep**,
+  **Privacy**, **Spend**. Alerts move to a bell inbox; Settings opens as its
+  own page.
+- **Keep** shows the backup chain (full copy + changes), the next scheduled
+  backup, the destination, and Back up now / Show in Finder.
+- **Privacy** turns masking into one control: Observe, Dry run or Redact.
+- **Spend** shows daily cost or tokens stacked by tool, the current 5-hour
+  block, and spend per tool.
+- New app icon (ink with the mint recorder mark) and a menu-bar glyph with
+  three states: recording, paused, and needs you (service failed to start).
 
 ### Backups: incremental, scheduled, and restorable
 - **Incremental backups.** After the first full copy, each backup writes only
