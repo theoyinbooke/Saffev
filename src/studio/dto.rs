@@ -756,6 +756,21 @@ pub struct ArchiveStatusView {
     /// A backup is running in the Studio process right now.
     #[serde(default)]
     pub backup_running: bool,
+    /// `full` | `incremental` for the last backup (from its manifest).
+    #[serde(default)]
+    pub last_backup_kind: Option<String>,
+    /// Links since the chain's full copy (0 = the last backup was full).
+    #[serde(default)]
+    pub backup_depth: Option<u32>,
+    /// Incremental links per chain before a new full copy (`[backup] full_every`).
+    #[serde(default)]
+    pub backup_full_every: u32,
+    /// Hours between scheduled backups.
+    #[serde(default)]
+    pub backup_interval_hours: u32,
+    /// When the schedule will next run a backup (when automatic backups are on).
+    #[serde(default)]
+    pub next_backup_ts: Option<i64>,
 }
 
 /// `POST /api/backup` — what one backup run did.

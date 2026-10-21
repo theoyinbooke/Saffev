@@ -2058,6 +2058,16 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         .flatten();
     let changed_since_backup =
         changed_since_backup(&state.store, archived.latest_ts, last_backup_ts).await;
+    let last_manifest = last_backup_dir
+        .as_deref()
+        .and_then(|d| crate::backup::read_manifest(std::path::Path::new(d)));
+    let last_check_ts: Option<i64> = state
+        .store
+        .get_setting(crate::backup::KEY_LAST_CHECK_TS)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok());
     let last_backup_error = state
         .store
         .get_setting(crate::backup::KEY_LAST_ERROR)
@@ -2085,6 +2095,20 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
             last_backup_error,
             backup_auto: cfg.backup.auto,
             backup_running: crate::backup::is_running(),
+            last_backup_kind: last_manifest.as_ref().map(|m| match m.kind {
+                crate::backup::Kind::Full => "full".to_string(),
+                crate::backup::Kind::Incremental => "incremental".to_string(),
+            }),
+            backup_depth: last_manifest.as_ref().map(|m| m.depth),
+            backup_full_every: cfg.backup.full_every,
+            backup_interval_hours: cfg.backup.interval_hours,
+            next_backup_ts: cfg.backup.auto.then(|| {
+                let period = i64::from(cfg.backup.interval_hours.max(1)) * 3_600_000;
+                last_backup_ts
+                    .max(last_check_ts)
+                    .map(|t| t + period)
+                    .unwrap_or_else(|| time::OffsetDateTime::now_utc().unix_timestamp() * 1000)
+            }),
             enabled: cfg.archive.enabled,
             auto: cfg.archive.auto,
             count: archived.count,

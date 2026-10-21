@@ -396,7 +396,7 @@ pub fn run_tray() -> ExitCode {
     // starve the timer (each event pushes the deadline out again).
     let mut next_tick = Instant::now() + refresh;
     // What the status item currently shows, so it is only touched on change.
-    let mut shown_icon: Option<bool> = None;
+    let mut shown_icon: Option<Glyph> = None;
     let mut shown_status: &'static str = "";
 
     event_loop.run(move |event, target, control_flow| {
@@ -427,7 +427,7 @@ pub fn run_tray() -> ExitCode {
             Event::NewEvents(StartCause::Init) => {
                 let mut builder = TrayIconBuilder::new()
                     .with_tooltip("Saffev — local AI studio")
-                    .with_icon(status_icon(sup.is_running()))
+                    .with_icon(status_icon(Glyph::of(&sup)))
                     // macOS template images are automatically rendered white
                     // or black for the current menu-bar appearance. The source
                     // stays a pure alpha mask, so it remains legible in either.
@@ -634,13 +634,14 @@ pub fn run_tray() -> ExitCode {
         // Refresh the icon + fallback menu, and push state to the panel only
         // when something changed (the page re-renders on every push).
         let running = sup.is_running();
-        if shown_icon != Some(running) {
+        let glyph = Glyph::of(&sup);
+        if shown_icon != Some(glyph) {
             if let Some(t) = &tray {
                 let _ = t.set_icon_with_as_template(
-                    Some(status_icon(running)),
+                    Some(status_icon(glyph)),
                     cfg!(target_os = "macos"),
                 );
-                shown_icon = Some(running);
+                shown_icon = Some(glyph);
             }
         }
         let status = sup.status_text();
@@ -792,28 +793,65 @@ const STATUS_ICON_MASK: [&str; 32] = [
     "                                ",
 ];
 
-fn status_icon_rgba(running: bool) -> Vec<u8> {
+/// What the status item shows: the three states of the menu-bar glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glyph {
+    /// Solid mark: the service is up and recording.
+    Recording,
+    /// Dimmed mark: stopped (or starting).
+    Paused,
+    /// Solid mark with a dot cut out of its top-right corner: the service
+    /// failed to start and needs the user. A template image cannot carry
+    /// colour, so the dot is drawn in the mark's own tint, ringed by a clear
+    /// gap so it reads at 16pt.
+    NeedsYou,
+}
+
+impl Glyph {
+    fn of(sup: &Supervisor) -> Self {
+        if sup.is_running() {
+            Glyph::Recording
+        } else if sup.status_key() == "failed" {
+            Glyph::NeedsYou
+        } else {
+            Glyph::Paused
+        }
+    }
+}
+
+fn status_icon_rgba(glyph: Glyph) -> Vec<u8> {
     let rgb = if cfg!(target_os = "macos") {
         // NSImage template content is defined by alpha, not RGB.
         (0, 0, 0)
-    } else if running {
-        (17, 118, 110)
-    } else {
+    } else if glyph == Glyph::Paused {
         (128, 128, 128)
+    } else {
+        (17, 118, 110)
     };
+    // The attention dot: centre, filled radius, cleared ring radius (px).
+    let (cx, cy, dot_r, gap_r) = (26.0f32, 6.0f32, 4.0f32, 6.5f32);
     let mut rgba = Vec::with_capacity(32 * 32 * 4);
-    for row in STATUS_ICON_MASK {
-        for px in row.bytes() {
-            let base_alpha = match px {
+    for (y, row) in STATUS_ICON_MASK.iter().enumerate() {
+        for (x, px) in row.bytes().enumerate() {
+            let base_alpha: u8 = match px {
                 b'#' => 255,
                 b'+' => 128,
                 _ => 0,
             };
-            let alpha = if running {
-                base_alpha
-            } else {
-                ((base_alpha as u16 * 112) / 255) as u8
+            let mut alpha = match glyph {
+                Glyph::Paused => ((base_alpha as u16 * 112) / 255) as u8,
+                _ => base_alpha,
             };
+            if glyph == Glyph::NeedsYou {
+                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                if d <= dot_r {
+                    alpha = 255;
+                } else if d <= dot_r + 1.0 {
+                    alpha = 128; // antialiased dot edge
+                } else if d <= gap_r {
+                    alpha = 0;
+                }
+            }
             rgba.extend_from_slice(&[rgb.0, rgb.1, rgb.2, alpha]);
         }
     }
@@ -822,8 +860,8 @@ fn status_icon_rgba(running: bool) -> Vec<u8> {
 
 /// The canonical Saffev mark for the status item. On macOS this is installed
 /// as a template image so AppKit supplies the correct menu-bar foreground.
-fn status_icon(running: bool) -> Icon {
-    Icon::from_rgba(status_icon_rgba(running), 32, 32).expect("valid icon")
+fn status_icon(glyph: Glyph) -> Icon {
+    Icon::from_rgba(status_icon_rgba(glyph), 32, 32).expect("valid icon")
 }
 
 // ----- Open at Login (a per-user LaunchAgent) -----
@@ -967,8 +1005,8 @@ mod tests {
     #[test]
     fn status_icon_is_the_canonical_transparent_mark() {
         assert!(STATUS_ICON_MASK.iter().all(|row| row.len() == 32));
-        let running = status_icon_rgba(true);
-        let stopped = status_icon_rgba(false);
+        let running = status_icon_rgba(Glyph::Recording);
+        let stopped = status_icon_rgba(Glyph::Paused);
         assert_eq!(running.len(), 32 * 32 * 4);
         assert_eq!(running[3], 0, "top-left must stay transparent");
         let running_alpha: u32 = running.iter().skip(3).step_by(4).map(|a| *a as u32).sum();
@@ -978,5 +1016,22 @@ mod tests {
             stopped_alpha < running_alpha,
             "stopped state should be visibly dimmer"
         );
+    }
+
+    #[test]
+    fn needs_you_glyph_adds_a_ringed_dot() {
+        let solid = status_icon_rgba(Glyph::Recording);
+        let alert = status_icon_rgba(Glyph::NeedsYou);
+        let alpha = |v: &[u8], x: usize, y: usize| v[(y * 32 + x) * 4 + 3];
+        assert_eq!(alpha(&alert, 26, 6), 255, "the dot's centre is opaque");
+        assert_eq!(
+            alpha(&alert, 26, 0),
+            0,
+            "a clear ring separates the dot from the mark"
+        );
+        // Away from the corner the glyph is the plain mark.
+        for (x, y) in [(5, 16), (16, 16), (10, 24)] {
+            assert_eq!(alpha(&alert, x, y), alpha(&solid, x, y));
+        }
     }
 }

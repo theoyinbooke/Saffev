@@ -183,18 +183,21 @@ mod tests {
 
     #[test]
     fn menu_bar_exposes_persistent_quick_settings() {
-        let html = StudioAssets::get("menubar.html").expect("embedded menubar shell");
-        let html = String::from_utf8_lossy(&html.data);
-        assert!(html.contains("id=\"btnSettings\""));
-
+        // The header (rendered by menubar.js) opens Settings as a sub-page.
         let js = StudioAssets::get("menubar.js").expect("embedded menubar logic");
         let js = String::from_utf8_lossy(&js.data);
+        assert!(
+            js.contains("data-page=\"settings\""),
+            "no way into quick settings"
+        );
         for field in [
             "archiveEnabled",
             "archiveAuto",
             "maskingEnabled",
             "maskingDryRun",
             "loginEnabled",
+            "backupAuto",
+            "backupIntervalHours",
             "method: 'PUT'",
         ] {
             assert!(js.contains(field), "quick settings missing {field}");
