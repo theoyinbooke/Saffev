@@ -86,3 +86,4 @@ post-announce-jobs = ["./notarize-macos", "./package-macos-dmg"]
 # after every bare [dist] key, or those keys would bind to this table instead.
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+aarch64-apple-darwin = "macos-15"

@@ -21,7 +21,7 @@
 #   workflow_dispatch — with a tag, to attach a DMG to a release that already
 #                       exists (which is how v0.6.0 gets fixed without re-cutting).
 #
-# The runner is macos-14 (Apple Silicon), so the artifact is arm64 — matching the
+# The runner is macos-15 (Apple Silicon), so the artifact is arm64 — matching the
 # `Saffev-macos-arm64.dmg` name the README links to.
 
 name: Package macOS DMG
@@ -63,7 +63,7 @@ on:
 jobs:
   package-dmg:
     name: Build + notarize Saffev.app DMG
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

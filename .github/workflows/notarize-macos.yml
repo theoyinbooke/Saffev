@@ -45,7 +45,7 @@ on:
 jobs:
   notarize-macos:
     name: Notarize macOS archives
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ inputs.plan }}

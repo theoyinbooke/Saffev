@@ -22,7 +22,7 @@ on:
 jobs:
   check-tray:
     name: cargo check --features tray
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
 
     env:
