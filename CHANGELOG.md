@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.1
+
+**Hardened, faster, and cleaner end-to-end.**
+
+### Security & Reliability
+- **Studio auth & DNS-rebinding hardening.** The Host-header allowlist now guards the static Studio and menu-bar shells (`index.html`, `menubar.html`) as well as `/api/*`, adds `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, escapes `<` in the injected token, rejects empty bearer tokens, and mints an ephemeral 256-bit session token if the OS keyring is unavailable.
+- **SSRF & path-traversal defenses.** Upstream forwarding disables automatic HTTP redirects; archive export/audit paths canonicalize safely across symlinks and verify mount presence before writing; Codex server config serializes model names safely; notification and restart helpers pass paths without shell interpolation.
+- **SQLCipher size-based retention fix.** `PRAGMA page_size` under SQLCipher returns text (`cipher_page_size`), which previously broke `Retention::Size`. Retention now parses numeric pragmas cleanly, tracks live `(page_count - freelist_count) * page_size`, and purges in batches while preserving the archive.
+- **Data integrity & backups.** Added schema migrations v11–v12 (`UNIQUE` on `responses(request_id)`, denormalized `archived_sessions.content_bytes`, covering and partial indexes), transactional migrations, atomic upserts, incremental delta deduplication, and `BackupCursor` regression detection so retention resets trigger a fresh full backup.
+- **Graceful shutdown.** Open `/api/stream` SSE connections now close immediately on `SIGTERM`/`SIGINT` instead of waiting for the 5-second drain timeout, and the store flushes pending writes before exit.
+
+### Privacy & Proxy Accuracy
+- **Stronger PII & streaming masking.** Added Anthropic/base64url API key detection, O(log M) span tracking, multi-KB PEM block suppression, long JWT holdback, and fixed backward whitespace snapping so space-separated secrets (credit cards, phones, IBANs) are never split across chunks.
+- **Single-pass JSON-aware masking & bounded buffers.** Request policy runs in a single pass with compressed-body safety; response buffering is capped at 16 MiB with proper `ResponseFinished` cleanup on early disconnects; proxy-side TTFT and decoded completion PII scanning are recorded accurately.
+- **Accurate local vs. cloud pricing.** Bounded model-ID matching keeps local Ollama models (e.g. `marco-o1:latest`) at `$0`, adds specific `-mini`/`-nano`/`-flash` tiers, supports Bedrock/OpenRouter `:` prefixes, and wires live pricing overrides into agent analytics.
+
+### Performance & Polish
+- **SQL pushdown & read-pool bounds.** Replaced multi-hundred-row scans in Live, Privacy, Quality, Analytics, and Timeline with targeted SQL aggregations; bounded concurrent SQLCipher read connections via semaphore; coalesced concurrent cold archive integrity checks; offloaded backup, export, audit, and agent endpoints to `spawn_blocking`.
+- **Faster coding-agent readers.** Replaced `4N+1`/`2N+1` SQLite queries in OpenCode and Goose with bulk queries; cached Aider walks, Claude Code usage files, and Codex titles; skipped unnecessary message decoding during metadata scans; fixed an infinite re-mirroring loop when redaction is enabled on PII-bearing titles.
+- **Studio & macOS menu-bar polish.** Multiplexed Studio live updates onto a single shared `/api/stream` SSE connection; parallelized Live/Engines refreshes; eliminated stale-response races across drawers and tabs; serialized Settings saves without losing input focus; tightened tray panel origin/reveal boundaries and supervisor lifecycle checks.
+
 ## v0.9.0
 
 **Backups that compound, and a menu bar that's fast to read.**
