@@ -339,7 +339,7 @@ pub fn spawn_background_child(
     // Diagnostic output goes to the log file when the caller provides one;
     // opening the log is best-effort (fail-open) — a failure falls back to null
     // rather than blocking the daemon from starting.
-    let (out, err) = match log_to.and_then(|p| open_rotated_log(p)) {
+    let (out, err) = match log_to.and_then(open_rotated_log) {
         Some((out, err)) => (out, err),
         None => (std::process::Stdio::null(), std::process::Stdio::null()),
     };
@@ -426,24 +426,43 @@ pub(crate) fn strip_deleted_marker(path: &str) -> String {
 /// it, and its output goes to `restart-helper.log` next to the daemon log so a
 /// failed relaunch is diagnosable instead of silent. Used by `POST /api/restart`.
 pub fn spawn_restart_helper() -> Result<()> {
+    spawn_restart_helper_with(None, None)
+}
+
+/// Like [`spawn_restart_helper`], forwarding an explicit `--config` path and
+/// placing `restart-helper.log` inside `data_dir` when known.
+///
+/// Passes executable and config paths via positional parameters / env vars —
+/// never interpolating paths into shell command strings.
+pub fn spawn_restart_helper_with(
+    config_path: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
+) -> Result<()> {
     let exe = current_exe_on_disk()?;
-    let exe = exe.to_string_lossy().to_string();
-    // Failures here were invisible (null stderr) — the Linux update bug hid
-    // behind that for two releases. Best-effort log file instead.
-    let log = dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("saffev/restart-helper.log");
+    let log = data_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(crate::config::Config::default_data_dir)
+        .join("restart-helper.log");
     let (out, err) = open_rotated_log(&log)
         .unwrap_or((std::process::Stdio::null(), std::process::Stdio::null()));
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let script = format!("sleep 0.6; \"{exe}\" stop; exec \"{exe}\" start --no-open");
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(script)
-            .stdin(std::process::Stdio::null())
+        if let Some(cfg) = config_path {
+            cmd.arg("-c")
+                .arg("sleep 0.6; \"$1\" --config \"$2\" stop; exec \"$1\" --config \"$2\" start --no-open")
+                .arg("saffev-restart")
+                .arg(&exe)
+                .arg(cfg);
+        } else {
+            cmd.arg("-c")
+                .arg("sleep 0.6; \"$1\" stop; exec \"$1\" start --no-open")
+                .arg("saffev-restart")
+                .arg(&exe);
+        }
+        cmd.stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err)
             // Own process group so the `stop` SIGTERM we send to ourselves can't
@@ -458,20 +477,32 @@ pub fn spawn_restart_helper() -> Result<()> {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let line = format!("timeout /T 1 >NUL & \"{exe}\" stop & \"{exe}\" start --no-open");
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", &line])
-            .stdin(std::process::Stdio::null())
-            .stdout(out)
-            .stderr(err)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            if config_path.is_some() {
+                "Start-Sleep -Milliseconds 600; & $env:SAFFEV_RESTART_EXE --config $env:SAFFEV_RESTART_CFG stop; & $env:SAFFEV_RESTART_EXE --config $env:SAFFEV_RESTART_CFG start --no-open"
+            } else {
+                "Start-Sleep -Milliseconds 600; & $env:SAFFEV_RESTART_EXE stop; & $env:SAFFEV_RESTART_EXE start --no-open"
+            },
+        ])
+        .env("SAFFEV_RESTART_EXE", &exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        if let Some(cfg) = config_path {
+            cmd.env("SAFFEV_RESTART_CFG", cfg);
+        }
         cmd.spawn()
             .map_err(|e| Error::Other(anyhow::anyhow!("failed to spawn restart helper: {e}")))?;
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (out, err);
+        let _ = (exe, config_path, out, err);
         Err(Error::Other(anyhow::anyhow!(
             "self-restart is not supported on this platform"
         )))

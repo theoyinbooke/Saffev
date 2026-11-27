@@ -115,6 +115,7 @@ impl DeterministicGuard {
 /// the proxy injects forces Ollama's `format:"json"` (it is what stops small
 /// "thinking" models returning empty content), so **prompt for JSON and parse
 /// JSON**. Ask for a bare line and you will silently receive JSON instead.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SafetyGuard: Send + Sync {
     /// Stable identifier, recorded with each finding (e.g. `deterministic:v2`).
@@ -205,6 +206,94 @@ impl ModelGuard {
         };
         parse_guard_reply(&reply)
     }
+    /// Run the guard over a separate `(prompt, response)` exchange, budgeting
+    /// `MAX_GUARD_CHARS` across both sides (tail of prompt + head of response)
+    /// so a long multi-turn system prompt never truncates away the latest user
+    /// turn or the AI's reply.
+    pub async fn scan_exchange_with(
+        &self,
+        backend: &dyn super::judge::LlmBackend,
+        prompt: Option<&str>,
+        response: Option<&str>,
+    ) -> Vec<GuardHit> {
+        let mut combined = String::new();
+        let half = MAX_GUARD_CHARS / 2;
+        if let Some(p) = prompt.filter(|s| !s.trim().is_empty()) {
+            let p_chars: Vec<char> = p.chars().collect();
+            let take_p = if response.is_some_and(|r| !r.trim().is_empty()) {
+                half
+            } else {
+                MAX_GUARD_CHARS
+            };
+            let start = p_chars.len().saturating_sub(take_p);
+            for ch in &p_chars[start..] {
+                combined.push(*ch);
+            }
+        }
+        if let Some(r) = response.filter(|s| !s.trim().is_empty()) {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            let budget = MAX_GUARD_CHARS.saturating_sub(combined.chars().count());
+            for ch in r.chars().take(budget) {
+                combined.push(ch);
+            }
+        }
+        self.scan_with(backend, &combined).await
+    }
+}
+
+/// Strip closed `<think>...</think>` reasoning traces so verdicts emitted after
+/// thinking blocks (or schema examples quoted inside them) parse cleanly.
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(start) = out.find("<think>") {
+        if let Some(rel_end) = out[start..].find("</think>") {
+            let end = start + rel_end + "</think>".len();
+            out.replace_range(start..end, "");
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Extract the last top-level JSON object `{...}` from a reply that may be
+/// wrapped in markdown code fences or brief preamble prose.
+fn extract_last_json_object(s: &str) -> Option<&str> {
+    let end = s.rfind('}')?;
+    let prefix = &s[..=end];
+    // Walk backward to find the matching `{` (respecting JSON string quoting).
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let bytes = prefix.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b'"' {
+            // Count preceding backslashes to tell escaped `\"` from real quote.
+            let mut bs = 0usize;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'\\' {
+                bs += 1;
+                j -= 1;
+            }
+            if bs % 2 == 0 {
+                in_str = !in_str;
+            }
+        } else if !in_str {
+            if b == b'}' {
+                depth += 1;
+            } else if b == b'{' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&prefix[i..=end]);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build the classifier prompt.
@@ -231,23 +320,28 @@ fn build_guard_prompt(text: &str) -> String {
 
 /// Parse a guard reply.
 ///
-/// The backend forces JSON, so JSON is the contract and is tried first. The text
-/// fallback exists only for a model that ignored the format, and it is
-/// deliberately STRICT: an earlier version treated any occurrence of the
-/// substring "unsafe" as a verdict, which flagged `"not unsafe"` and any reply
-/// that merely echoed the prompt (which itself contains the word). A guard that
-/// cries wolf on its own instructions is worse than no guard.
+/// The backend forces JSON, so JSON is the contract and is tried first (also
+/// handling `<think>...</think>` blocks and markdown code fences from OpenAI /
+/// LM Studio backends). The text fallback exists only for a model that ignored
+/// the format, and it is deliberately STRICT: an earlier version treated any
+/// occurrence of the substring "unsafe" as a verdict, which flagged `"not unsafe"`
+/// and any reply that merely echoed the prompt (which itself contains the word).
 ///
 /// Anything that is not a clear unsafe verdict yields no finding. Absence of a
 /// hit is not an assertion of safety, it is just an absence.
 fn parse_guard_reply(reply: &str) -> Vec<GuardHit> {
-    let trimmed = reply.trim();
+    let cleaned = strip_think_blocks(reply);
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
 
-    // The contract: {"verdict": "...", "category": "..."}
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+    // The contract: {"verdict": "...", "category": "..."} (bare or fenced).
+    let json_val = serde_json::from_str::<serde_json::Value>(trimmed).ok().or_else(|| {
+        extract_last_json_object(trimmed)
+            .and_then(|obj| serde_json::from_str::<serde_json::Value>(obj).ok())
+    });
+    if let Some(v) = json_val {
         let verdict = v
             .get("verdict")
             .and_then(|x| x.as_str())
@@ -502,5 +596,30 @@ mod socket_tests {
     async fn guards_are_identifiable() {
         assert_eq!(DeterministicGuard.id(), "deterministic:v2");
         assert_eq!(ModelGuard::new("lionguard:1b").model, "lionguard:1b");
+    }
+
+    #[tokio::test]
+    async fn model_guard_parses_think_and_fenced_json_and_budgets_response() {
+        let g = ModelGuard::new("m");
+        let reply = "<think>considering safety</think>\n```json\n{\"verdict\":\"unsafe\",\"category\":\"malware\"}\n```";
+        let hits = g.scan_with(&Canned(Some(reply.into())), "x").await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].category, "malware");
+
+        // Ensure response is still sent to the backend even when prompt > MAX_GUARD_CHARS.
+        struct Capture(std::sync::Mutex<String>);
+        #[async_trait::async_trait]
+        impl super::super::judge::LlmBackend for Capture {
+            async fn complete(&self, prompt: &str) -> Option<String> {
+                *self.0.lock().unwrap() = prompt.to_string();
+                Some(r#"{"verdict":"safe"}"#.into())
+            }
+        }
+        let cap = Capture(std::sync::Mutex::new(String::new()));
+        let long_prompt = "x".repeat(MAX_GUARD_CHARS + 500);
+        let _ = g
+            .scan_exchange_with(&cap, Some(&long_prompt), Some("RESPONSE_SENTINEL"))
+            .await;
+        assert!(cap.0.lock().unwrap().contains("RESPONSE_SENTINEL"));
     }
 }

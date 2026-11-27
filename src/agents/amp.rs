@@ -231,25 +231,23 @@ impl AmpReader {
                             });
                         }
                     }
-                    "tool_result" => {
-                        if with_messages {
-                            let out_text = b
-                                .get("run")
-                                .and_then(|r| r.get("result"))
-                                .map(|r| match r.get("output").and_then(Value::as_str) {
-                                    Some(s) => s.to_string(),
-                                    None => r.to_string(),
-                                })
-                                .unwrap_or_default();
-                            if !out_text.is_empty() {
-                                messages.push(AgentMessage {
-                                    role: Role::Tool,
-                                    kind: MessageKind::ToolResult,
-                                    content: super::claude_code::truncate(&out_text, 2000),
-                                    ts,
-                                    tool_name: None,
-                                });
-                            }
+                    "tool_result" if with_messages => {
+                        let out_text = b
+                            .get("run")
+                            .and_then(|r| r.get("result"))
+                            .map(|r| match r.get("output").and_then(Value::as_str) {
+                                Some(s) => s.to_string(),
+                                None => r.to_string(),
+                            })
+                            .unwrap_or_default();
+                        if !out_text.is_empty() {
+                            messages.push(AgentMessage {
+                                role: Role::Tool,
+                                kind: MessageKind::ToolResult,
+                                content: super::claude_code::truncate(&out_text, 2000),
+                                ts,
+                                tool_name: None,
+                            });
                         }
                     }
                     _ => {}
@@ -315,6 +313,9 @@ impl AgentReader for AmpReader {
         Some(super::hash_files(self.thread_files().into_iter()))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
+        if !super::is_safe_path_id(raw_id) {
+            return None;
+        }
         let direct = self.threads.join(format!("{raw_id}.json"));
         if direct.is_file() {
             return Self::parse(&direct, true);
@@ -362,5 +363,21 @@ mod tests {
         assert_eq!(sessions[0].cache_tokens, 3);
         assert_eq!(sessions[0].model.as_deref(), Some("claude-sonnet-4-5"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_detail_rejects_path_traversal() {
+        let base = std::env::temp_dir().join(format!("saffev-amp-trav-{}", uuid::Uuid::new_v4()));
+        let threads = base.join("threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        std::fs::write(
+            base.join("secret.json"),
+            r#"{"v":1,"id":"secret","created":1753660000000,"messages":[{"role":"user","messageId":0,"content":"secret"}]}"#,
+        )
+        .unwrap();
+        let reader = AmpReader::with_root(threads);
+        assert!(reader.session_detail("../secret").is_none());
+        assert!(reader.session_detail("/etc/passwd").is_none());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

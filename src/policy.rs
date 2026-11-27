@@ -147,23 +147,18 @@ impl Policy {
             governs.push("masking.block_kinds".into());
         }
         if !self.custom_patterns.is_empty() {
-            // Appended, not replaced: a team policy adds shared patterns without
-            // deleting the ones an individual added for their own work.
-            let existing: std::collections::HashSet<&str> = cfg
+            // Team policy wins on name collision while keeping any non-colliding
+            // local patterns the user added for their own work.
+            let policy_names: std::collections::HashSet<&str> = self
                 .custom_patterns
                 .iter()
                 .map(|p| p.name.as_str())
                 .collect();
-            let mut added: Vec<CustomPattern> = self
-                .custom_patterns
-                .iter()
-                .filter(|p| !existing.contains(p.name.as_str()))
-                .cloned()
-                .collect();
-            if !added.is_empty() {
-                cfg.custom_patterns.append(&mut added);
-                governs.push("custom_patterns".into());
-            }
+            cfg.custom_patterns
+                .retain(|p| !policy_names.contains(p.name.as_str()));
+            cfg.custom_patterns
+                .extend(self.custom_patterns.iter().cloned());
+            governs.push("custom_patterns".into());
         }
 
         governs
@@ -331,12 +326,14 @@ regex = "EMP-[0-9]{6}"
         );
         let policy = Policy::load(&p).unwrap();
 
-        let mut cfg = Config::default();
-        cfg.custom_patterns = vec![CustomPattern {
-            name: "My ticket ids".into(),
-            regex: "TCK-[0-9]+".into(),
-            confidence: Default::default(),
-        }];
+        let mut cfg = Config {
+            custom_patterns: vec![CustomPattern {
+                name: "My ticket ids".into(),
+                regex: "TCK-[0-9]+".into(),
+                confidence: Default::default(),
+            }],
+            ..Default::default()
+        };
 
         policy.apply(&mut cfg);
 
@@ -380,8 +377,10 @@ regex = "EMP-[0-9]{6}"
     #[test]
     fn a_broken_policy_reports_loudly_instead_of_applying_nothing_quietly() {
         let p = write("this is not = valid toml [[[");
-        let mut cfg = Config::default();
-        cfg.policy_file = Some(p.clone());
+        let mut cfg = Config {
+            policy_file: Some(p.clone()),
+            ..Default::default()
+        };
 
         let status = apply_configured(&mut cfg).expect("a configured policy always reports");
         assert!(!status.active);
@@ -395,8 +394,10 @@ regex = "EMP-[0-9]{6}"
 
     #[test]
     fn a_missing_policy_file_reports_rather_than_silently_passing() {
-        let mut cfg = Config::default();
-        cfg.policy_file = Some(PathBuf::from("/nope/does-not-exist.toml"));
+        let mut cfg = Config {
+            policy_file: Some(PathBuf::from("/nope/does-not-exist.toml")),
+            ..Default::default()
+        };
         let status = apply_configured(&mut cfg).expect("configured but missing must report");
         assert!(!status.active);
         assert!(status.error.is_some());
@@ -418,5 +419,40 @@ regex = "EMP-[0-9]{6}"
             expand_home(Path::new("/etc/saffev-policy.toml")),
             PathBuf::from("/etc/saffev-policy.toml")
         );
+    }
+
+    #[test]
+    fn policy_custom_patterns_override_colliding_local_patterns() {
+        let mut cfg = Config::default();
+        cfg.custom_patterns.push(CustomPattern {
+            name: "corp_token".into(),
+            regex: "^$".into(), // local weak/no-op pattern with same name
+            confidence: crate::brain::Confidence::Low,
+        });
+        cfg.custom_patterns.push(CustomPattern {
+            name: "personal_pattern".into(),
+            regex: "MY-[0-9]{4}".into(),
+            confidence: crate::brain::Confidence::High,
+        });
+        let policy = Policy {
+            version: Some(1),
+            description: None,
+            masking: Default::default(),
+            custom_patterns: vec![CustomPattern {
+                name: "corp_token".into(),
+                regex: "CORP-[A-Z0-9]{16}".into(),
+                confidence: crate::brain::Confidence::High,
+            }],
+        };
+        let governs = policy.apply(&mut cfg);
+        assert!(governs.iter().any(|g| g == "custom_patterns"));
+        assert_eq!(cfg.custom_patterns.len(), 2);
+        let corp = cfg
+            .custom_patterns
+            .iter()
+            .find(|p| p.name == "corp_token")
+            .unwrap();
+        assert_eq!(corp.regex, "CORP-[A-Z0-9]{16}");
+        assert_eq!(corp.confidence, crate::brain::Confidence::High);
     }
 }

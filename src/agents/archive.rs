@@ -62,7 +62,7 @@ impl Redaction {
         })
     }
 
-    fn is_on(&self) -> bool {
+    pub(crate) fn is_on(&self) -> bool {
         self.detector.is_some()
     }
 
@@ -136,9 +136,12 @@ fn build(
                 }
                 // Mirroring switched on after this session was archived: the
                 // incremental skip would otherwise mean "never mirrored". One
-                // stat per skipped session; the transcript is parsed only when
-                // the mirror file is genuinely missing.
-                if mirror && super::mirror::mirror_path(s).is_some_and(|p| !p.exists()) {
+                // stat per skipped session (using the redacted filename when
+                // redaction is on, so secret-titled sessions don't re-mirror on
+                // every pass).
+                if mirror
+                    && super::mirror::mirror_path_for(s, redaction).is_some_and(|p| !p.exists())
+                {
                     if let Some(d) = super::detail(&s.id) {
                         summary.mirrored += mirror_one(&d, redaction);
                     }
@@ -147,8 +150,20 @@ fn build(
             }
         }
         match super::detail(&s.id) {
-            Some(d) => {
-                let archived = to_archived(&d, &hash, now, redaction);
+            Some(mut d) => {
+                // Redact once when enabled so archive + mirror share the same
+                // redacted title & messages (no double PII regex scan or clone).
+                if redaction.is_on() {
+                    d.session.title = d
+                        .session
+                        .title
+                        .as_deref()
+                        .map(|t| redaction.apply(super::Role::User, t));
+                    for m in &mut d.messages {
+                        m.content = redaction.apply(m.role, &m.content);
+                    }
+                }
+                let archived = to_archived(&d, &hash, now, &Redaction::off());
                 if store
                     .enqueue_blocking(WriteOp::ArchiveSession(Box::new(archived)))
                     .is_ok()
@@ -158,7 +173,7 @@ fn build(
                     summary.errors += 1;
                 }
                 if mirror {
-                    summary.mirrored += mirror_one(&d, redaction);
+                    summary.mirrored += mirror_one_pre_redacted(&d);
                 }
             }
             None => summary.errors += 1,
@@ -167,8 +182,8 @@ fn build(
 
     // Deletion detection: only flag an archived session whose **source file is
     // positively gone** (never just because it fell outside the capped live list).
-    // File-backed tools have a `.jsonl` source_path; shared-DB tools do not, so we
-    // conservatively never auto-flag those.
+    // File-backed tools have a `.jsonl`/`.json` source_path; shared-DB tools do
+    // not, so we conservatively never auto-flag those.
     for a in &existing {
         if seen.contains(&a.id) || a.source_deleted {
             continue;
@@ -201,10 +216,23 @@ fn mirror_one(d: &super::AgentSessionDetail, redaction: &Redaction) -> u32 {
     }
 }
 
-/// A per-session file source (`.jsonl`) that no longer exists = the app pruned it.
-/// Shared databases (Cursor/OpenCode) are never treated as gone.
+/// Mirror one pre-redacted session, fail-open.
+fn mirror_one_pre_redacted(d: &super::AgentSessionDetail) -> u32 {
+    match super::mirror::write_pre_redacted(d) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            tracing::debug!(target: "saffev::archive", "repo mirror failed (skipped): {e}");
+            0
+        }
+    }
+}
+
+/// A per-session file source (`.jsonl` or `.json`) that no longer exists = the
+/// app pruned it. Shared databases (Cursor/OpenCode/Goose) are never treated as gone.
 fn source_is_gone(source_path: &str) -> bool {
-    source_path.ends_with(".jsonl") && !std::path::Path::new(source_path).exists()
+    (source_path.ends_with(".jsonl") || source_path.ends_with(".json"))
+        && !std::path::Path::new(source_path).exists()
 }
 
 /// Cheap change key from list metadata — changes whenever a session grows or is
@@ -250,7 +278,10 @@ fn to_archived(
         id: s.id.clone(),
         tool: s.tool.key().to_string(),
         source_id,
-        title: s.title.clone(),
+        title: s
+            .title
+            .as_deref()
+            .map(|t| redaction.apply(Role::User, t)),
         project: s.project.clone(),
         git_branch: s.git_branch.clone(),
         model: s.model.clone(),

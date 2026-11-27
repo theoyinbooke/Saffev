@@ -73,10 +73,105 @@ impl UsageEvent {
     }
 }
 
+type CachedUsageFile = (u128, u64, Vec<(Option<(String, String)>, UsageEvent)>);
+
+fn usage_file_cache() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CachedUsageFile>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CachedUsageFile>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn parse_usage_file(path: &Path) -> Vec<(Option<(String, String)>, UsageEvent)> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let session_id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut project: Option<String> = None;
+    let mut rows = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        // Fast pre-filter: skip non-usage lines without building a full JSON DOM
+        // once `project` has already been captured.
+        if project.is_some() && !trimmed.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if project.is_none() {
+            project = v.get("cwd").and_then(Value::as_str).map(String::from);
+        }
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let Some(usage) = msg.get("usage") else {
+            continue;
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(super::rfc3339_millis)
+            .unwrap_or(0);
+        if ts <= 0 {
+            continue;
+        }
+        // Validate input_tokens + output_tokens BEFORE recording dedupe key so
+        // an earlier incomplete record cannot poison `seen` and drop a complete
+        // record with the same (message.id, requestId).
+        let (Some(input), Some(output)) = (
+            usage.get("input_tokens").and_then(Value::as_u64),
+            usage.get("output_tokens").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("");
+        let req_id = v.get("requestId").and_then(Value::as_str).unwrap_or("");
+        let dedupe_key = (!msg_id.is_empty() || !req_id.is_empty())
+            .then(|| (msg_id.to_string(), req_id.to_string()));
+        let g = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+        rows.push((
+            dedupe_key,
+            UsageEvent {
+                ts,
+                model: msg
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                input,
+                output,
+                cache_read: g("cache_read_input_tokens"),
+                cache_write: g("cache_creation_input_tokens"),
+                session_id: session_id.clone(),
+                project: project.clone(),
+                stored_cost_usd: v.get("costUSD").and_then(Value::as_f64),
+            },
+        ));
+    }
+    rows
+}
+
 /// Extract usage events from a Claude Code projects dir
 /// (`~/.claude/projects`). Dedupe follows ccusage: a `(message.id,
 /// requestId)` pair seen twice is the same billed request re-written.
+/// Per-file results are cached by `(mtime, size)` so repeated analytics /
+/// 60s monitor runs avoid re-parsing unchanged historical JSONL files.
 pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
+    claude_code_events_since(projects_dir, None)
+}
+
+/// Like [`claude_code_events`], optionally skipping files whose filesystem
+/// modification time is strictly before `min_mtime_secs` (unix seconds) —
+/// letting `spend_today` skip months of untouched historical files.
+pub fn claude_code_events_since(projects_dir: &Path, min_mtime_secs: Option<i64>) -> Vec<UsageEvent> {
     let mut out = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let Ok(slugs) = fs::read_dir(projects_dir) else {
@@ -91,72 +186,51 @@ pub fn claude_code_events(projects_dir: &Path) -> Vec<UsageEvent> {
             if p.extension().map(|e| e != "jsonl").unwrap_or(true) {
                 continue;
             }
-            let Ok(file) = fs::File::open(&p) else {
+            let Ok(meta) = fs::metadata(&p) else {
                 continue;
             };
-            let session_id = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
+            let mtime_dur = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .unwrap_or_default();
-            let mut project: Option<String> = None;
-            for line in BufReader::new(file).lines() {
-                let Ok(line) = line else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-                    continue;
-                };
-                if project.is_none() {
-                    project = v.get("cwd").and_then(Value::as_str).map(String::from);
-                }
-                if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            if let Some(min_secs) = min_mtime_secs {
+                if (mtime_dur.as_secs() as i64) < min_secs {
                     continue;
                 }
-                let Some(msg) = v.get("message") else {
-                    continue;
-                };
-                let Some(usage) = msg.get("usage") else {
-                    continue;
-                };
-                let ts = v
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .map(super::rfc3339_millis)
-                    .unwrap_or(0);
-                if ts <= 0 {
-                    continue;
+            }
+            let mtime_ns = mtime_dur.as_nanos();
+            let size = meta.len();
+
+            let cached = usage_file_cache()
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.get(&p)
+                        .filter(|(m, s, _)| *m == mtime_ns && *s == size)
+                        .map(|(_, _, evs)| evs.clone())
+                });
+            let file_rows = match cached {
+                Some(rows) => rows,
+                None => {
+                    let parsed = parse_usage_file(&p);
+                    if let Ok(mut c) = usage_file_cache().lock() {
+                        if c.len() > 2048 {
+                            c.clear();
+                        }
+                        c.insert(p, (mtime_ns, size, parsed.clone()));
+                    }
+                    parsed
                 }
-                let msg_id = msg.get("id").and_then(Value::as_str).unwrap_or("");
-                let req_id = v.get("requestId").and_then(Value::as_str).unwrap_or("");
-                if !msg_id.is_empty() || !req_id.is_empty() {
-                    if !seen.insert((msg_id.to_string(), req_id.to_string())) {
-                        continue; // retried/re-streamed duplicate
+            };
+
+            for (key, ev) in file_rows {
+                if let Some(k) = key {
+                    if !seen.insert(k) {
+                        continue;
                     }
                 }
-                // ccusage's schema requires input_tokens AND output_tokens;
-                // a record missing either is dropped entirely, not defaulted
-                // to zero (G3 round-1 critic, P3) — matching that keeps the
-                // two tools counting the same records.
-                let (Some(input), Some(output)) = (
-                    usage.get("input_tokens").and_then(Value::as_u64),
-                    usage.get("output_tokens").and_then(Value::as_u64),
-                ) else {
-                    continue;
-                };
-                let g = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                out.push(UsageEvent {
-                    ts,
-                    model: msg
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    input,
-                    output,
-                    cache_read: g("cache_read_input_tokens"),
-                    cache_write: g("cache_creation_input_tokens"),
-                    session_id: session_id.clone(),
-                    project: project.clone(),
-                    stored_cost_usd: v.get("costUSD").and_then(Value::as_f64),
-                });
+                out.push(ev);
             }
         }
     }

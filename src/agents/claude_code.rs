@@ -95,6 +95,7 @@ struct ParseState {
     tool_count: u32,
     first_ts: i64,
     last_ts: i64,
+    seen_usage: std::collections::HashSet<(String, String)>,
     messages: Vec<AgentMessage>,
 }
 
@@ -115,6 +116,7 @@ impl ParseState {
             tool_count: 0,
             first_ts: i64::MAX,
             last_ts: 0,
+            seen_usage: std::collections::HashSet::new(),
             messages: Vec::new(),
         }
     }
@@ -162,7 +164,7 @@ impl ParseState {
 
 impl super::tail::LineState for ParseState {
     fn weight(&self) -> usize {
-        super::tail::messages_weight(&self.messages)
+        super::tail::messages_weight(&self.messages) + self.seen_usage.len() * 80 + 256
     }
 
     fn feed(&mut self, line: &str) {
@@ -222,19 +224,35 @@ impl super::tail::LineState for ParseState {
                             *self.model_counts.entry(model.to_string()).or_default() += 1;
                         }
                         if let Some(u) = m.get("usage") {
-                            self.inp += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                            self.outp +=
-                                u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                            let cr = u
-                                .get("cache_read_input_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let cw = u
-                                .get("cache_creation_input_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            self.cache += cr + cw;
-                            self.cache_w += cw;
+                            // Require both input_tokens and output_tokens before
+                            // recording the dedupe key (matches `usage.rs`) so an
+                            // incomplete streaming line never poisons `seen_usage`
+                            // and drops the final usage line for the same turn.
+                            if let (Some(inp), Some(outp)) = (
+                                u.get("input_tokens").and_then(Value::as_u64),
+                                u.get("output_tokens").and_then(Value::as_u64),
+                            ) {
+                                let msg_id = m.get("id").and_then(Value::as_str).unwrap_or("");
+                                let req_id = v.get("requestId").and_then(Value::as_str).unwrap_or("");
+                                let is_dup = (!msg_id.is_empty() || !req_id.is_empty())
+                                    && !self
+                                        .seen_usage
+                                        .insert((msg_id.to_string(), req_id.to_string()));
+                                if !is_dup {
+                                    self.inp += inp;
+                                    self.outp += outp;
+                                    let cr = u
+                                        .get("cache_read_input_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0);
+                                    let cw = u
+                                        .get("cache_creation_input_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0);
+                                    self.cache += cr + cw;
+                                    self.cache_w += cw;
+                                }
+                            }
                         }
                     }
                 }
@@ -295,7 +313,7 @@ impl AgentReader for ClaudeCodeReader {
                 (m, p)
             })
             .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|a| std::cmp::Reverse(a.0));
         files
             .into_iter()
             .take(400)
@@ -568,5 +586,27 @@ mod tests {
         assert!(looks_like_uuid("11111111-1111-1111-1111-111111111111"));
         assert!(!looks_like_uuid("skill-injections"));
         assert!(!looks_like_uuid("short"));
+    }
+
+    #[test]
+    fn dedupes_streamed_usage_by_message_and_request_id() {
+        let dir = std::env::temp_dir().join(format!("saffev-cc-dedupe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","timestamp":"2026-07-02T06:21:40.000Z","sessionId":"22222222-2222-2222-2222-222222222222","message":{{"role":"user","content":"go"}}}}"#).unwrap();
+        // Same (message.id, requestId) emitted twice for one streamed turn
+        // must count its usage only once.
+        writeln!(f, r#"{{"type":"assistant","timestamp":"2026-07-02T06:21:41.000Z","requestId":"req_1","message":{{"id":"msg_1","role":"assistant","model":"claude-sonnet-4-6","content":[{{"type":"text","text":"part 1"}}],"usage":{{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"assistant","timestamp":"2026-07-02T06:21:42.000Z","requestId":"req_1","message":{{"id":"msg_1","role":"assistant","model":"claude-sonnet-4-6","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{}}}}],"usage":{{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}}}}"#).unwrap();
+        drop(f);
+
+        let reader = ClaudeCodeReader::new();
+        let d = reader.parse(&path, true).expect("parses");
+        assert_eq!(d.session.input_tokens, 100);
+        assert_eq!(d.session.output_tokens, 40);
+        assert_eq!(d.session.cache_tokens, 15);
+        assert_eq!(d.session.cache_write_tokens, 5);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

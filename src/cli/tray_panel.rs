@@ -113,23 +113,41 @@ pub fn sanitize_route(route: &str) -> Option<String> {
 }
 
 /// Accept a page-supplied folder for "Show in Finder" only if it is an
-/// absolute path to an existing directory whose name marks it as a Saffev
-/// backup (`Saffev-Backup-…`). The page is ours, but whatever it sends still
-/// becomes an argument to `open`, so it must not be able to name an
-/// arbitrary file or app, or a dash-leading option.
+/// absolute path to an existing Saffev backup directory (`Saffev-Backup-…`
+/// with no bundle extension and a genuine `manifest.json` or `saffev.db`
+/// inside). The page is ours, but whatever it sends still becomes an argument
+/// to `open`, so it must not be able to name an arbitrary file or `.app`
+/// bundle, or a dash-leading option.
 pub fn sanitize_reveal_path(path: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() || path.len() > 4096 {
         return None;
     }
     let name = p.file_name()?.to_str()?;
-    if !name.starts_with(crate::backup::DIR_PREFIX) {
+    if !name.starts_with(crate::backup::DIR_PREFIX) || p.extension().is_some() {
         return None;
     }
     if !p.is_dir() {
         return None;
     }
+    if !p.join("manifest.json").is_file() && !p.join("saffev.db").is_file() {
+        return None;
+    }
     Some(p.to_path_buf())
+}
+
+/// Whether the panel's WKWebView may navigate to `url`: only `about:*` or an
+/// exact-origin match for `studio_origin` (followed by end-of-string, `/`, `?`,
+/// or `#`, so `http://localhost:7100.attacker.com` cannot bypass the check).
+pub fn is_allowed_navigation(url: &str, studio_origin: &str) -> bool {
+    if url.starts_with("about:") {
+        return true;
+    }
+    let origin = studio_origin.trim_end_matches('/');
+    match url.strip_prefix(origin) {
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '?', '#']),
+        None => false,
+    }
 }
 
 /// Clamp the height the page asked for into the host's bounds.
@@ -321,9 +339,7 @@ mod imp {
                 .with_devtools(cfg!(debug_assertions))
                 // Only the offline shell and our own Studio origin may load; a
                 // link that escapes goes nowhere (deep links use the `open` IPC).
-                .with_navigation_handler(move |url| {
-                    url.starts_with(&studio_origin) || url.starts_with("about:")
-                })
+                .with_navigation_handler(move |url| is_allowed_navigation(&url, &studio_origin))
                 .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
                 .with_on_page_load_handler(move |event, url| {
                     let finished = matches!(event, PageLoadEvent::Finished);
@@ -730,14 +746,23 @@ mod tests {
 
         let base = std::env::temp_dir().join(format!("saffev-reveal-{}", std::process::id()));
         let good = base.join("Saffev-Backup-20261019-120000");
+        let empty = base.join("Saffev-Backup-20261019-120001");
+        let app_bundle = base.join("Saffev-Backup-20261019.app");
         let other = base.join("Documents");
         std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&app_bundle).unwrap();
+        std::fs::write(app_bundle.join("manifest.json"), b"{}").unwrap();
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(
             sanitize_reveal_path(good.to_str().unwrap()),
             Some(good.clone())
         );
-        // Not a backup folder, not absolute, not existing, an app, an option.
+        // Missing manifest/db, macOS .app bundle extension, not a backup folder,
+        // not absolute, not existing, an app, an option.
+        assert_eq!(sanitize_reveal_path(empty.to_str().unwrap()), None);
+        assert_eq!(sanitize_reveal_path(app_bundle.to_str().unwrap()), None);
         assert_eq!(sanitize_reveal_path(other.to_str().unwrap()), None);
         assert_eq!(sanitize_reveal_path("Saffev-Backup-20261019-120000"), None);
         assert_eq!(sanitize_reveal_path("/nope/Saffev-Backup-1"), None);
@@ -751,6 +776,28 @@ mod tests {
             "directories only"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn navigation_origin_enforces_boundary() {
+        let origin = "http://localhost:7100";
+        assert!(is_allowed_navigation("about:blank", origin));
+        assert!(is_allowed_navigation("http://localhost:7100", origin));
+        assert!(is_allowed_navigation(
+            "http://localhost:7100/menubar.html",
+            origin
+        ));
+        assert!(is_allowed_navigation("http://localhost:7100?a=1", origin));
+        assert!(is_allowed_navigation("http://localhost:7100#/live", origin));
+        assert!(!is_allowed_navigation(
+            "http://localhost:7100.attacker.com/menubar.html",
+            origin
+        ));
+        assert!(!is_allowed_navigation(
+            "http://localhost:71001/menubar.html",
+            origin
+        ));
+        assert!(!is_allowed_navigation("https://example.com", origin));
     }
 
     #[test]

@@ -139,10 +139,88 @@ impl AgentReader for OpenCodeReader {
         self.db.is_file()
     }
     fn list_sessions(&self) -> Vec<AgentSession> {
+        use std::collections::HashMap;
         with_sqlite_snapshot(&self.db, |conn| {
             if !Self::has_tables(conn) {
                 return Some(Vec::new());
             }
+            // Bulk-scan messages once and parse JSON in Rust (faster than 8x
+            // `json_extract` per row AND skips corrupted JSON rows non-fatally).
+            #[derive(Default)]
+            struct MsgAgg {
+                msg_count: i64,
+                inp: i64,
+                outp: i64,
+                cache: i64,
+                cache_w: i64,
+                latest_ts: i64,
+                model: Option<String>,
+            }
+            let mut msg_map: HashMap<String, MsgAgg> = HashMap::new();
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT session_id, time_created, data FROM message")
+            {
+                if let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1).unwrap_or(0),
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                }) {
+                    for (sid, ts, raw) in rows.flatten() {
+                        let agg = msg_map.entry(sid).or_default();
+                        agg.msg_count += 1;
+                        let Some(raw) = raw else { continue };
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                            continue;
+                        };
+                        if v.get("role").and_then(|x| x.as_str()) == Some("assistant") {
+                            if let Some(tok) = v.get("tokens") {
+                                agg.inp += tok.get("input").and_then(|x| x.as_i64()).unwrap_or(0);
+                                agg.outp += tok.get("output").and_then(|x| x.as_i64()).unwrap_or(0);
+                                if let Some(c) = tok.get("cache") {
+                                    let cr = c.get("read").and_then(|x| x.as_i64()).unwrap_or(0);
+                                    let cw = c.get("write").and_then(|x| x.as_i64()).unwrap_or(0);
+                                    agg.cache += cr + cw;
+                                    agg.cache_w += cw;
+                                }
+                            }
+                            if ts >= agg.latest_ts {
+                                if let (Some(p), Some(m)) = (
+                                    v.get("providerID").and_then(|x| x.as_str()),
+                                    v.get("modelID").and_then(|x| x.as_str()),
+                                ) {
+                                    if !p.is_empty() && !m.is_empty() {
+                                        agg.latest_ts = ts;
+                                        agg.model = Some(format!("{p}/{m}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bulk-aggregate tool part counts once, skipping malformed JSON rows.
+            let mut tool_map: HashMap<String, i64> = HashMap::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT session_id, data FROM part") {
+                if let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                }) {
+                    for (sid, raw) in rows.flatten() {
+                        let Some(raw) = raw else { continue };
+                        if !raw.contains("\"tool\"") {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            if v.get("type").and_then(|x| x.as_str()) == Some("tool") {
+                                *tool_map.entry(sid).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut stmt = conn
                 .prepare("SELECT id, title, directory, time_created, time_updated FROM session")
                 .ok()?;
@@ -158,9 +236,26 @@ impl AgentReader for OpenCodeReader {
                 })
                 .ok()?;
             let mut out = Vec::new();
-            for row in rows.flatten() {
-                let (id, title, dir, created, updated) = row;
-                out.push(Self::summary(conn, &id, &title, &dir, created, updated));
+            for (id, title, dir, created, updated) in rows.flatten() {
+                let agg = msg_map.remove(&id).unwrap_or_default();
+                let tool_count = tool_map.get(&id).copied().unwrap_or(0);
+                out.push(AgentSession {
+                    id: AgentSession::make_id(AgentTool::OpenCode, &id),
+                    tool: AgentTool::OpenCode,
+                    title: Some(title).filter(|s| !s.is_empty()),
+                    project: Some(dir).filter(|s| !s.is_empty()),
+                    git_branch: None,
+                    model: agg.model,
+                    started_ts: created,
+                    updated_ts: if updated > 0 { updated } else { created },
+                    message_count: agg.msg_count.max(0) as u32,
+                    tool_call_count: tool_count.max(0) as u32,
+                    input_tokens: agg.inp.max(0) as u64,
+                    output_tokens: agg.outp.max(0) as u64,
+                    cache_tokens: agg.cache.max(0) as u64,
+                    cache_write_tokens: agg.cache_w.max(0) as u64,
+                    source_path: "opencode.db".to_string(),
+                });
             }
             Some(out)
         })
@@ -215,32 +310,58 @@ impl AgentReader for OpenCodeReader {
                 .flatten()
                 .collect();
 
+            // Load all parts for the session in one query grouped by message_id
+            // (eliminates M+1 per-message part queries and skips malformed JSON).
+            type PartRow = (String, Option<String>, Option<String>, Option<String>);
+            let mut parts_by_msg: std::collections::HashMap<String, Vec<PartRow>> =
+                std::collections::HashMap::new();
+            {
+                let mut pstmt = conn
+                    .prepare(
+                        "SELECT message_id, data \
+                         FROM part WHERE session_id=?1 ORDER BY time_created, id",
+                    )
+                    .ok()?;
+                let parts = pstmt
+                    .query_map([raw_id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .ok()?;
+                for (mid, raw) in parts.flatten() {
+                    let Some(raw) = raw else { continue };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    let ptype = v
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let text = v.get("text").and_then(|x| x.as_str()).map(String::from);
+                    let tool = v.get("tool").and_then(|x| x.as_str()).map(String::from);
+                    let tool_out = v
+                        .get("state")
+                        .and_then(|s| s.get("output"))
+                        .and_then(|x| x.as_str())
+                        .map(String::from);
+                    parts_by_msg
+                        .entry(mid)
+                        .or_default()
+                        .push((ptype, text, tool, tool_out));
+                }
+            }
+
             let mut out: Vec<AgentMessage> = Vec::new();
-            let mut pstmt = conn
-                .prepare(
-                    "SELECT json_extract(data,'$.type'), json_extract(data,'$.text'), \
-                            json_extract(data,'$.tool'), json_extract(data,'$.state.output') \
-                     FROM part WHERE message_id=?1 ORDER BY time_created, id",
-                )
-                .ok()?;
             for (mid, role_s, ts) in msgs {
                 let role = if role_s == "user" {
                     Role::User
                 } else {
                     Role::Assistant
                 };
-                let parts = pstmt
-                    .query_map([&mid], |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                        ))
-                    })
-                    .ok()?;
-                for p in parts.flatten() {
-                    let (ptype, text, tool, tool_out) = p;
+                let Some(parts) = parts_by_msg.remove(&mid) else {
+                    continue;
+                };
+                for (ptype, text, tool, tool_out) in parts {
                     match ptype.as_str() {
                         "text" => {
                             if let Some(t) = text.filter(|s| !s.is_empty()) {

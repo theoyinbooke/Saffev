@@ -110,6 +110,7 @@ pub enum HealthState {
 
 /// Per-OS interception strategy. The Cooperative impl works everywhere; the
 /// systemd impl is Linux-only Gateway adoption.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EngineController: Send + Sync {
     /// Detect engines on this host (ports, binaries, services).
@@ -161,8 +162,10 @@ mod tests {
 
     #[test]
     fn default_controller_is_cooperative_in_cooperative_mode() {
-        let mut cfg = Config::default();
-        cfg.mode = crate::config::Mode::Cooperative;
+        let cfg = Config {
+            mode: crate::config::Mode::Cooperative,
+            ..Default::default()
+        };
         let ctrl = default_controller(&cfg);
         // Cooperative never adopts.
         assert!(!ctrl.can_adopt());
@@ -174,8 +177,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn default_controller_is_systemd_in_gateway_mode_on_linux() {
-        let mut cfg = Config::default();
-        cfg.mode = crate::config::Mode::Gateway;
+        let cfg = Config {
+            mode: crate::config::Mode::Gateway,
+            ..Default::default()
+        };
         let ctrl = default_controller(&cfg);
         assert!(ctrl.can_adopt());
     }

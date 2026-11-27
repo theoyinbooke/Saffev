@@ -94,23 +94,7 @@ impl GooseReader {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn summary(conn: &Connection, row: SessionRow) -> AgentSession {
-        let msg_count = conn
-            .query_row(
-                "SELECT count(*) FROM messages WHERE session_id=?1",
-                [&row.id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        let tool_count = conn
-            .query_row(
-                "SELECT COALESCE(SUM((LENGTH(content_json) - LENGTH(REPLACE(content_json, '\"toolRequest\"', ''))) / 13), 0) \
-                 FROM messages WHERE session_id=?1",
-                [&row.id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
+    fn build_session(row: SessionRow, msg_count: i64, tool_count: i64) -> AgentSession {
         let model = match (&row.provider, &row.model_name) {
             (Some(p), Some(m)) => Some(format!("{p}/{m}")),
             (None, Some(m)) => Some(m.clone()),
@@ -134,6 +118,20 @@ impl GooseReader {
             cache_write_tokens: row.cache_w.max(0) as u64,
             source_path: "sessions.db".to_string(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn summary(conn: &Connection, row: SessionRow) -> AgentSession {
+        let (msg_count, tool_count) = conn
+            .query_row(
+                "SELECT COUNT(*), \
+                        COALESCE(SUM((LENGTH(content_json) - LENGTH(REPLACE(content_json, '\"toolRequest\"', ''))) / 13), 0) \
+                 FROM messages WHERE session_id=?1",
+                [&row.id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0));
+        Self::build_session(row, msg_count, tool_count)
     }
 }
 
@@ -203,10 +201,31 @@ impl AgentReader for GooseReader {
         self.db.is_file()
     }
     fn list_sessions(&self) -> Vec<AgentSession> {
+        use std::collections::HashMap;
         with_sqlite_snapshot(&self.db, |conn| {
             if !Self::has_tables(conn) {
                 return Some(Vec::new());
             }
+            // One GROUP BY pass over `messages` instead of 2N per-session queries.
+            let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT session_id, COUNT(*), \
+                        COALESCE(SUM((LENGTH(content_json) - LENGTH(REPLACE(content_json, '\"toolRequest\"', ''))) / 13), 0) \
+                 FROM messages GROUP BY session_id",
+            ) {
+                if let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1).unwrap_or(0),
+                        r.get::<_, i64>(2).unwrap_or(0),
+                    ))
+                }) {
+                    for (sid, mc, tc) in rows.flatten() {
+                        counts.insert(sid, (mc, tc));
+                    }
+                }
+            }
+
             let sql = format!(
                 "SELECT {SESSION_COLS} FROM sessions \
                  WHERE COALESCE(session_type,'user') NOT IN ('sub_agent','hidden') \
@@ -216,7 +235,8 @@ impl AgentReader for GooseReader {
             let rows = stmt.query_map([], row_to_session).ok()?;
             let mut out = Vec::new();
             for row in rows.flatten() {
-                out.push(Self::summary(conn, row));
+                let (mc, tc) = counts.get(&row.id).copied().unwrap_or((0, 0));
+                out.push(Self::build_session(row, mc, tc));
             }
             Some(out)
         })

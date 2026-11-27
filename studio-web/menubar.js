@@ -290,24 +290,34 @@
   }
 
   /* ---- live stream (signals + quick refresh) ---------------------------- */
-  let streamCtrl = null, streamRetry = 0, liveDebounce = null;
+  let streamCtrl = null, streamTimer = null, streamRetry = 0, liveDebounce = null;
   function connectStream() {
     disconnectStream();
     runStream();
   }
   function disconnectStream() {
+    if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+    if (liveDebounce) { clearTimeout(liveDebounce); liveDebounce = null; }
     if (streamCtrl) { try { streamCtrl.abort(); } catch (e) { /* closed */ } }
     streamCtrl = null;
   }
   async function runStream() {
     if (!visible) return;
+    if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
     const ctrl = new AbortController();
     streamCtrl = ctrl;
     const headers = { Accept: 'text/event-stream' };
     if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
     try {
       const res = await fetch('/api/stream', { headers, signal: ctrl.signal, cache: 'no-store' });
-      if (!res.ok || !res.body) throw new Error('stream HTTP ' + res.status);
+      if (!res.ok || !res.body) {
+        if (res.status === 401 || res.status === 403) {
+          failed.auth = true;
+          queueRender();
+          return;
+        }
+        throw new Error('stream HTTP ' + res.status);
+      }
       streamRetry = 0;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -330,7 +340,7 @@
     }
     if (streamCtrl !== ctrl || !visible) return;
     streamRetry = Math.min(streamRetry + 1, 6);
-    setTimeout(runStream, 1000 * Math.pow(2, streamRetry));
+    streamTimer = setTimeout(() => { streamTimer = null; runStream(); }, 1000 * Math.pow(2, streamRetry));
   }
   function onStreamEvent(msg) {
     if (!msg || !msg.type) return;
@@ -724,14 +734,21 @@
   // the API answering is the proof it runs.
   const hostStatus = () => (!window.ipc && data.live ? 'running' : host.status);
   const isStopped = () => host.running === false && !data.live;
+  // Avoid tearing down and recreating DOM trees (losing focus/hover/transitions)
+  // when a poll tick produces identical markup.
+  function setHtml(el, html) {
+    if (el._lastHtml === html) return false;
+    el._lastHtml = html;
+    el.innerHTML = html;
+    return true;
+  }
   function renderHeader() {
     const hd = $('#hd');
     if (page) {
       hd.className = 'hd sub';
       const clear = page === 'alerts' && deriveAlerts().length ? '<button class="btn sm ghost" data-cmd="clear_alerts">Clear all</button>' : '';
       const aside = page === 'settings' ? '<span class="share" style="padding-right:4px;font-size:12px;color:var(--p-text-3)">Saved instantly</span>' : '';
-      hd.innerHTML = `<button class="ib" data-page="" aria-label="Back">${ICON.back}</button><h1>${page === 'alerts' ? 'Alerts' : 'Settings'}</h1>${clear}${aside}`;
-      return;
+      return setHtml(hd, `<button class="ib" data-page="" aria-label="Back">${ICON.back}</button><h1>${page === 'alerts' ? 'Alerts' : 'Settings'}</h1>${clear}${aside}`);
     }
     hd.className = 'hd';
     const s = hostStatus() || 'stopped';
@@ -743,17 +760,19 @@
     const hot = alerts.filter((a) => a.sev !== 'info').length;
     const danger = alerts.some((a) => a.sev === 'danger');
     const badge = hot ? `<span class="badge ${danger ? '' : 'warn'}">${hot > 9 ? '9+' : hot}</span>` : '';
-    hd.innerHTML = `<span class="mark ${s === 'running' ? '' : 'off'}">${MARK}</span>
+    return setHtml(hd, `<span class="mark ${s === 'running' ? '' : 'off'}">${MARK}</span>
       <div class="wm"><b>${esc(host.appName || 'Saffev')}</b><span class="status ${cls}"><span class="dot"></span>${esc(text)}</span></div>
       <button class="ib" data-page="alerts" aria-label="Alerts${hot ? ', ' + hot + ' need you' : ''}" title="Alerts">${ICON.bell}${badge}</button>
       <button class="ib" data-route="" aria-label="Open Studio" title="Open Studio">${ICON.open}</button>
-      <button class="ib" data-page="settings" aria-label="Settings" title="Settings">${ICON.sliders}</button>`;
+      <button class="ib" data-page="settings" aria-label="Settings" title="Settings">${ICON.sliders}</button>`);
   }
   function renderTabs() {
     const nav = $('#tabs');
+    const wasHidden = nav.hidden;
     nav.hidden = !!page || isStopped();
     nav.style.display = nav.hidden ? 'none' : '';
-    nav.innerHTML = TABS.map((t) => `<button class="tab" role="tab" data-tab="${t.id}" aria-selected="${t.id === tab}">${t.label}</button>`).join('');
+    const html = TABS.map((t) => `<button class="tab" role="tab" data-tab="${t.id}" aria-selected="${t.id === tab}">${t.label}</button>`).join('');
+    return setHtml(nav, html) || wasHidden !== nav.hidden;
   }
   function renderBody() {
     const body = $('#body');
@@ -763,37 +782,36 @@
     else if (page === 'settings') html = viewSettings();
     else if (page === 'alerts') html = viewAlerts();
     else html = tab === 'today' ? viewToday() : tab === 'keep' ? viewKeep() : tab === 'privacy' ? viewPrivacy() : viewSpend();
+    const wrapped = `<div class="stack">${html}</div>`;
+    if (body._lastHtml === wrapped) return false;
     const scroll = body.scrollTop;
-    body.innerHTML = `<div class="stack">${html}</div>`;
+    body._lastHtml = wrapped;
+    body.innerHTML = wrapped;
     body.scrollTop = scroll;
+    return true;
   }
   function renderFooter() {
     const foot = $('#foot');
     const port = (host.studioUrl || '').match(/:(\d+)\/?$/);
     const ver = (host.version ? 'v' + host.version : '') + (port ? ' · :' + port[1] : '');
     if (page === 'settings') {
-      foot.innerHTML = `<span class="ver">${esc(ver)}</span><button class="btn sm ghost quit" data-cmd="quit" title="Quit the menu-bar app (the service keeps running)">Quit Saffev</button>`;
-      return;
+      return setHtml(foot, `<span class="ver">${esc(ver)}</span><button class="btn sm ghost quit" data-cmd="quit" title="Quit the menu-bar app (the service keeps running)">Quit Saffev</button>`);
     }
     if (page === 'alerts') {
-      foot.innerHTML = `<span class="ver">Evaluated on this Mac</span><button class="btn sm ghost" data-page="settings">Settings</button>`;
-      return;
+      return setHtml(foot, `<span class="ver">Evaluated on this Mac</span><button class="btn sm ghost" data-page="settings">Settings</button>`);
     }
     const running = hostStatus() === 'running';
     const starting = hostStatus() === 'starting';
-    foot.innerHTML = `<span class="ver">${esc(ver)}</span>
+    return setHtml(foot, `<span class="ver">${esc(ver)}</span>
       ${window.ipc ? `<button class="ib sm" data-cmd="pin" aria-label="Keep the panel open" aria-pressed="${host.pinned ? 'true' : 'false'}" title="${host.pinned ? 'Unpin' : 'Keep open'}">${ICON.pin}</button>` : ''}
       <button class="ib sm" data-cmd="restart" aria-label="Restart service" title="Restart service" ${running ? '' : 'disabled'}>${ICON.restart}</button>
       <button class="ib sm" data-cmd="logs" aria-label="Open logs" title="Open logs">${ICON.logs}</button>
       ${running ? `<button class="ib sm" data-cmd="stop" aria-label="Stop service" title="Stop service">${ICON.power}</button>`
-        : `<button class="ib sm" data-cmd="start" aria-label="Start service" title="Start service" ${starting ? 'disabled' : ''}>${ICON.play}</button>`}`;
+        : `<button class="ib sm" data-cmd="start" aria-label="Start service" title="Start service" ${starting ? 'disabled' : ''}>${ICON.play}</button>`}`);
   }
   function render() {
-    renderHeader();
-    renderTabs();
-    renderBody();
-    renderFooter();
-    reportHeight();
+    const changed = renderHeader() | renderTabs() | renderBody() | renderFooter();
+    if (changed) reportHeight();
   }
 
   /* ---- notices ---------------------------------------------------------- */
@@ -808,8 +826,13 @@
     el.innerHTML = `${n.kind === 'busy' ? '<span class="spin"></span>' : ''}<b>${esc(n.title)}</b><span>${esc(n.detail || '')}</span>${reveal}`;
     el.hidden = false;
     if (n.kind === 'ok' || n.kind === 'error') {
-      const wasBackup = busy.backup;
-      busy.backup = false; busy.preserve = false; render();
+      const title = n.title || '';
+      const isBackupNotice = n.scope === 'backup' || !!n.revealPath || /backup|backed up|nothing new/i.test(title);
+      const isPreserveNotice = n.scope === 'preserve' || /preserv/i.test(title);
+      const wasBackup = isBackupNotice && busy.backup;
+      if (isBackupNotice) busy.backup = false;
+      if (isPreserveNotice) busy.preserve = false;
+      if (isBackupNotice || isPreserveNotice) render();
       if (wasBackup) load(['agents', 'verify'], true);
       noticeTimer = setTimeout(() => { el.hidden = true; reportHeight(); }, n.kind === 'error' || n.revealPath ? 9000 : 4000);
     }
@@ -955,7 +978,7 @@
       if (was !== host.status && host.status === 'running') refresh(true);
       render();
     },
-    onShow() { const was = visible; visible = true; refresh(true); if (!was || !pollTimer) startPolling(); },
+    onShow() { const was = visible; visible = true; refresh(false); if (!was || !pollTimer) startPolling(); },
     onHide() { visible = false; stopPolling(); if (page === 'alerts') page = null; },
     notice,
     // The host's native folder picker returned (null = cancelled). Save it as

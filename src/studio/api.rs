@@ -38,6 +38,24 @@ const TODAY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 // Error helper
 // ---------------------------------------------------------------------------
 
+/// Compact error wrapper for Studio handlers: boxes [`Response`] (which is over
+/// 128 bytes) so `Result<T, ApiErr>` stays small on the stack and satisfies
+/// `clippy::result_large_err`.
+#[derive(Debug)]
+pub struct ApiErr(Box<Response>);
+
+impl IntoResponse for ApiErr {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+impl From<Response> for ApiErr {
+    fn from(resp: Response) -> Self {
+        Self(Box::new(resp))
+    }
+}
+
 /// Helper: build an [`dto::ApiError`] response with the given status.
 pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     let body = dto::ApiError {
@@ -47,9 +65,14 @@ pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Boxed error response helper for Studio `Result<_, ApiErr>` handlers.
+fn api_err(status: StatusCode, code: &str, message: &str) -> ApiErr {
+    ApiErr(Box::new(api_error(status, code, message)))
+}
+
 /// Map any internal `Result` error into a 500 envelope. Used by read handlers.
-fn internal(err: impl std::fmt::Display) -> Response {
-    api_error(
+fn internal(err: impl std::fmt::Display) -> ApiErr {
+    api_err(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
         &err.to_string(),
@@ -214,37 +237,32 @@ pub async fn health(State(state): State<StudioState>) -> Json<dto::Health> {
 }
 
 /// `GET /api/live`
-pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnapshot>, Response> {
-    let rows = state
-        .store
-        .history(HistoryQuery {
+pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnapshot>, ApiErr> {
+    let now = now_millis();
+    let cutoff = now - TODAY_WINDOW_MS;
+
+    // Fetch only the recent page (50 rows) for display, exact 24h KPIs in SQL
+    // (no 500-row cap and no per-row correlated subqueries), and PII badges
+    // for just the 50 displayed rows.
+    let (rows_res, kpis_res) = tokio::join!(
+        state.store.history(HistoryQuery {
             q: None,
             pii_only: false,
             failed_only: false,
             limit: Some(LIVE_RECENT_LIMIT),
             before_ts: None,
-        })
-        .await
-        .map_err(internal)?;
+        }),
+        state.store.live_window_kpis(cutoff),
+    );
+    let rows = rows_res.map_err(internal)?;
+    let mut kpis = kpis_res.map_err(internal)?;
 
-    // KPIs computed off the privacy/finding + history reads. "Today" is the
-    // trailing 24h window relative to the newest row's clock (server now).
-    let now = now_millis();
-    let cutoff = now - TODAY_WINDOW_MS;
-
-    // ONE windowed findings read serves both the per-row badges and the
-    // findings-today KPI (this handler is the most-polled endpoint, and it used
-    // to full-scan the findings table twice per refresh). Bound: old enough to
-    // cover the oldest row on the page AND the 24h KPI window.
-    let oldest_row_ts = rows.last().map(|r| r.request.ts).unwrap_or(cutoff);
-    let findings = state
+    let row_ids: Vec<String> = rows.iter().map(|r| r.request.id.clone()).collect();
+    let kinds = state
         .store
-        .privacy_summary(Some(oldest_row_ts.min(cutoff)))
+        .pii_kinds_for_ids(&row_ids)
         .await
-        .map_err(internal)?;
-
-    // Populate PII kinds per row so badges show on seeded rows too (not just live).
-    let kinds = kinds_by_record(&findings);
+        .unwrap_or_default();
     let recent: Vec<dto::HistoryItem> = rows
         .iter()
         .map(|r| {
@@ -258,52 +276,14 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
         })
         .collect();
 
-    // requests_today + p50 latency over a wider recent window.
-    let window = state
-        .store
-        .history(HistoryQuery {
-            q: None,
-            pii_only: false,
-            failed_only: false,
-            limit: Some(MAX_HISTORY_LIMIT),
-            before_ts: None,
-        })
-        .await
-        .map_err(internal)?;
-
-    let mut requests_today: u64 = 0;
-    let mut latencies: Vec<u32> = Vec::new();
-    for r in &window {
-        if r.request.ts >= cutoff {
-            requests_today += 1;
-            if let Some(ms) = row_latency_ms(r) {
-                latencies.push(ms);
-            }
-        }
-    }
-    let p50_latency_ms = median(&mut latencies);
-
-    // PII findings today: count findings whose parent request is within window.
-    let recent_ids: std::collections::HashSet<&str> = window
-        .iter()
-        .filter(|r| r.request.ts >= cutoff)
-        .map(|r| r.request.id.as_str())
-        .collect();
-    let pii_findings_today = findings
-        .iter()
-        .filter(|f| recent_ids.contains(f.record_id.as_str()))
-        .count() as u64;
-
-    // Lifetime total — distinguishes "never captured anything" (show onboarding)
-    // from a merely empty recent window.
-    let lifetime_requests = state.store.request_count().await.map_err(internal)?;
+    let p50_latency_ms = median(&mut kpis.latencies);
 
     Ok(Json(dto::LiveSnapshot {
         recent,
-        requests_today,
+        requests_today: kpis.requests_today,
         p50_latency_ms,
-        pii_findings_today,
-        lifetime_requests,
+        pii_findings_today: kpis.pii_findings_today,
+        lifetime_requests: kpis.lifetime_requests,
     }))
 }
 
@@ -311,7 +291,7 @@ pub async fn live(State(state): State<StudioState>) -> Result<Json<dto::LiveSnap
 pub async fn history(
     State(state): State<StudioState>,
     Query(params): Query<dto::HistoryParams>,
-) -> Result<Json<Vec<dto::HistoryItem>>, Response> {
+) -> Result<Json<Vec<dto::HistoryItem>>, ApiErr> {
     let limit = params
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
@@ -329,18 +309,14 @@ pub async fn history(
         .await
         .map_err(internal)?;
 
-    // Badges need findings for this page only — window the read to the page's
-    // own oldest row instead of scanning the whole findings table.
-    let kinds = match rows.last() {
-        Some(oldest) => kinds_by_record(
-            &state
-                .store
-                .privacy_summary(Some(oldest.request.ts))
-                .await
-                .unwrap_or_default(),
-        ),
-        None => Default::default(),
-    };
+    // Badges need findings for this page's IDs only (avoids scanning weeks of
+    // `pii_findings` when paging far back in history).
+    let row_ids: Vec<String> = rows.iter().map(|r| r.request.id.clone()).collect();
+    let kinds = state
+        .store
+        .pii_kinds_for_ids(&row_ids)
+        .await
+        .unwrap_or_default();
     let items: Vec<dto::HistoryItem> = rows
         .iter()
         .map(|r| {
@@ -360,7 +336,7 @@ pub async fn history(
 pub async fn history_detail(
     State(state): State<StudioState>,
     Path(id): Path<String>,
-) -> Result<Json<dto::HistoryDetail>, Response> {
+) -> Result<Json<dto::HistoryDetail>, ApiErr> {
     // Indexed point read — a record stays reachable no matter how far back it
     // sits (the old page-recent-and-match approach 404'd anything older than
     // the newest 500 rows).
@@ -369,7 +345,7 @@ pub async fn history_detail(
         .history_by_id(&id)
         .await
         .map_err(internal)?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "not_found", "unknown record id"))?;
+        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "not_found", "unknown record id"))?;
 
     // Findings for this record, projected to views — a per-record point read,
     // not a full findings scan.
@@ -446,73 +422,38 @@ pub async fn history_detail(
 /// `GET /api/privacy`
 pub async fn privacy(
     State(state): State<StudioState>,
-) -> Result<Json<dto::PrivacySummary>, Response> {
-    // All-time on purpose: this page's headline is the lifetime distribution.
-    let findings = state.store.privacy_summary(None).await.map_err(internal)?;
-
-    // by_kind: bucket per PII kind with request/response split.
-    let mut by_kind_map: BTreeMap<String, dto::PrivacyBucket> = BTreeMap::new();
-    for f in &findings {
-        let key = format!("{:?}", f.kind);
-        let bucket = by_kind_map
-            .entry(key)
-            .or_insert_with(|| dto::PrivacyBucket {
-                kind: f.kind,
-                count: 0,
-                request_count: 0,
-                response_count: 0,
-            });
-        bucket.count += 1;
-        match f.side {
-            Side::Request => bucket.request_count += 1,
-            Side::Response => bucket.response_count += 1,
-        }
-    }
-    let by_kind: Vec<dto::PrivacyBucket> = by_kind_map.into_values().collect();
-
-    // by_app / by_model require joining findings to their parent request meta.
-    // Build a record_id -> (app, model) map from recent history.
-    let history = state
-        .store
-        .history(HistoryQuery {
-            q: None,
-            pii_only: false,
-            failed_only: false,
-            limit: Some(MAX_HISTORY_LIMIT),
-            before_ts: None,
+) -> Result<Json<dto::PrivacySummary>, ApiErr> {
+    // SQL-aggregated lifetime distribution: exact across all history (never
+    // truncates `by_app`/`by_model` to the newest 500 requests) and O(groups)
+    // memory instead of loading every `pii_findings` row.
+    let agg = state.store.privacy_aggregates().await.map_err(internal)?;
+    let by_kind: Vec<dto::PrivacyBucket> = agg
+        .by_kind
+        .into_iter()
+        .map(|(kind, count, request_count, response_count)| dto::PrivacyBucket {
+            kind,
+            count,
+            request_count,
+            response_count,
         })
-        .await
-        .map_err(internal)?;
-    let mut meta: BTreeMap<&str, (&Option<String>, &Option<String>)> = BTreeMap::new();
-    for r in &history {
-        meta.insert(
-            r.request.id.as_str(),
-            (&r.request.source_app, &r.request.model),
-        );
-    }
-
-    let mut app_counts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut model_counts: BTreeMap<String, u64> = BTreeMap::new();
-    for f in &findings {
-        if let Some((app, model)) = meta.get(f.record_id.as_str()) {
-            if let Some(name) = app {
-                *app_counts.entry(name.clone()).or_insert(0) += 1;
-            }
-            if let Some(name) = model {
-                *model_counts.entry(name.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let by_app = named_counts_sorted(app_counts);
-    let by_model = named_counts_sorted(model_counts);
+        .collect();
+    let by_app: Vec<dto::NamedCount> = agg
+        .by_app
+        .into_iter()
+        .map(|(name, count)| dto::NamedCount { name, count })
+        .collect();
+    let by_model: Vec<dto::NamedCount> = agg
+        .by_model
+        .into_iter()
+        .map(|(name, count)| dto::NamedCount { name, count })
+        .collect();
 
     let masking = &state.config.load().masking;
     Ok(Json(dto::PrivacySummary {
         by_kind,
         by_app,
         by_model,
-        total: findings.len() as u64,
+        total: agg.total,
         // Reflect the opt-in masking switch (§7.6) AND whether it's dry-run, so
         // the Privacy page can say "observing" vs "redacting".
         masking_enabled: masking.enabled,
@@ -524,7 +465,7 @@ pub async fn privacy(
 pub async fn quality(
     State(state): State<StudioState>,
     Query(params): Query<AnalyticsParams>,
-) -> Result<Json<dto::QualityReport>, Response> {
+) -> Result<Json<dto::QualityReport>, ApiErr> {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -602,31 +543,22 @@ pub async fn quality(
         })
         .collect();
 
-    // Recent flagged exchanges + in-window request count (coverage denominator).
-    let rows = state
+    // Exact in-window request count (so coverage never exceeds 100%) and the
+    // most recent safety-flagged exchanges (even if >500 clean calls followed).
+    let (req_count_res, flagged_rows_res) = tokio::join!(
+        state.store.request_count_since(start),
+        state.store.recent_safety_flagged(50),
+    );
+    let requests_in_window = req_count_res.map_err(internal)?;
+    let flagged_rows = flagged_rows_res.map_err(internal)?;
+    let flagged_ids: Vec<String> = flagged_rows.iter().map(|r| r.request.id.clone()).collect();
+    let kinds = state
         .store
-        .history(HistoryQuery {
-            limit: Some(MAX_HISTORY_LIMIT),
-            ..Default::default()
-        })
+        .pii_kinds_for_ids(&flagged_ids)
         .await
-        .map_err(internal)?;
-    let requests_in_window = rows.iter().filter(|r| r.request.ts >= start).count() as u64;
-    // Badge kinds for the page rows only — window to the oldest fetched row.
-    let kinds = match rows.last() {
-        Some(oldest) => kinds_by_record(
-            &state
-                .store
-                .privacy_summary(Some(oldest.request.ts))
-                .await
-                .unwrap_or_default(),
-        ),
-        None => Default::default(),
-    };
-    let recent_flagged: Vec<dto::HistoryItem> = rows
+        .unwrap_or_default();
+    let recent_flagged: Vec<dto::HistoryItem> = flagged_rows
         .iter()
-        .filter(|r| r.safety_count > 0)
-        .take(50)
         .map(|r| {
             history_item(
                 r,
@@ -692,7 +624,7 @@ const ANALYTICS_MAX_RANGE_MS: i64 = 92 * 24 * 60 * 60 * 1000;
 pub async fn analytics(
     State(state): State<StudioState>,
     Query(params): Query<AnalyticsParams>,
-) -> Result<Json<dto::AnalyticsReport>, Response> {
+) -> Result<Json<dto::AnalyticsReport>, ApiErr> {
     use std::collections::BTreeMap;
 
     let now = now_millis();
@@ -704,34 +636,13 @@ pub async fn analytics(
     let start = now - range_ms;
     let prev_start = start - range_ms;
 
-    // Gather all rows back to prev_start (covers current + previous window for
-    // deltas), paginating past the per-query 1000 clamp.
-    let mut all: Vec<HistoryRow> = Vec::new();
-    let mut cursor: Option<i64> = None;
-    loop {
-        let batch = state
-            .store
-            .history(HistoryQuery {
-                q: None,
-                pii_only: false,
-                failed_only: false,
-                limit: Some(1000),
-                before_ts: cursor,
-            })
-            .await
-            .map_err(internal)?;
-        if batch.is_empty() {
-            break;
-        }
-        let oldest = batch.last().map(|r| r.request.ts).unwrap_or(0);
-        let exhausted = batch.len() < 1000;
-        cursor = Some(oldest);
-        let reached = oldest < prev_start;
-        all.extend(batch);
-        if reached || exhausted || all.len() > 200_000 {
-            break;
-        }
-    }
+    // Fetch all rows back to prev_start in one query without per-row correlated
+    // PII/safety subqueries (analytics joins `privacy_summary` once below).
+    let all = state
+        .store
+        .analytics_rows(prev_start, 200_000)
+        .await
+        .map_err(internal)?;
 
     // The report only joins findings against rows in `prev_start..now`.
     let findings = state
@@ -787,9 +698,17 @@ pub async fn analytics(
         .map(|v| v as u64)
         .sum();
     let mut lats: Vec<u32> = cur.iter().filter_map(|r| lat(r)).collect();
-    let p50_latency_ms = percentile(&mut lats, 50);
-    let p90_latency_ms = percentile(&mut lats, 90);
-    let p99_latency_ms = percentile(&mut lats, 99);
+    lats.sort_unstable();
+    let p_sorted = |xs: &[u32], p: u32| -> Option<u32> {
+        if xs.is_empty() {
+            return None;
+        }
+        let idx = ((xs.len() - 1) * (p as usize)).div_ceil(100).min(xs.len() - 1);
+        Some(xs[idx])
+    };
+    let p50_latency_ms = p_sorted(&lats, 50);
+    let p90_latency_ms = p_sorted(&lats, 90);
+    let p99_latency_ms = p_sorted(&lats, 99);
     let ttfts: Vec<u32> = cur
         .iter()
         .filter_map(|r| r.response.as_ref().and_then(|x| x.ttft_ms))
@@ -1004,7 +923,8 @@ pub async fn analytics(
             pii: a.pii,
         })
         .collect();
-    by_app.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_app.sort_by_key(|x| std::cmp::Reverse(x.requests));
+    let active_apps = by_app.len() as u64;
     by_app.truncate(12);
 
     let mut by_endpoint: Vec<dto::GroupStat> = endpoints
@@ -1018,7 +938,7 @@ pub async fn analytics(
             pii: e.pii,
         })
         .collect();
-    by_endpoint.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_endpoint.sort_by_key(|x| std::cmp::Reverse(x.requests));
     by_endpoint.truncate(12);
 
     let mut by_model: Vec<dto::ModelStat> = models
@@ -1033,7 +953,8 @@ pub async fn analytics(
             tokens_per_sec: median_f64(&m.tps).map(|v| (v * 10.0).round() / 10.0),
         })
         .collect();
-    by_model.sort_by(|x, y| y.requests.cmp(&x.requests));
+    by_model.sort_by_key(|x| std::cmp::Reverse(x.requests));
+    let active_models = by_model.len() as u64;
     by_model.truncate(12);
 
     // ---- performance distributions ----
@@ -1067,14 +988,18 @@ pub async fn analytics(
         .into_iter()
         .map(|(name, count)| dto::NamedCount { name, count })
         .collect();
-    finish_reasons.sort_by(|a, b| b.count.cmp(&a.count));
+    finish_reasons.sort_by_key(|a| std::cmp::Reverse(a.count));
 
-    // slowest exchanges
+    // slowest exchanges (O(N) partial selection instead of full O(N log N) sort)
     let mut slow_rows: Vec<&HistoryRow> = cur.clone();
-    slow_rows.sort_by(|a, b| lat(b).unwrap_or(0).cmp(&lat(a).unwrap_or(0)));
+    let slow_cmp = |a: &&HistoryRow, b: &&HistoryRow| lat(b).unwrap_or(0).cmp(&lat(a).unwrap_or(0));
+    if slow_rows.len() > 8 {
+        slow_rows.select_nth_unstable_by(8, slow_cmp);
+        slow_rows.truncate(8);
+    }
+    slow_rows.sort_by(slow_cmp);
     let slowest: Vec<dto::HistoryItem> = slow_rows
         .iter()
-        .take(8)
         .map(|r| history_item(r, Vec::new()))
         .collect();
 
@@ -1167,8 +1092,8 @@ pub async fn analytics(
         avg_ttft_ms,
         pii_findings,
         failed_requests,
-        active_apps: by_app.len() as u64,
-        active_models: by_model.len() as u64,
+        active_apps,
+        active_models,
         est_cost_saved_usd: (est_cost_saved_usd * 100.0).round() / 100.0,
         cost_basis: cloud_basis.clone(),
         prev_total_requests,
@@ -1250,7 +1175,7 @@ fn sample_xy(pairs: &mut [(u32, u32)], max: usize) -> Vec<dto::XYPoint> {
     if pairs.is_empty() {
         return Vec::new();
     }
-    let step = (pairs.len() + max - 1) / max;
+    let step = pairs.len().div_ceil(max);
     pairs
         .iter()
         .step_by(step.max(1))
@@ -1360,7 +1285,7 @@ fn build_insights(
 }
 
 /// `GET /api/engines`
-pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::EnginesView>, Response> {
+pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::EnginesView>, ApiErr> {
     let cfg = state.config.load();
     let records = state.store.engines().await.map_err(internal)?;
 
@@ -1411,9 +1336,10 @@ pub async fn engines(State(state): State<StudioState>) -> Result<Json<dto::Engin
         }
     }
 
-    // Exposure doctor verdict against the public proxy port. Fail-soft to a
-    // benign "not exposed / unknown" report so the Engines page still renders.
-    let exposure = crate::exposure::check(cfg.ports.upstream)
+    // Exposure doctor verdict against the active engine port (shadow in Gateway
+    // mode, upstream in Cooperative mode). Fail-soft to a benign "not exposed /
+    // unknown" report so the Engines page still renders.
+    let exposure = crate::exposure::check(active_port)
         .await
         .unwrap_or_else(|_| crate::exposure::ExposureReport {
             exposed: false,
@@ -1458,10 +1384,10 @@ fn engine_kind_name(kind: crate::engine::EngineKind) -> &'static str {
 pub async fn engines_adopt(
     State(state): State<StudioState>,
     Json(body): Json<dto::AdoptRequest>,
-) -> Result<Json<dto::EngineView>, Response> {
+) -> Result<Json<dto::EngineView>, ApiErr> {
     let requested = body.engine.trim().to_ascii_lowercase();
     if requested.is_empty() {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::BAD_REQUEST,
             "validation",
             "engine name is required",
@@ -1479,7 +1405,7 @@ pub async fn engines_adopt(
             } else {
                 "llama.cpp"
             };
-            return Err(api_error(
+            return Err(api_err(
                 StatusCode::CONFLICT,
                 "gateway_unsupported",
                 &format!(
@@ -1490,7 +1416,7 @@ pub async fn engines_adopt(
             ));
         }
         if cfg.mode != crate::config::Mode::Gateway {
-            return Err(api_error(
+            return Err(api_err(
                 StatusCode::CONFLICT,
                 "gateway_requires_mode",
                 "Gateway adoption requires mode = \"gateway\". Set the mode in \
@@ -1498,7 +1424,7 @@ pub async fn engines_adopt(
             ));
         }
         if !crate::engine::default_controller(&cfg).can_adopt() {
-            return Err(api_error(
+            return Err(api_err(
                 StatusCode::CONFLICT,
                 "gateway_unavailable",
                 "Gateway adoption is Linux/systemd-only. On this host Saffev \
@@ -1515,7 +1441,7 @@ pub async fn engines_adopt(
         .into_iter()
         .find(|i| engine_kind_name(i.engine) == requested)
         .ok_or_else(|| {
-            api_error(
+            api_err(
                 StatusCode::NOT_FOUND,
                 "not_found",
                 &format!("no running {requested} engine detected — start it and try again"),
@@ -1533,7 +1459,7 @@ pub async fn engines_adopt(
     crate::engine::adopt::run_adoption(controller.as_ref(), &info, &state.store)
         .await
         .map_err(|e| {
-            api_error(
+            api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "adopt_failed",
                 &format!("adoption failed — the host was not changed: {e}"),
@@ -1556,10 +1482,10 @@ pub async fn engines_adopt(
 pub async fn engines_revert(
     State(state): State<StudioState>,
     Json(body): Json<dto::RevertRequest>,
-) -> Result<Json<dto::EngineView>, Response> {
+) -> Result<Json<dto::EngineView>, ApiErr> {
     let requested = body.engine.trim().to_ascii_lowercase();
     if requested.is_empty() {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::BAD_REQUEST,
             "validation",
             "engine name is required",
@@ -1571,7 +1497,7 @@ pub async fn engines_revert(
         .into_iter()
         .find(|r| r.engine.eq_ignore_ascii_case(&requested))
         .ok_or_else(|| {
-            api_error(
+            api_err(
                 StatusCode::NOT_FOUND,
                 "not_found",
                 &format!("no adoption record for {requested} — nothing to revert"),
@@ -1589,7 +1515,7 @@ pub async fn engines_revert(
     } else {
         let c = crate::engine::default_controller(&cfg);
         if !c.can_adopt() {
-            return Err(api_error(
+            return Err(api_err(
                 StatusCode::CONFLICT,
                 "gateway_required_for_revert",
                 "this engine was adopted in Gateway mode — set mode = \"gateway\" \
@@ -1617,7 +1543,7 @@ pub async fn engines_revert(
     crate::engine::adopt::run_revert(controller.as_ref(), &info, &journal, &state.store)
         .await
         .map_err(|e| {
-            api_error(
+            api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "revert_failed",
                 &format!("revert failed — the host may still be adopted: {e}"),
@@ -1675,7 +1601,7 @@ pub async fn update_get(State(_state): State<StudioState>) -> Json<dto::UpdateSt
 /// PRIVACY: contacts GitHub release metadata + the installer asset only.
 pub async fn update_post(
     State(_state): State<StudioState>,
-) -> Result<Json<dto::UpdateResult>, Response> {
+) -> Result<Json<dto::UpdateResult>, ApiErr> {
     match crate::update::apply().await {
         Ok(outcome) => {
             let message = if outcome.updated {
@@ -1702,7 +1628,7 @@ pub async fn update_post(
             message: msg,
         })),
         // A real apply failure — surface it as a 500 envelope.
-        Err(crate::update::UpdateError::Failed(msg)) => Err(api_error(
+        Err(crate::update::UpdateError::Failed(msg)) => Err(api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "update_failed",
             &msg,
@@ -1717,9 +1643,14 @@ pub async fn update_post(
 /// version takes effect without the user opening a terminal. The SPA polls
 /// `/api/health` afterwards and reloads once the new daemon answers.
 pub async fn restart(
-    State(_state): State<StudioState>,
-) -> Result<Json<dto::RestartResult>, Response> {
-    crate::cli::daemon::spawn_restart_helper().map_err(internal)?;
+    State(state): State<StudioState>,
+) -> Result<Json<dto::RestartResult>, ApiErr> {
+    let cfg = state.config.load();
+    crate::cli::daemon::spawn_restart_helper_with(
+        cfg.source_path.as_deref(),
+        Some(cfg.data_dir.as_path()),
+    )
+    .map_err(internal)?;
     Ok(Json(dto::RestartResult { restarting: true }))
 }
 
@@ -1738,7 +1669,11 @@ pub async fn restart(
 pub async fn demo(State(state): State<StudioState>) -> Json<dto::DemoResult> {
     let cfg = state.config.load();
     let proxy = format!("http://127.0.0.1:{}", cfg.ports.proxy);
-    let engine = format!("http://127.0.0.1:{}", cfg.ports.upstream);
+    let engine_port = match cfg.mode {
+        crate::config::Mode::Gateway => cfg.ports.shadow,
+        crate::config::Mode::Cooperative => cfg.ports.upstream,
+    };
+    let engine = format!("http://127.0.0.1:{engine_port}");
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -2024,24 +1959,7 @@ fn at_risk_view(r: &crate::agents::retention::AtRisk) -> dto::AtRiskView {
 
 /// `GET /api/agents` — which coding tools are present + rollups + at-risk + archive.
 pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOverview> {
-    // List once; derive tool stats + at-risk from the same pass.
-    let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
-        .await
-        .unwrap_or_default();
-    let tools = crate::agents::tool_stats(&sessions);
-    // At-risk = past (or within a week of) the tool's deletion line AND not
-    // yet in the archive. A preserved session is safe by definition; counting
-    // it here kept the "overdue" flag up after the user clicked Preserve.
     let archived_ids = state.store.archived_ids().await.unwrap_or_default();
-    let unpreserved: Vec<crate::agents::AgentSession> = sessions
-        .iter()
-        .filter(|s| !archived_ids.contains(&s.id))
-        .cloned()
-        .collect();
-    let at_risk = crate::agents::at_risk_report(&unpreserved);
-    let total_sessions = tools.iter().map(|t| t.sessions).sum();
-    let total_tokens = tools.iter().map(|t| t.tokens).sum();
-    let total_cost_usd = tools.iter().map(|t| t.cost_usd).sum();
     let archived = state.store.archive_stats().await.unwrap_or_default();
     let last_backup_ts: Option<i64> = state
         .store
@@ -2058,9 +1976,6 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         .flatten();
     let changed_since_backup =
         changed_since_backup(&state.store, archived.latest_ts, last_backup_ts).await;
-    let last_manifest = last_backup_dir
-        .as_deref()
-        .and_then(|d| crate::backup::read_manifest(std::path::Path::new(d)));
     let last_check_ts: Option<i64> = state
         .store
         .get_setting(crate::backup::KEY_LAST_CHECK_TS)
@@ -2075,14 +1990,45 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
         .ok()
         .flatten()
         .filter(|e| !e.is_empty());
+
     let cfg = state.config.load();
+    let cfg_for_bg = cfg.clone();
+    let last_backup_dir_bg = last_backup_dir.clone();
+    // Run all synchronous filesystem/process work off the async executor in a
+    // single blocking task: session listing, tool stats, at-risk calculation,
+    // backup manifest read, Codex availability probe, and DB file stat.
+    let (tools, at_risk, last_manifest, codex_available, db_bytes) =
+        tokio::task::spawn_blocking(move || {
+            let sessions = crate::agents::all_sessions();
+            let tools = crate::agents::tool_stats_with(&sessions, &cfg_for_bg.pricing);
+            // At-risk = past (or within a week of) the tool's deletion line AND not
+            // yet in the archive. A preserved session is safe by definition; counting
+            // it here kept the "overdue" flag up after the user clicked Preserve.
+            let unpreserved: Vec<crate::agents::AgentSession> = sessions
+                .into_iter()
+                .filter(|s| !archived_ids.contains(&s.id))
+                .collect();
+            let at_risk = crate::agents::at_risk_report(&unpreserved);
+            let last_manifest = last_backup_dir_bg
+                .as_deref()
+                .and_then(|d| crate::backup::read_manifest(std::path::Path::new(d)));
+            let codex_available = crate::agents::codex_server::is_available();
+            let db_bytes = db_size_bytes(&cfg_for_bg);
+            (tools, at_risk, last_manifest, codex_available, db_bytes)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), Vec::new(), None, false, 0));
+
+    let total_sessions = tools.iter().map(|t| t.sessions).sum();
+    let total_tokens = tools.iter().map(|t| t.tokens).sum();
+    let total_cost_usd = tools.iter().map(|t| t.cost_usd).sum();
     Json(dto::AgentsOverview {
         tools: tools.iter().map(tool_stat_view).collect(),
         total_sessions,
         total_tokens,
         total_cost_usd,
         analysis: dto::AnalysisStatus {
-            available: crate::agents::codex_server::is_available(),
+            available: codex_available,
             enabled: cfg.analysis.enabled,
             model: cfg.analysis.model.clone(),
         },
@@ -2114,7 +2060,7 @@ pub async fn agents(State(state): State<StudioState>) -> Json<dto::AgentsOvervie
             count: archived.count,
             messages: archived.messages,
             bytes: archived.bytes,
-            db_bytes: db_size_bytes(&cfg),
+            db_bytes,
         },
     })
 }
@@ -2211,28 +2157,55 @@ fn compact_transcript(d: &crate::agents::AgentSessionDetail, max_chars: usize) -
 pub async fn agents_summarize(
     State(state): State<StudioState>,
     Path(id): Path<String>,
-) -> Result<Json<dto::SummaryResult>, Response> {
+) -> Result<Json<dto::SummaryResult>, ApiErr> {
     let cfg = state.config.load();
     if !cfg.analysis.enabled {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::FORBIDDEN,
             "analysis_disabled",
             "AI analysis is off. Enable it in Settings (uses your Codex subscription).",
         ));
     }
-    if !crate::agents::codex_server::is_available() {
-        return Err(api_error(
+    let id_for_bg = id.clone();
+    let (codex_available, live_detail) = tokio::task::spawn_blocking(move || {
+        let avail = crate::agents::codex_server::is_available();
+        let detail = if avail {
+            crate::agents::detail(&id_for_bg)
+        } else {
+            None
+        };
+        (avail, detail)
+    })
+    .await
+    .map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "join_error",
+            "analysis task failed",
+        )
+    })?;
+    if !codex_available {
+        return Err(api_err(
             StatusCode::SERVICE_UNAVAILABLE,
             "codex_unavailable",
             "Codex is not installed or not signed in on this machine.",
         ));
     }
-    let detail = crate::agents::detail(&id)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id"))?;
+    let detail = match live_detail {
+        Some(d) => d,
+        None => state
+            .store
+            .archived_detail(&id)
+            .await
+            .ok()
+            .flatten()
+            .map(archived_to_detail)
+            .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "not_found", "unknown session id"))?,
+    };
 
     let transcript = compact_transcript(&detail, 24_000);
     if transcript.is_empty() {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "empty_session",
             "This session has no readable content to summarize.",
@@ -2258,7 +2231,7 @@ TRANSCRIPT (source: {}):\n{}",
     })
     .await
     .map_err(|_| {
-        api_error(
+        api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "join_error",
             "analysis task failed",
@@ -2271,7 +2244,7 @@ TRANSCRIPT (source: {}):\n{}",
             model: c.model,
             elapsed_ms: c.elapsed_ms,
         })),
-        Err(e) => Err(api_error(StatusCode::BAD_GATEWAY, "codex_error", &e)),
+        Err(e) => Err(api_err(StatusCode::BAD_GATEWAY, "codex_error", &e)),
     }
 }
 
@@ -2300,13 +2273,15 @@ pub async fn agents_sessions(
         v.preserved = archived_ids.contains(s.id.as_str());
         out.push(v);
     }
-    // Resurrected: archived sessions the source deleted and are no longer live.
+    // Archived-only sessions: include any archived session absent from the
+    // live list (whether its source file was deleted, a DB-backed tool pruned
+    // it without leaving a file path, or it aged past the live list cap).
     for a in &archived {
-        if a.source_deleted && !live_ids.contains(a.id.as_str()) {
+        if !live_ids.contains(a.id.as_str()) {
             out.push(archived_session_view(a));
         }
     }
-    out.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
+    out.sort_by_key(|a| std::cmp::Reverse(a.updated_ts));
 
     if let Some(tool) = p.tool.as_deref() {
         out.retain(|v| v.tool == tool);
@@ -2421,7 +2396,7 @@ fn archived_to_detail(a: crate::store::ArchivedSession) -> crate::agents::AgentS
 pub async fn agents_detail(
     State(state): State<StudioState>,
     Path(id): Path<String>,
-) -> Result<Json<dto::AgentSessionDetailView>, Response> {
+) -> Result<Json<dto::AgentSessionDetailView>, ApiErr> {
     let id2 = id.clone();
     let live = tokio::task::spawn_blocking(move || crate::agents::detail(&id2))
         .await
@@ -2429,8 +2404,8 @@ pub async fn agents_detail(
         .flatten();
     let (d, preserved, source_deleted) = match live {
         Some(d) => {
-            let idx = state.store.archived_index().await.unwrap_or_default();
-            (d, idx.contains_key(&id), false)
+            let is_pres = state.store.is_archived(&id).await.unwrap_or(false);
+            (d, is_pres, false)
         }
         None => {
             let a = state
@@ -2440,7 +2415,7 @@ pub async fn agents_detail(
                 .ok()
                 .flatten()
                 .ok_or_else(|| {
-                    api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id")
+                    api_err(StatusCode::NOT_FOUND, "not_found", "unknown session id")
                 })?;
             let sd = a.source_deleted;
             (archived_to_detail(a), true, sd)
@@ -2512,10 +2487,10 @@ pub async fn agents_detail(
 /// `POST /api/archive/run` — trigger a snapshot into the archive (gated on enabled).
 pub async fn archive_run(
     State(state): State<StudioState>,
-) -> Result<Json<crate::agents::archive::SnapshotSummary>, Response> {
+) -> Result<Json<crate::agents::archive::SnapshotSummary>, ApiErr> {
     let cfg = state.config.load();
     if !cfg.archive.enabled {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::FORBIDDEN,
             "archive_disabled",
             "Preservation is off. Enable it in Settings to archive your history.",
@@ -2524,7 +2499,7 @@ pub async fn archive_run(
     // If the user asked for redaction and the detector will not build, refuse
     // rather than archive raw secrets under a setting that says otherwise.
     let redaction = crate::agents::archive::Redaction::from_config(&cfg).map_err(|e| {
-        api_error(
+        api_err(
             StatusCode::BAD_REQUEST,
             "redaction_unavailable",
             &format!(
@@ -2547,9 +2522,9 @@ pub async fn archive_run(
 pub async fn backup_run(
     State(state): State<StudioState>,
     body: Option<Json<dto::BackupRequest>>,
-) -> Result<Json<dto::BackupResultView>, Response> {
+) -> Result<Json<dto::BackupResultView>, ApiErr> {
     if crate::backup::is_running() {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::CONFLICT,
             "backup_running",
             "A backup is already running.",
@@ -2573,7 +2548,7 @@ pub async fn backup_run(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            api_error(status, "backup_failed", &msg)
+            api_err(status, "backup_failed", &msg)
         })?;
     Ok(Json(match outcome {
         crate::backup::Outcome::Unchanged { dir } => dto::BackupResultView {
@@ -2620,7 +2595,7 @@ pub struct TimelineParams {
 pub async fn timeline(
     State(state): State<StudioState>,
     Query(p): Query<TimelineParams>,
-) -> Result<Json<dto::TimelineView>, Response> {
+) -> Result<Json<dto::TimelineView>, ApiErr> {
     let q = p.q.unwrap_or_default().trim().to_lowercase();
     let limit = p.limit.unwrap_or(200).clamp(1, 1_000);
     let range_ms = p.range_ms.unwrap_or(0).max(0);
@@ -2640,17 +2615,17 @@ pub async fn timeline(
     if want_proxy {
         let rows = state
             .store
-            .history(crate::store::HistoryQuery {
-                q: if q.is_empty() { None } else { Some(q.clone()) },
-                limit: Some(limit as u32),
-                ..Default::default()
-            })
+            .history_since(
+                crate::store::HistoryQuery {
+                    q: if q.is_empty() { None } else { Some(q.clone()) },
+                    limit: Some(limit as u32),
+                    ..Default::default()
+                },
+                (since > 0).then_some(since),
+            )
             .await
             .map_err(internal)?;
         for r in rows {
-            if r.request.ts < since {
-                continue;
-            }
             proxy_count += 1;
             let resp = r.response.as_ref();
             let failed = resp
@@ -2684,18 +2659,18 @@ pub async fn timeline(
         }
     }
 
-    // --- coding-agent sessions ---
+    // --- coding-agent sessions (live + archived-only) ---
+    let mut has_archive_rows = false;
     if want_agent {
         let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
             .await
             .unwrap_or_default();
-        let archived_ids: std::collections::HashSet<String> = state
-            .store
-            .archived_index()
-            .await
-            .unwrap_or_default()
-            .into_keys()
-            .collect();
+        let archived = state.store.archived_sessions().await.unwrap_or_default();
+        has_archive_rows = !archived.is_empty();
+        let live_ids: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.id.as_str()).collect();
+        let archived_ids: std::collections::HashSet<&str> =
+            archived.iter().map(|a| a.id.as_str()).collect();
 
         // Content search reaches preserved sessions (same reasoning as the
         // Agents page: scanning every live transcript per query is the cost the
@@ -2714,7 +2689,7 @@ pub async fn timeline(
                     .collect()
             };
 
-        for s in sessions {
+        for s in &sessions {
             if s.updated_ts < since {
                 continue;
             }
@@ -2749,20 +2724,65 @@ pub async fn timeline(
                 pii_count: 0,
                 failed: false,
                 safety_flagged: false,
-                preserved: archived_ids.contains(&s.id),
+                preserved: archived_ids.contains(s.id.as_str()),
                 snippets: hit.map(|h| h.snippets.clone()).unwrap_or_default(),
                 id: s.id.clone(),
             });
         }
+
+        // Archived-only sessions (deleted from source or aged past live list cap)
+        // must also appear in Timeline and carry their FTS content matches.
+        for a in &archived {
+            if live_ids.contains(a.id.as_str()) || a.updated_ts < since {
+                continue;
+            }
+            let matches = q.is_empty()
+                || content.contains_key(&a.id)
+                || format!(
+                    "{} {} {}",
+                    a.title.as_deref().unwrap_or(""),
+                    a.project.as_deref().unwrap_or(""),
+                    a.model.as_deref().unwrap_or("")
+                )
+                .to_lowercase()
+                .contains(&q);
+            if !matches {
+                continue;
+            }
+            agent_count += 1;
+            let hit = content.get(&a.id);
+            let tool_label = crate::agents::split_id(&a.id)
+                .map(|(t, _)| t.label().to_string())
+                .unwrap_or_else(|| a.tool.clone());
+            entries.push(dto::TimelineEntry {
+                kind: dto::TimelineKind::Agent,
+                ts: a.updated_ts,
+                source: a.tool.clone(),
+                label: tool_label,
+                title: a
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Untitled session".to_string()),
+                model: a.model.clone(),
+                project: a.project.clone(),
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                pii_count: 0,
+                failed: false,
+                safety_flagged: false,
+                preserved: true,
+                snippets: hit.map(|h| h.snippets.clone()).unwrap_or_default(),
+                id: a.id.clone(),
+            });
+        }
     }
 
-    entries.sort_by(|a, b| b.ts.cmp(&a.ts));
-    let content_search = state
-        .store
-        .archive_stats()
-        .await
-        .map(|s| s.count > 0)
-        .unwrap_or(false);
+    entries.sort_by_key(|a| std::cmp::Reverse(a.ts));
+    let content_search = if want_agent {
+        has_archive_rows
+    } else {
+        state.store.has_archived_sessions().await.unwrap_or(false)
+    };
     entries.truncate(limit);
 
     Ok(Json(dto::TimelineView {
@@ -2792,7 +2812,7 @@ const VERIFY_REUSE: std::time::Duration = std::time::Duration::from_secs(10 * 60
 pub async fn archive_verify(
     State(state): State<StudioState>,
     Query(params): Query<VerifyParams>,
-) -> Result<Json<dto::ArchiveIntegrityView>, Response> {
+) -> Result<Json<dto::ArchiveIntegrityView>, ApiErr> {
     let fresh = matches!(params.fresh.as_deref(), Some("1" | "true"));
     let v = if fresh {
         state.store.verify_archive().await
@@ -2878,12 +2898,30 @@ fn fmt_utc(ms: i64) -> String {
 /// including its limits.
 pub async fn archive_audit(
     State(state): State<StudioState>,
-) -> Result<Json<dto::AuditExportResult>, Response> {
+) -> Result<Json<dto::AuditExportResult>, ApiErr> {
     if !state.config.load().archive.enabled {
-        return Err(api_error(
+        return Err(api_err(
             StatusCode::FORBIDDEN,
             "archive_disabled",
             "Preservation is off, so there is nothing to audit.",
+        ));
+    }
+
+    let stamp = crate::agents::now_ms();
+    let base = state.config.load().export_base();
+    // Honor the same unplugged-mount safety invariant as `backup::run` and
+    // `archive_export`: never create a missing mount point on the internal disk.
+    let base_ok = {
+        let b = base.clone();
+        tokio::task::spawn_blocking(move || b.is_dir())
+            .await
+            .unwrap_or(false)
+    };
+    if !base_ok {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "bad_dest",
+            "the configured export destination does not exist or is not mounted",
         ));
     }
 
@@ -2891,20 +2929,23 @@ pub async fn archive_audit(
     let log = state.store.archive_log().await.map_err(internal)?;
     let sessions = state.store.archived_sessions().await.map_err(internal)?;
 
-    let stamp = crate::agents::now_ms();
-    let dir = state
-        .config
-        .load()
-        .export_base()
-        .join(format!("Saffev-Audit-{stamp}"));
-    let transcripts = dir.join("transcripts");
-    std::fs::create_dir_all(&transcripts).map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "export_failed",
-            &format!("could not create {}: {e}", dir.display()),
-        )
-    })?;
+    // Fetch all session details before writing to disk, then perform every
+    // filesystem operation inside one `spawn_blocking` worker task.
+    let mut transcripts_to_write: Vec<(String, String)> = Vec::with_capacity(sessions.len());
+    let mut fetch_errors = 0u32;
+    for s in &sessions {
+        match state.store.archived_detail(&s.id).await {
+            Ok(Some(full)) => {
+                let detail = archived_to_detail(full);
+                let name = safe_audit_transcript_name(&s.id);
+                let md = crate::agents::export::to_markdown(&detail);
+                transcripts_to_write.push((name, md));
+            }
+            _ => fetch_errors += 1,
+        }
+    }
+
+    let dir = base.join(format!("Saffev-Audit-{stamp}"));
 
     // The chain, verbatim, so it can be recomputed independently.
     let chain: Vec<serde_json::Value> = log
@@ -2935,46 +2976,73 @@ pub async fn archive_audit(
             "headTs": integrity.head_ts,
         },
         "chain": chain,
-    });
-    write_export(&dir.join("manifest.json"), &manifest.to_string())?;
-    write_export(&dir.join("README.md"), &audit_readme(&integrity))?;
-
-    // One readable transcript per session, named by its id so a manifest entry
-    // points at a file the reviewer can actually open.
-    let mut written = 0u32;
-    let mut errors = 0u32;
-    for s in &sessions {
-        match state.store.archived_detail(&s.id).await {
-            Ok(Some(full)) => {
-                let detail = archived_to_detail(full);
-                let name = format!("{}.md", s.id.replace(':', "_"));
-                if write_export(
-                    &transcripts.join(name),
-                    &crate::agents::export::to_markdown(&detail),
-                )
-                .is_ok()
-                {
-                    written += 1;
-                } else {
-                    errors += 1;
-                }
+    })
+    .to_string();
+    let readme = audit_readme(&integrity);
+    let dir_bg = dir.clone();
+    let write_res = tokio::task::spawn_blocking(move || -> std::result::Result<(u32, u32), String> {
+        let transcripts = dir_bg.join("transcripts");
+        std::fs::create_dir_all(&transcripts)
+            .map_err(|e| format!("could not create {}: {e}", dir_bg.display()))?;
+        std::fs::write(dir_bg.join("manifest.json"), manifest)
+            .map_err(|e| format!("could not write manifest.json: {e}"))?;
+        std::fs::write(dir_bg.join("README.md"), readme)
+            .map_err(|e| format!("could not write README.md: {e}"))?;
+        let mut written = 0u32;
+        let mut write_errors = 0u32;
+        for (name, md) in transcripts_to_write {
+            if std::fs::write(transcripts.join(name), md).is_ok() {
+                written += 1;
+            } else {
+                write_errors += 1;
             }
-            _ => errors += 1,
         }
-    }
+        Ok((written, write_errors))
+    })
+    .await
+    .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", "audit task failed"))?;
+
+    let (written, write_errors) = write_res.map_err(|msg| {
+        api_err(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", &msg)
+    })?;
 
     Ok(Json(dto::AuditExportResult {
         dir: dir.to_string_lossy().to_string(),
         sessions: written,
-        errors,
+        errors: fetch_errors + write_errors,
         intact: integrity.intact,
         head_digest: integrity.head_digest,
     }))
 }
 
-fn write_export(path: &std::path::Path, body: &str) -> Result<(), Response> {
+/// Sanitize a session id into a single safe `.md` filename component (never
+/// allowing `/`, `\`, `..`, or control chars to escape `transcripts/`).
+fn safe_audit_transcript_name(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    let base = if trimmed.is_empty() { "session" } else { trimmed };
+    if sanitized == id.replace(':', "_") && !base.is_empty() {
+        format!("{base}.md")
+    } else {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(id.as_bytes());
+        let suffix: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+        format!("{base}_{suffix}.md")
+    }
+}
+
+fn write_export(path: &std::path::Path, body: &str) -> Result<(), ApiErr> {
     std::fs::write(path, body).map_err(|e| {
-        api_error(
+        api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "export_failed",
             &format!("could not write {}: {e}", path.display()),
@@ -3040,10 +3108,10 @@ pub async fn agents_export(
     State(state): State<StudioState>,
     Path(id): Path<String>,
     Query(p): Query<ExportParams>,
-) -> Result<Response, Response> {
+) -> Result<Response, ApiErr> {
     let format = crate::agents::export::Format::parse(p.format.as_deref().unwrap_or("md"))
         .ok_or_else(|| {
-            api_error(
+            api_err(
                 StatusCode::BAD_REQUEST,
                 "bad_format",
                 "format must be md or json",
@@ -3066,7 +3134,7 @@ pub async fn agents_export(
                 .ok()
                 .flatten()
                 .ok_or_else(|| {
-                    api_error(StatusCode::NOT_FOUND, "not_found", "unknown session id")
+                    api_err(StatusCode::NOT_FOUND, "not_found", "unknown session id")
                 })?;
             archived_to_detail(a)
         }
@@ -3128,49 +3196,131 @@ fn write_session_export(
 pub async fn archive_export(
     State(state): State<StudioState>,
     Json(body): Json<ExportAllBody>,
-) -> Result<Json<dto::ExportSummary>, Response> {
+) -> Result<Json<dto::ExportSummary>, ApiErr> {
     let format = crate::agents::export::Format::parse(body.format.as_deref().unwrap_or("md"))
         .ok_or_else(|| {
-            api_error(
+            api_err(
                 StatusCode::BAD_REQUEST,
                 "bad_format",
                 "format must be md or json",
             )
         })?;
-    let dir = body
-        .dest
-        .filter(|d| !d.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.config.load().export_base().join("Saffev-Export"));
-    std::fs::create_dir_all(&dir).map_err(internal)?;
+    let base = state.config.load().export_base();
+    let dir = match body.dest.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        None => base.join("Saffev-Export"),
+        Some(raw) => {
+            let candidate = std::path::PathBuf::from(raw);
+            if candidate
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(api_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_dest",
+                    "export destination must not contain `..` components",
+                ));
+            }
+            let resolved = if candidate.is_absolute() {
+                candidate
+            } else {
+                base.join(candidate)
+            };
+            if !base.is_dir() {
+                return Err(api_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_dest",
+                    "the configured export destination does not exist or is not mounted",
+                ));
+            }
+            let canon_base = base.canonicalize().map_err(internal)?;
+            // Walk up to the deepest existing ancestor and canonicalize it,
+            // catching symlink escapes through nested non-existent dirs AND
+            // handling macOS `/tmp` -> `/private/tmp` symlinks accurately.
+            let mut tail_parts: Vec<std::ffi::OsString> = Vec::new();
+            let mut cur = resolved.as_path();
+            let canon_ancestor = loop {
+                if cur.exists() {
+                    break cur.canonicalize().map_err(|_| {
+                        api_err(
+                            StatusCode::BAD_REQUEST,
+                            "bad_dest",
+                            "export destination could not be resolved",
+                        )
+                    })?;
+                }
+                match (cur.file_name(), cur.parent()) {
+                    (Some(name), Some(parent)) => {
+                        tail_parts.push(name.to_os_string());
+                        cur = parent;
+                    }
+                    _ => {
+                        return Err(api_err(
+                            StatusCode::BAD_REQUEST,
+                            "bad_dest",
+                            "export destination must stay within the configured export_dir",
+                        ));
+                    }
+                }
+            };
+            if !canon_ancestor.starts_with(&canon_base) {
+                return Err(api_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_dest",
+                    "export destination must stay within the configured export_dir",
+                ));
+            }
+            let mut safe = canon_ancestor;
+            for part in tail_parts.into_iter().rev() {
+                safe.push(part);
+            }
+            safe
+        }
+    };
+    if !base.is_dir() {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "bad_dest",
+            "the configured export destination does not exist or is not mounted",
+        ));
+    }
+    {
+        let dir_mk = dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir_mk))
+            .await
+            .map_err(|_| internal("export dir task failed"))?
+            .map_err(internal)?;
+    }
     let tool = body.tool.filter(|t| !t.is_empty());
 
-    let has_archive = state
-        .store
-        .archive_stats()
-        .await
-        .map(|s| s.count > 0)
-        .unwrap_or(false);
+    let has_archive = state.store.has_archived_sessions().await.unwrap_or(false);
     let (count, errors) = if has_archive {
-        let mut count = 0u32;
-        let mut errors = 0u32;
+        let mut details = Vec::new();
+        let mut fetch_errors = 0u32;
         for a in state.store.archived_sessions().await.map_err(internal)? {
             if tool.as_deref().map(|t| a.tool != t).unwrap_or(false) {
                 continue;
             }
             match state.store.archived_detail(&a.id).await {
-                Ok(Some(full)) => {
-                    let detail = archived_to_detail(full);
-                    if write_session_export(&dir, &detail, format).is_ok() {
-                        count += 1;
-                    } else {
-                        errors += 1;
-                    }
-                }
-                _ => errors += 1,
+                Ok(Some(full)) => details.push(archived_to_detail(full)),
+                _ => fetch_errors += 1,
             }
         }
-        (count, errors)
+        let dir2 = dir.clone();
+        let (written, write_errors) = tokio::task::spawn_blocking(move || {
+            let mut count = 0u32;
+            let mut errors = 0u32;
+            for detail in &details {
+                if write_session_export(&dir2, detail, format).is_ok() {
+                    count += 1;
+                } else {
+                    errors += 1;
+                }
+            }
+            (count, errors)
+        })
+        .await
+        .map_err(|_| internal("export task failed"))?;
+        (written, fetch_errors + write_errors)
     } else {
         let dir2 = dir.clone();
         tokio::task::spawn_blocking(move || {
@@ -3281,157 +3431,174 @@ pub async fn agents_privacy(
 }
 
 pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::AgentAnalytics> {
-    let sessions = crate::agents::all_sessions();
-    let by_tool = crate::agents::detected();
-    let total_sessions = sessions.len() as u32;
-    let total_tokens: u64 = sessions
-        .iter()
-        .map(|s| s.input_tokens + s.output_tokens)
-        .sum();
-    let total_tool_calls: u64 = sessions.iter().map(|s| s.tool_call_count as u64).sum();
-    let total_cost_usd: f64 = by_tool.iter().map(|t| t.cost_usd).sum();
+    let pricing = state.config.load().pricing.clone();
+    // Run all synchronous filesystem scanning, JSONL usage parsing, and rollup
+    // computation in one blocking worker pass (and derive `by_tool` from the
+    // already-listed `sessions` instead of calling `detected()`, which scanned
+    // everything a second time).
+    let report = tokio::task::spawn_blocking(move || {
+        let sessions = crate::agents::all_sessions();
+        let by_tool = crate::agents::tool_stats_with(&sessions, &pricing);
+        let total_sessions = sessions.len() as u32;
+        let total_tokens: u64 = sessions
+            .iter()
+            .map(|s| s.input_tokens + s.output_tokens)
+            .sum();
+        let total_tool_calls: u64 = sessions.iter().map(|s| s.tool_call_count as u64).sum();
+        let total_cost_usd: f64 = by_tool.iter().map(|t| t.cost_usd).sum();
 
-    let _state_pricing = state.config.load().pricing.clone();
-    let mut models: BTreeMap<String, (u32, u64, f64)> = BTreeMap::new();
-    for s in &sessions {
-        let name = s.model.clone().unwrap_or_else(|| "unknown".into());
-        let e = models.entry(name).or_insert((0, 0, 0.0));
-        e.0 += 1;
-        e.1 += s.input_tokens + s.output_tokens;
-        e.2 += crate::agents::cost_usd_split_with(
-            &_state_pricing,
-            s.model.as_deref(),
-            s.input_tokens,
-            s.output_tokens,
-            s.cache_tokens,
-            s.cache_write_tokens,
-        );
-    }
-    let mut by_model: Vec<dto::AgentModelStat> = models
-        .into_iter()
-        .map(
-            |(model, (sessions, tokens, cost_usd))| dto::AgentModelStat {
-                model,
-                sessions,
-                tokens,
-                cost_usd,
-            },
-        )
-        .collect();
-    by_model.sort_by(|a, b| b.tokens.cmp(&a.tokens));
-
-    // G3 usage report: per-request events (Claude Code JSONL) -> daily rows,
-    // 5-hour billing blocks with live burn, plan progress. Pure local reads.
-    let usage = {
-        let pricing = &state.config.load().pricing;
-        let events = crate::agents::usage::claude_code_events(
-            &crate::agents::usage::default_claude_projects_dir(),
-        );
-        if events.is_empty() {
-            None
-        } else {
-            let now = crate::agents::now_ms();
-            let mut daily = crate::agents::usage::daily(&events, pricing);
-            if daily.len() > 30 {
-                daily.drain(..daily.len() - 30);
-            }
-            let mut blocks = crate::agents::usage::blocks(&events, pricing, now);
-            let plan = blocks.iter().find(|b| b.is_active).map(|active| {
-                // Allowance: the user's configured estimate, else the
-                // highest OBSERVED block (needs no invented number).
-                // Baseline = the max of COMPLETED blocks — including the
-                // active one made the bar read exactly 100% whenever the
-                // current block was the all-time max (G3 closing critic).
-                // With no completed history the active block is all there
-                // is, and 100% is the honest answer.
-                let completed_max = blocks
-                    .iter()
-                    .filter(|b| !b.is_gap && !b.is_active)
-                    .map(|b| b.totals.cost_usd)
-                    .fold(0.0f64, f64::max);
-                let observed_max = if completed_max > 0.0 {
-                    completed_max
-                } else {
-                    active.totals.cost_usd
-                };
-                let allowance = if pricing.plan_block_allowance_usd > 0.0 {
-                    pricing.plan_block_allowance_usd
-                } else {
-                    observed_max
-                };
-                dto::PlanProgress {
-                    plan: if pricing.plan.is_empty() {
-                        "observed-max".to_string()
-                    } else {
-                        pricing.plan.clone()
-                    },
-                    block_cost_allowance_usd: allowance,
-                    spent_usd: active.totals.cost_usd,
-                    used_fraction: if allowance > 0.0 {
-                        active.totals.cost_usd / allowance
-                    } else {
-                        0.0
-                    },
-                    resets_in_ms: (active.end_ts - now).max(0),
-                }
-            });
-            if blocks.len() > 20 {
-                blocks.drain(..blocks.len() - 20);
-            }
-            Some(dto::UsageReport {
-                pricing_as_of: pricing.as_of.clone(),
-                monthly: crate::agents::usage::monthly(&events, pricing),
-                daily,
-                blocks,
-                totals: crate::agents::usage::totals(&events, pricing),
-                plan,
-            })
+        let mut models: BTreeMap<String, (u32, u64, f64)> = BTreeMap::new();
+        for s in &sessions {
+            let name = s.model.clone().unwrap_or_else(|| "unknown".into());
+            let e = models.entry(name).or_insert((0, 0, 0.0));
+            e.0 += 1;
+            e.1 += s.input_tokens + s.output_tokens;
+            e.2 += crate::agents::cost_usd_split_with(
+                &pricing,
+                s.model.as_deref(),
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_tokens,
+                s.cache_write_tokens,
+            );
         }
-    };
+        let mut by_model: Vec<dto::AgentModelStat> = models
+            .into_iter()
+            .map(
+                |(model, (sessions, tokens, cost_usd))| dto::AgentModelStat {
+                    model,
+                    sessions,
+                    tokens,
+                    cost_usd,
+                },
+            )
+            .collect();
+        by_model.sort_by_key(|a| std::cmp::Reverse(a.tokens));
 
-    // Daily spend by tool: sessions dated by last activity for every tool,
-    // then Claude Code's day rows replaced by the usage engine's exact ones.
-    let daily_by_tool = {
-        let pricing = state.config.load().pricing.clone();
+        // G3 usage report: per-request events (Claude Code JSONL) -> daily rows,
+        // 5-hour billing blocks with live burn, plan progress. Pure local reads.
         let now = crate::agents::now_ms();
-        let mut rows = crate::agents::daily_by_tool(&sessions, &pricing, now, 30);
-        if let Some(u) = usage.as_ref() {
-            let cc = crate::agents::AgentTool::ClaudeCode.key();
-            let exact: BTreeMap<&str, &crate::agents::usage::DailyRow> =
-                u.daily.iter().map(|d| (d.date.as_str(), d)).collect();
-            for row in rows.iter_mut() {
-                row.cost_by_tool.remove(cc);
-                row.tokens_by_tool.remove(cc);
-                if let Some(d) = exact.get(row.date.as_str()) {
-                    let t = &d.totals;
-                    if t.cost_usd > 0.0 || t.input + t.output > 0 {
-                        row.cost_by_tool.insert(cc.to_string(), t.cost_usd);
-                        row.tokens_by_tool.insert(
-                            cc.to_string(),
-                            t.input + t.output + t.cache_read + t.cache_write,
-                        );
+        let usage = {
+            let events = crate::agents::usage::claude_code_events(
+                &crate::agents::usage::default_claude_projects_dir(),
+            );
+            if events.is_empty() {
+                None
+            } else {
+                let mut daily = crate::agents::usage::daily(&events, &pricing);
+                if daily.len() > 30 {
+                    daily.drain(..daily.len() - 30);
+                }
+                let mut blocks = crate::agents::usage::blocks(&events, &pricing, now);
+                let plan = blocks.iter().find(|b| b.is_active).map(|active| {
+                    // Allowance: the user's configured estimate, else the
+                    // highest OBSERVED block (needs no invented number).
+                    // Baseline = the max of COMPLETED blocks — including the
+                    // active one made the bar read exactly 100% whenever the
+                    // current block was the all-time max (G3 closing critic).
+                    // With no completed history the active block is all there
+                    // is, and 100% is the honest answer.
+                    let completed_max = blocks
+                        .iter()
+                        .filter(|b| !b.is_gap && !b.is_active)
+                        .map(|b| b.totals.cost_usd)
+                        .fold(0.0f64, f64::max);
+                    let observed_max = if completed_max > 0.0 {
+                        completed_max
+                    } else {
+                        active.totals.cost_usd
+                    };
+                    let allowance = if pricing.plan_block_allowance_usd > 0.0 {
+                        pricing.plan_block_allowance_usd
+                    } else {
+                        observed_max
+                    };
+                    dto::PlanProgress {
+                        plan: if pricing.plan.is_empty() {
+                            "observed-max".to_string()
+                        } else {
+                            pricing.plan.clone()
+                        },
+                        block_cost_allowance_usd: allowance,
+                        spent_usd: active.totals.cost_usd,
+                        used_fraction: if allowance > 0.0 {
+                            active.totals.cost_usd / allowance
+                        } else {
+                            0.0
+                        },
+                        resets_in_ms: (active.end_ts - now).max(0),
+                    }
+                });
+                if blocks.len() > 20 {
+                    blocks.drain(..blocks.len() - 20);
+                }
+                Some(dto::UsageReport {
+                    pricing_as_of: pricing.as_of.clone(),
+                    monthly: crate::agents::usage::monthly(&events, &pricing),
+                    daily,
+                    blocks,
+                    totals: crate::agents::usage::totals(&events, &pricing),
+                    plan,
+                })
+            }
+        };
+
+        // Daily spend by tool: sessions dated by last activity for every tool,
+        // then Claude Code's day rows replaced by the usage engine's exact ones.
+        let daily_by_tool = {
+            let mut rows = crate::agents::daily_by_tool(&sessions, &pricing, now, 30);
+            if let Some(u) = usage.as_ref() {
+                let cc = crate::agents::AgentTool::ClaudeCode.key();
+                let exact: BTreeMap<&str, &crate::agents::usage::DailyRow> =
+                    u.daily.iter().map(|d| (d.date.as_str(), d)).collect();
+                for row in rows.iter_mut() {
+                    row.cost_by_tool.remove(cc);
+                    row.tokens_by_tool.remove(cc);
+                    if let Some(d) = exact.get(row.date.as_str()) {
+                        let t = &d.totals;
+                        if t.cost_usd > 0.0 || t.input + t.output > 0 {
+                            row.cost_by_tool.insert(cc.to_string(), t.cost_usd);
+                            row.tokens_by_tool.insert(
+                                cc.to_string(),
+                                t.input + t.output + t.cache_read + t.cache_write,
+                            );
+                        }
                     }
                 }
             }
-        }
-        rows
-    };
-    let tool_labels: BTreeMap<String, String> = by_tool
-        .iter()
-        .map(|t| (t.tool.key().to_string(), t.tool.label().to_string()))
-        .collect();
+            rows
+        };
+        let tool_labels: BTreeMap<String, String> = by_tool
+            .iter()
+            .map(|t| (t.tool.key().to_string(), t.tool.label().to_string()))
+            .collect();
 
-    Json(dto::AgentAnalytics {
-        total_sessions,
-        total_tokens,
-        total_cost_usd,
-        total_tool_calls,
-        by_tool: by_tool.iter().map(tool_stat_view).collect(),
-        by_model,
-        usage,
-        daily_by_tool,
-        tool_labels,
+        dto::AgentAnalytics {
+            total_sessions,
+            total_tokens,
+            total_cost_usd,
+            total_tool_calls,
+            by_tool: by_tool.iter().map(tool_stat_view).collect(),
+            by_model,
+            usage,
+            daily_by_tool,
+            tool_labels,
+        }
     })
+    .await
+    .unwrap_or_else(|_| dto::AgentAnalytics {
+        total_sessions: 0,
+        total_tokens: 0,
+        total_cost_usd: 0.0,
+        total_tool_calls: 0,
+        by_tool: Vec::new(),
+        by_model: Vec::new(),
+        usage: None,
+        daily_by_tool: Vec::new(),
+        tool_labels: BTreeMap::new(),
+    });
+
+    Json(report)
 }
 
 /// `GET /api/settings`
@@ -3441,8 +3608,16 @@ pub async fn agents_analytics(State(state): State<StudioState>) -> Json<dto::Age
 /// restart.
 pub async fn settings_get(
     State(state): State<StudioState>,
-) -> Result<Json<dto::SettingsView>, Response> {
-    Ok(Json(settings_view(&state.config.load())))
+) -> Result<Json<dto::SettingsView>, ApiErr> {
+    let cfg = state.config.load_full();
+    Ok(Json(settings_view_async(cfg).await))
+}
+
+/// Process-wide mutex serializing `PUT /api/settings` read-modify-save-swap so
+/// concurrent saves cannot clobber each other or leave TOML diverged from memory.
+fn settings_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// `PUT /api/settings`
@@ -3463,96 +3638,20 @@ pub async fn settings_get(
 pub async fn settings_put(
     State(state): State<StudioState>,
     Json(body): Json<dto::SettingsUpdate>,
-) -> Result<Json<dto::SettingsView>, Response> {
+) -> Result<Json<dto::SettingsView>, ApiErr> {
     use std::sync::Arc;
 
-    // Base everything on the CURRENT live snapshot, not a startup capture.
-    let current = state.config.load_full();
+    let _guard = settings_lock().lock().await;
 
-    // `persisted`: the full config written to TOML (includes mode for next start).
-    // `live`: the config we will swap into the handle (hot-reloadable fields only;
-    //          mode is intentionally left at the running value).
-    let mut persisted = (*current).clone();
-    let mut live = (*current).clone();
-    let mut restart_required: Vec<String> = Vec::new();
-
-    // mode — NOT runtime-changeable: persist only, flag restart-required.
-    if let Some(mode) = body.mode {
-        if mode != current.mode {
-            persisted.mode = mode;
-            restart_required.push("mode".to_string());
-            // Audit the persisted intent (it applies on the next start).
-            state.store.enqueue(crate::store::WriteOp::Setting {
-                key: "mode".to_string(),
-                value: format!("{:?}", mode).to_lowercase(),
-            });
-        }
-    }
-
-    // payload_storage — HOT-RELOADABLE.
-    if let Some(payload_storage) = body.payload_storage {
-        persisted.payload_storage = payload_storage;
-        live.payload_storage = payload_storage;
-        // Toggling payload storage is an explicit, logged action (04 §7.9).
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "payload_storage".to_string(),
-            value: payload_storage.to_string(),
-        });
-    }
-
-    // retention — HOT-RELOADABLE.
-    if let Some(retention) = body.retention {
-        persisted.retention = retention;
-        live.retention = retention;
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "retention".to_string(),
-            value: serde_json::to_string(&retention).unwrap_or_default(),
-        });
-    }
-
-    // handover — HOT-RELOADABLE (read by the supervisor at stop time).
-    if let Some(handover) = body.handover {
-        persisted.handover = handover;
-        live.handover = handover;
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "handover".to_string(),
-            value: format!("{:?}", handover).to_lowercase(),
-        });
-    }
-
-    // masking.enabled — HOT-RELOADABLE.
-    if let Some(masking_enabled) = body.masking_enabled {
-        persisted.masking.enabled = masking_enabled;
-        live.masking.enabled = masking_enabled;
-        // Enabling masking is an explicit, logged action (04 §7.6, §7.9).
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "masking_enabled".to_string(),
-            value: masking_enabled.to_string(),
-        });
-    }
-
-    // masking.dry_run — HOT-RELOADABLE.
-    if let Some(masking_dry_run) = body.masking_dry_run {
-        persisted.masking.dry_run = masking_dry_run;
-        live.masking.dry_run = masking_dry_run;
-        // Leaving dry-run (dry_run=false) is the step that turns on real request
-        // redaction — log it explicitly.
-        state.store.enqueue(crate::store::WriteOp::Setting {
-            key: "masking_dry_run".to_string(),
-            value: masking_dry_run.to_string(),
-        });
-    }
-
-    // A shared team policy outranks the Studio. Refuse rather than silently
-    // accept-then-ignore: a switch that appears to flip but does nothing is worse
-    // than one that says no.
+    // A shared team policy outranks the Studio. Refuse BEFORE mutating or
+    // recording audit rows rather than silently accepting or half-applying.
     for (field, requested) in [
         ("masking.enabled", body.masking_enabled.is_some()),
         ("masking.dry_run", body.masking_dry_run.is_some()),
         ("masking.block_kinds", body.masking_block_kinds.is_some()),
     ] {
         if requested && crate::policy::governs(field) {
-            return Err(api_error(
+            return Err(api_err(
                 StatusCode::CONFLICT,
                 "governed_by_policy",
                 &format!(
@@ -3563,12 +3662,111 @@ pub async fn settings_put(
         }
     }
 
+    // Validate bounded inputs before touching config or audit state.
+    if let Some(h) = body.backup_interval_hours {
+        if !(1..=720).contains(&h) {
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                "bad_backup_interval",
+                "Backup interval must be between 1 and 720 hours.",
+            ));
+        }
+    }
+
+    // Base everything on the CURRENT live snapshot, not a startup capture.
+    let current = state.config.load_full();
+
+    // `persisted`: the full config written to TOML (includes mode for next start).
+    // `live`: the config we will swap into the handle (hot-reloadable fields only;
+    //          mode is intentionally left at the running value).
+    let mut persisted = (*current).clone();
+    let mut live = (*current).clone();
+    let mut restart_required: Vec<String> = Vec::new();
+    let mut audit_ops: Vec<crate::store::WriteOp> = Vec::new();
+
+    // Preserve any previously persisted (restart-required) `mode` change when
+    // this request updates unrelated fields before the daemon restarts.
+    if body.mode.is_none() {
+        let active_path = current.active_config_path();
+        if let Ok(text) = std::fs::read_to_string(&active_path) {
+            if let Ok(disk_cfg) = toml::from_str::<crate::config::Config>(&text) {
+                if disk_cfg.mode != current.mode {
+                    persisted.mode = disk_cfg.mode;
+                }
+            }
+        }
+    }
+
+    // mode — NOT runtime-changeable: persist only, flag restart-required.
+    if let Some(mode) = body.mode {
+        if mode != current.mode {
+            persisted.mode = mode;
+            restart_required.push("mode".to_string());
+            audit_ops.push(crate::store::WriteOp::Setting {
+                key: "mode".to_string(),
+                value: format!("{:?}", mode).to_lowercase(),
+            });
+        } else {
+            persisted.mode = mode;
+        }
+    }
+
+    // payload_storage — HOT-RELOADABLE.
+    if let Some(payload_storage) = body.payload_storage {
+        persisted.payload_storage = payload_storage;
+        live.payload_storage = payload_storage;
+        audit_ops.push(crate::store::WriteOp::Setting {
+            key: "payload_storage".to_string(),
+            value: payload_storage.to_string(),
+        });
+    }
+
+    // retention — HOT-RELOADABLE.
+    if let Some(retention) = body.retention {
+        persisted.retention = retention;
+        live.retention = retention;
+        audit_ops.push(crate::store::WriteOp::Setting {
+            key: "retention".to_string(),
+            value: serde_json::to_string(&retention).unwrap_or_default(),
+        });
+    }
+
+    // handover — HOT-RELOADABLE (read by the supervisor at stop time).
+    if let Some(handover) = body.handover {
+        persisted.handover = handover;
+        live.handover = handover;
+        audit_ops.push(crate::store::WriteOp::Setting {
+            key: "handover".to_string(),
+            value: format!("{:?}", handover).to_lowercase(),
+        });
+    }
+
+    // masking.enabled — HOT-RELOADABLE.
+    if let Some(masking_enabled) = body.masking_enabled {
+        persisted.masking.enabled = masking_enabled;
+        live.masking.enabled = masking_enabled;
+        audit_ops.push(crate::store::WriteOp::Setting {
+            key: "masking_enabled".to_string(),
+            value: masking_enabled.to_string(),
+        });
+    }
+
+    // masking.dry_run — HOT-RELOADABLE.
+    if let Some(masking_dry_run) = body.masking_dry_run {
+        persisted.masking.dry_run = masking_dry_run;
+        live.masking.dry_run = masking_dry_run;
+        audit_ops.push(crate::store::WriteOp::Setting {
+            key: "masking_dry_run".to_string(),
+            value: masking_dry_run.to_string(),
+        });
+    }
+
     // masking.block_kinds — HOT-RELOADABLE. The one setting that can stop a
     // user's request, so it is logged explicitly like the other protective ones.
     if let Some(kinds) = body.masking_block_kinds.clone() {
         persisted.masking.block_kinds = kinds.clone();
         live.masking.block_kinds = kinds.clone();
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "masking_block_kinds".to_string(),
             value: serde_json::to_string(&kinds).unwrap_or_default(),
         });
@@ -3578,7 +3776,7 @@ pub async fn settings_put(
     if let Some(v) = body.eval_enabled {
         persisted.eval.enabled = v;
         live.eval.enabled = v;
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "eval_enabled".to_string(),
             value: v.to_string(),
         });
@@ -3609,7 +3807,7 @@ pub async fn settings_put(
     if let Some(v) = body.analysis_enabled {
         persisted.analysis.enabled = v;
         live.analysis.enabled = v;
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "analysis_enabled".to_string(),
             value: v.to_string(),
         });
@@ -3619,7 +3817,7 @@ pub async fn settings_put(
     if let Some(v) = body.archive_enabled {
         persisted.archive.enabled = v;
         live.archive.enabled = v;
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "archive_enabled".to_string(),
             value: v.to_string(),
         });
@@ -3631,7 +3829,7 @@ pub async fn settings_put(
     if let Some(v) = body.archive_redact {
         persisted.archive.redact = v;
         live.archive.redact = v;
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "archive_redact".to_string(),
             value: v.to_string(),
         });
@@ -3655,13 +3853,6 @@ pub async fn settings_put(
         live.backup.auto = v;
     }
     if let Some(h) = body.backup_interval_hours {
-        if !(1..=720).contains(&h) {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "bad_backup_interval",
-                "Backup interval must be between 1 and 720 hours.",
-            ));
-        }
         persisted.backup.interval_hours = h;
         live.backup.interval_hours = h;
     }
@@ -3675,44 +3866,61 @@ pub async fn settings_put(
         let val = if trimmed.is_empty() {
             None
         } else {
-            let path = match trimmed.strip_prefix("~/") {
-                Some(rest) => crate::agents::home().join(rest),
-                None => std::path::PathBuf::from(trimmed),
+            let path = if trimmed == "~" {
+                crate::agents::home()
+            } else if let Some(rest) = trimmed.strip_prefix("~/") {
+                crate::agents::home().join(rest)
+            } else {
+                std::path::PathBuf::from(trimmed)
             };
             if !path.is_absolute() {
-                return Err(api_error(
+                return Err(api_err(
                     StatusCode::BAD_REQUEST,
                     "bad_export_dir",
                     "export destination must be an absolute path (or start with ~/)",
                 ));
             }
-            if !path.is_dir() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "bad_export_dir",
-                    &format!(
-                        "{} does not exist or is not a directory — if it is a \
-                         removable drive, check it is mounted",
-                        path.display()
-                    ),
+            // Offload filesystem check + unique writability probe so sleeping
+            // external/network mounts never stall a Tokio worker thread.
+            let check_path = path.clone();
+            let probe_res = tokio::task::spawn_blocking(move || -> Result<(), (String, String)> {
+                if !check_path.is_dir() {
+                    return Err((
+                        "bad_export_dir".into(),
+                        format!(
+                            "{} does not exist or is not a directory — if it is a \
+                             removable drive, check it is mounted",
+                            check_path.display()
+                        ),
+                    ));
+                }
+                let probe = check_path.join(format!(
+                    ".saffev-write-check-{}",
+                    uuid::Uuid::new_v4()
                 ));
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&probe)
+                {
+                    return Err((
+                        "bad_export_dir".into(),
+                        format!("{} is not writable: {e}", check_path.display()),
+                    ));
+                }
+                let _ = std::fs::remove_file(&probe);
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+            if let Err((code, msg)) = probe_res {
+                return Err(api_err(StatusCode::BAD_REQUEST, &code, &msg));
             }
-            // Writability probe: create-and-remove a marker. A read-only mount
-            // (or a card mounted for another user) fails here, at Save time.
-            let probe = path.join(".saffev-write-check");
-            if let Err(e) = std::fs::write(&probe, b"") {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "bad_export_dir",
-                    &format!("{} is not writable: {e}", path.display()),
-                ));
-            }
-            let _ = std::fs::remove_file(&probe);
             Some(std::path::PathBuf::from(trimmed))
         };
         persisted.export_dir = val.clone();
         live.export_dir = val.clone();
-        state.store.enqueue(crate::store::WriteOp::Setting {
+        audit_ops.push(crate::store::WriteOp::Setting {
             key: "export_dir".to_string(),
             value: val
                 .as_deref()
@@ -3721,17 +3929,39 @@ pub async fn settings_put(
         });
     }
 
-    // Persist the full config (write-through to TOML). The token is never touched.
-    persisted.save().map_err(internal)?;
+    // Validate the resulting persisted config when mode changed (e.g., catch
+    // port collisions introduced by toggling between Cooperative and Gateway).
+    if body.mode.is_some() {
+        if let Err(e) = persisted.validate() {
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_config",
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Persist the full config atomically off the async worker thread.
+    let to_save = persisted.clone();
+    tokio::task::spawn_blocking(move || to_save.save())
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
 
     // Swap the hot-reloadable config into the shared handle so BOTH running
     // servers observe it immediately. `mode` stays at the running value in `live`,
     // so this never changes mode mid-process even though `persisted` recorded it.
     state.config.store(Arc::new(live));
 
+    // Only record audit rows once validation and persistence succeeded.
+    for op in audit_ops {
+        state.store.enqueue(op);
+    }
+
     // The returned view reflects the now-live config; restart_required surfaces any
     // persisted-but-not-applied field (currently only mode).
-    let mut view = settings_view(&state.config.load());
+    let live_cfg = state.config.load_full();
+    let mut view = settings_view_async(live_cfg).await;
     if !restart_required.is_empty() {
         view.restart_note = Some(format!(
             "{} saved to config but require a `saffev start` to apply \
@@ -3752,18 +3982,40 @@ pub async fn settings_put(
 /// store remains the source of truth.
 pub async fn stream(
     State(state): State<StudioState>,
+    shutdown: Option<axum::Extension<tokio::sync::watch::Receiver<bool>>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.events.subscribe();
+    let shutdown_rx = shutdown.map(|axum::Extension(r)| r);
 
     // Drive the broadcast receiver as a stream without pulling in `tokio-stream`.
     // `unfold` yields one SSE frame per received event; lagged events (slow
-    // subscriber) are skipped, and channel close ends the stream cleanly.
-    let s = futures::stream::unfold(rx, |mut rx| async move {
+    // subscriber) are skipped, and channel close OR server shutdown ends the
+    // stream cleanly so `saffev stop` / tray Restart never stalls draining SSE.
+    let s = futures::stream::unfold((rx, shutdown_rx), |(mut rx, mut shut)| async move {
         loop {
-            match rx.recv().await {
+            if let Some(ref srx) = shut {
+                if *srx.borrow() {
+                    return None;
+                }
+            }
+            let recv_res = match shut.as_mut() {
+                Some(srx) => {
+                    tokio::select! {
+                        r = rx.recv() => r,
+                        changed = srx.changed() => {
+                            if changed.is_err() || *srx.borrow() {
+                                return None;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                None => rx.recv().await,
+            };
+            match recv_res {
                 Ok(evt) => {
                     if let Ok(json) = serde_json::to_string(&evt) {
-                        return Some((Ok(Event::default().data(json)), rx));
+                        return Some((Ok(Event::default().data(json)), (rx, shut)));
                     }
                     // Unserializable event (should not happen) — skip, keep going.
                 }
@@ -3787,6 +4039,15 @@ pub async fn stream(
 ///
 /// The `restart_required` / `restart_note` fields are empty here; `settings_put`
 /// fills them in when a persisted-but-not-hot-applied field (mode/ports) changed.
+/// Build [`dto::SettingsView`] off the async runtime (offloading `PATH` probe
+/// and `db_size_bytes` filesystem stats).
+async fn settings_view_async(cfg: std::sync::Arc<crate::config::Config>) -> dto::SettingsView {
+    let fallback = cfg.clone();
+    tokio::task::spawn_blocking(move || settings_view(&cfg))
+        .await
+        .unwrap_or_else(|_| settings_view(&fallback))
+}
+
 fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
     dto::SettingsView {
         mode: cfg.mode,
@@ -3814,7 +4075,7 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
         archive_mirror_repos: cfg.archive.mirror_repos,
         backup_auto: cfg.backup.auto,
         backup_interval_hours: cfg.backup.interval_hours,
-        db_bytes: db_size_bytes(&cfg),
+        db_bytes: db_size_bytes(cfg),
         export_dir: cfg.export_dir.as_deref().map(|p| p.display().to_string()),
         export_dir_effective: cfg.export_base().display().to_string(),
         restart_required: Vec::new(),
@@ -3826,12 +4087,12 @@ fn settings_view(cfg: &crate::config::Config) -> dto::SettingsView {
 async fn current_engine_view(
     state: &StudioState,
     engine: &str,
-) -> Result<dto::EngineView, Response> {
+) -> Result<dto::EngineView, ApiErr> {
     let records = state.store.engines().await.map_err(internal)?;
     let rec = records
         .into_iter()
         .find(|r| r.engine.eq_ignore_ascii_case(engine))
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "not_found", "unknown engine"))?;
+        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "not_found", "unknown engine"))?;
     let port = rec.shadow_port.unwrap_or(rec.public_port);
     let health = if probe_loopback(port).await {
         "healthy"
@@ -4497,8 +4758,10 @@ mod tests {
     #[tokio::test]
     async fn settings_put_mode_change_is_restart_required_not_live() {
         // Start in Cooperative; request Gateway.
-        let mut cfg = crate::config::Config::default();
-        cfg.mode = crate::config::Mode::Cooperative;
+        let cfg = crate::config::Config {
+            mode: crate::config::Mode::Cooperative,
+            ..Default::default()
+        };
         let (state, handle) = test_state(cfg).await;
 
         let update = dto::SettingsUpdate {
@@ -4524,5 +4787,109 @@ mod tests {
         );
         // The returned view reflects the still-running mode, honestly.
         assert_eq!(resp.0.mode, crate::config::Mode::Cooperative);
+    }
+
+    #[tokio::test]
+    async fn settings_put_preserves_pending_mode_and_does_not_audit_rejected_updates() {
+        let cfg = crate::config::Config {
+            mode: crate::config::Mode::Cooperative,
+            ..Default::default()
+        };
+        let (state, handle) = test_state(cfg).await;
+
+        // 1. Switch mode to Gateway (persisted, restart-required).
+        let _ = settings_put(
+            State(state.clone()),
+            Json(dto::SettingsUpdate {
+                mode: Some(crate::config::Mode::Gateway),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("mode change saved");
+
+        // 2. Save an unrelated setting before restarting — pending Gateway mode
+        //    must NOT be clobbered back to Cooperative on disk.
+        let _ = settings_put(
+            State(state.clone()),
+            Json(dto::SettingsUpdate {
+                payload_storage: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("unrelated save ok");
+
+        let on_disk_text =
+            std::fs::read_to_string(handle.load().active_config_path()).expect("read config");
+        let on_disk: crate::config::Config = toml::from_str(&on_disk_text).expect("parse config");
+        assert_eq!(
+            on_disk.mode,
+            crate::config::Mode::Gateway,
+            "pending mode change must survive subsequent saves"
+        );
+        assert!(on_disk.payload_storage);
+
+        // 3. A rejected update (bad backup interval + masking change) must NOT
+        //    write dirty audit rows to the settings table.
+        let err = settings_put(
+            State(state.clone()),
+            Json(dto::SettingsUpdate {
+                masking_enabled: Some(true),
+                backup_interval_hours: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(err.is_err());
+        state.store.flush().await.unwrap();
+        assert_eq!(
+            state.store.get_setting("masking_enabled").await.unwrap(),
+            None,
+            "rejected settings_put must not enqueue audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_export_rejects_traversal_and_outside_dest() {
+        let mut cfg = crate::config::Config::default();
+        let tmp = std::env::temp_dir().join(format!("saffev-exp-{}", uuid::Uuid::new_v4()));
+        let allowed = tmp.join("allowed");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        cfg.export_dir = Some(allowed.clone());
+        let (state, _) = test_state(cfg).await;
+
+        let bad_parent = archive_export(
+            State(state.clone()),
+            Json(ExportAllBody {
+                format: Some("md".into()),
+                dest: Some("../outside".into()),
+                tool: None,
+            }),
+        )
+        .await;
+        assert!(bad_parent.is_err());
+
+        let bad_outside = archive_export(
+            State(state),
+            Json(ExportAllBody {
+                format: Some("md".into()),
+                dest: Some(outside.to_string_lossy().to_string()),
+                tool: None,
+            }),
+        )
+        .await;
+        assert!(bad_outside.is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn safe_audit_transcript_name_blocks_path_traversal() {
+        let name = safe_audit_transcript_name("cline:../../etc/passwd");
+        assert!(!name.contains('/') && !name.contains(".."));
+        assert!(name.ends_with(".md"));
     }
 }

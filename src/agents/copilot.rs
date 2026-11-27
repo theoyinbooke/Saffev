@@ -469,16 +469,14 @@ impl CopilotReader {
                         }
                     }
                 }
-                "tool" => {
-                    if with_messages && !content.is_empty() {
-                        messages.push(AgentMessage {
-                            role: Role::Tool,
-                            kind: MessageKind::ToolResult,
-                            content: super::claude_code::truncate(content, 2000),
-                            ts: None,
-                            tool_name: None,
-                        });
-                    }
+                "tool" if with_messages && !content.is_empty() => {
+                    messages.push(AgentMessage {
+                        role: Role::Tool,
+                        kind: MessageKind::ToolResult,
+                        content: super::claude_code::truncate(content, 2000),
+                        ts: None,
+                        tool_name: None,
+                    });
                 }
                 _ => {}
             }
@@ -560,6 +558,9 @@ impl AgentReader for CopilotReader {
         ))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
+        if !super::is_safe_path_id(raw_id) {
+            return None;
+        }
         // Modern: the directory name IS the session id.
         let events = self
             .base
@@ -571,14 +572,17 @@ impl AgentReader for CopilotReader {
                 return Some(d);
             }
         }
-        // Legacy: the filename embeds the id.
+        // Legacy: the filename embeds the id; confirm exact id match after parsing.
+        let want = AgentSession::make_id(AgentTool::Copilot, raw_id);
         for p in self.legacy_sessions() {
             if p.file_name()
                 .map(|n| n.to_string_lossy().contains(raw_id))
                 .unwrap_or(false)
             {
                 if let Some(d) = Self::parse_legacy(&p, true) {
-                    return Some(d);
+                    if d.session.id == want {
+                        return Some(d);
+                    }
                 }
             }
         }

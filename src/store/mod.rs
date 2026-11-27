@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::brain::{Confidence, Finding, PiiKind, Side};
 use crate::{Error, Result};
@@ -651,6 +651,27 @@ impl BackupCursor {
             ("eval_scores", self.eval_scores, to.eval_scores),
         ]
     }
+
+    /// True if any high-water mark moved backwards relative to `prev` (for
+    /// example, retention emptied a table without `AUTOINCREMENT` and SQLite
+    /// reset `MAX(rowid)` to 0). When that happens an incremental delta cannot
+    /// safely diff against `prev`, so the caller must start a fresh full chain.
+    pub fn regressed_from(&self, prev: &BackupCursor) -> bool {
+        self.archive_seq < prev.archive_seq
+            || self.requests < prev.requests
+            || self.responses < prev.responses
+            || self.payloads < prev.payloads
+            || self.pii_findings < prev.pii_findings
+            || self.safety_findings < prev.safety_findings
+            || self.eval_scores < prev.eval_scores
+    }
+}
+
+/// Commands queued onto the single writer thread.
+enum WriterCmd {
+    Op(Box<WriteOp>),
+    Flush(oneshot::Sender<()>),
+    Retention(crate::config::Retention, oneshot::Sender<Result<()>>),
 }
 
 /// What [`restore_backup_chain`] did.
@@ -675,7 +696,7 @@ pub struct Store {
 struct StoreInner {
     /// Bound to the single writer thread. `try_send` keeps the request path
     /// non-blocking (fail-open: a full queue drops the write, logged only).
-    tx: mpsc::Sender<WriteOp>,
+    tx: mpsc::Sender<WriterCmd>,
     /// Path to the on-disk DB, used to open read connections on demand.
     path: std::path::PathBuf,
     /// Idle read connections, reused across reads. Opening a SQLCipher
@@ -684,12 +705,14 @@ struct StoreInner {
     /// connection, which once exhausted the 256-fd limit macOS gives a
     /// launchd-spawned app. Capped at [`READ_POOL_MAX`].
     readers: std::sync::Mutex<Vec<Connection>>,
-    /// Archive byte total, keyed by [`ArchiveShape`]. Summing `LENGTH(content)`
-    /// reads (and decrypts) every archived message, and the panel asked for it
-    /// on every 6-second poll.
-    bytes_cache: std::sync::Mutex<Option<(ArchiveShape, u64)>>,
+    /// Bounds total *concurrent* read connections (not just idle ones) to
+    /// [`READ_POOL_MAX`], preventing bursty SQLCipher KDF + FD exhaustion.
+    read_sem: Arc<Semaphore>,
     /// Last full integrity verdict, for [`Store::verify_archive_cached`].
     verify_cache: std::sync::Mutex<Option<(ArchiveShape, std::time::Instant, ArchiveIntegrity)>>,
+    /// Coalesces concurrent cold `verify_archive_cached` runs so a cache miss
+    /// never consumes all `READ_POOL_MAX` connections hashing the same archive.
+    verify_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A cheap fingerprint of the archive: every archival appends a chain entry,
@@ -749,7 +772,7 @@ impl Store {
         .await
         .map_err(|e| Error::Store(format!("writer init join: {e}")))??;
 
-        let (tx, rx) = mpsc::channel::<WriteOp>(WRITER_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel::<WriterCmd>(WRITER_QUEUE_CAPACITY);
         spawn_writer(conn, rx);
 
         Ok(Store {
@@ -757,8 +780,9 @@ impl Store {
                 tx,
                 path,
                 readers: std::sync::Mutex::new(Vec::new()),
-                bytes_cache: std::sync::Mutex::new(None),
+                read_sem: Arc::new(Semaphore::new(READ_POOL_MAX)),
                 verify_cache: std::sync::Mutex::new(None),
+                verify_lock: Arc::new(tokio::sync::Mutex::new(())),
             }),
         })
     }
@@ -769,7 +793,7 @@ impl Store {
     /// and logged — it is **never** allowed to block or fail the request path
     /// (the hard fail-open invariant).
     pub fn enqueue(&self, op: WriteOp) {
-        if let Err(e) = self.inner.tx.try_send(op) {
+        if let Err(e) = self.inner.tx.try_send(WriterCmd::Op(Box::new(op))) {
             // Drop-and-log: logging must never break inference.
             tracing::warn!(target: "saffev::store", "dropped write op: {e}");
         }
@@ -783,7 +807,7 @@ impl Store {
     pub fn enqueue_blocking(&self, op: WriteOp) -> Result<()> {
         self.inner
             .tx
-            .blocking_send(op)
+            .blocking_send(WriterCmd::Op(Box::new(op)))
             .map_err(|_| Error::Store("writer thread gone".into()))
     }
 
@@ -797,6 +821,13 @@ impl Store {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
+        let _permit = self
+            .inner
+            .read_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Store("read semaphore closed".into()))?;
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<T> {
             let pooled = inner.readers.lock().ok().and_then(|mut p| p.pop());
@@ -818,32 +849,19 @@ impl Store {
         .map_err(|e| Error::Store(format!("read join: {e}")))?
     }
 
-    /// Flush: block until the writer has drained at least up to a fresh fence
-    /// (test/control helper, not on the request path). Writes a unique fence
-    /// value through the ordered channel, then polls a read connection until the
-    /// writer has committed it — guaranteeing every op enqueued *before* this
-    /// call is durable.
+    /// Flush: block until the single writer thread has processed every op
+    /// enqueued *before* this call. Uses a FIFO oneshot fence on the writer
+    /// channel — safe under concurrent callers and never writes to `settings`.
     #[doc(hidden)]
     pub async fn flush(&self) -> Result<()> {
-        let fence = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
         self.inner
             .tx
-            .send(WriteOp::Setting {
-                key: FLUSH_FENCE_KEY.to_string(),
-                value: fence.clone(),
-            })
+            .send(WriterCmd::Flush(tx))
             .await
-            .map_err(|e| Error::Store(format!("flush enqueue: {e}")))?;
-
-        // Poll until the fence value is visible (the channel is FIFO, so once
-        // the writer has committed this fence, all prior ops are committed too).
-        for _ in 0..1000 {
-            if self.get_setting(FLUSH_FENCE_KEY).await? == Some(fence.clone()) {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        Err(Error::Store("flush timed out".into()))
+            .map_err(|_| Error::Store("flush enqueue: writer thread gone".into()))?;
+        rx.await
+            .map_err(|_| Error::Store("flush failed: writer thread exited".into()))
     }
 
     /// Fetch a page of history rows for the Studio.
@@ -1069,34 +1087,36 @@ impl Store {
     pub async fn archived_detail(&self, id: &str) -> Result<Option<ArchivedSession>> {
         let id = id.to_string();
         self.read(move |conn| {
-            let mut session = conn
-                .query_row(
-                    "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
-                     message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
-                     source_path,content_hash,archived_ts,source_deleted \
-                     FROM archived_sessions WHERE id = ?1",
-                    [&id],
-                    row_to_archived,
-                )
-                .optional()?;
-            if let Some(s) = session.as_mut() {
-                let mut stmt = conn.prepare(
-                    "SELECT role,kind,content,ts,tool_name FROM archived_messages \
-                     WHERE session_id = ?1 ORDER BY seq",
-                )?;
-                s.messages = stmt
-                    .query_map([&id], |r| {
-                        Ok(ArchivedMessage {
-                            role: r.get(0)?,
-                            kind: r.get(1)?,
-                            content: r.get(2)?,
-                            ts: r.get(3)?,
-                            tool_name: r.get(4)?,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-            }
-            Ok(session)
+            with_read_tx(conn, |conn| {
+                let mut session = conn
+                    .query_row(
+                        "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
+                         message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
+                         source_path,content_hash,archived_ts,source_deleted \
+                         FROM archived_sessions WHERE id = ?1",
+                        [&id],
+                        row_to_archived,
+                    )
+                    .optional()?;
+                if let Some(s) = session.as_mut() {
+                    let mut stmt = conn.prepare(
+                        "SELECT role,kind,content,ts,tool_name FROM archived_messages \
+                         WHERE session_id = ?1 ORDER BY seq",
+                    )?;
+                    s.messages = stmt
+                        .query_map([&id], |r| {
+                            Ok(ArchivedMessage {
+                                role: r.get(0)?,
+                                kind: r.get(1)?,
+                                content: r.get(2)?,
+                                ts: r.get(3)?,
+                                tool_name: r.get(4)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+                Ok(session)
+            })
         })
         .await
     }
@@ -1329,159 +1349,75 @@ impl Store {
     /// 2. **Content**: for each session, recompute the digest of what is stored
     ///    *now* and compare it to the newest entry logged for that session.
     ///    Catches somebody editing an archived transcript directly in the database
-    ///    without touching the log.
+    ///    without touching the log, or deleting/forging log rows.
+    ///
+    /// Runs inside a single read snapshot (`BEGIN ... ROLLBACK`) so a concurrent
+    /// archival write cannot cause a false-positive mismatch between `archive_log`
+    /// and `archived_sessions`/`archived_messages`.
     pub async fn verify_archive(&self) -> Result<ArchiveIntegrity> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT seq, ts, session_id, content_digest, prev_digest, entry_digest \
-                 FROM archive_log ORDER BY seq ASC",
-            )?;
-            let entries: Vec<ArchiveLogEntry> = stmt
-                .query_map([], |r| {
-                    Ok(ArchiveLogEntry {
-                        seq: r.get(0)?,
-                        ts: r.get(1)?,
-                        session_id: r.get(2)?,
-                        content_digest: r.get(3)?,
-                        prev_digest: r.get(4)?,
-                        entry_digest: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let mut out = ArchiveIntegrity {
-                entries: entries.len() as u64,
-                intact: true,
-                ..Default::default()
-            };
-            if entries.is_empty() {
-                // Nothing archived yet. Vacuously intact, and the UI says so
-                // rather than claiming a verified archive.
-                return Ok(out);
-            }
-
-            // 1. Chain.
-            let mut expected_prev = String::new();
-            let mut latest: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for e in &entries {
-                if e.prev_digest != expected_prev {
-                    out.intact = false;
-                    out.broken_at = Some(format!(
-                        "entry {} does not follow the entry before it — the log was \
-                         edited, reordered, or an entry was removed",
-                        e.seq
-                    ));
-                    break;
-                }
-                let recomputed = entry_digest(
-                    e.seq,
-                    e.ts,
-                    &e.session_id,
-                    &e.content_digest,
-                    &e.prev_digest,
-                );
-                if recomputed != e.entry_digest {
-                    out.intact = false;
-                    out.broken_at = Some(format!(
-                        "entry {} has been altered since it was written",
-                        e.seq
-                    ));
-                    break;
-                }
-                expected_prev = e.entry_digest.clone();
-                latest.insert(e.session_id.clone(), e.content_digest.clone());
-            }
-            out.sessions = latest.len() as u64;
-
-            // 2. Content, for the sessions still present.
-            if out.intact {
-                let mut ms = conn.prepare(
-                    "SELECT role,kind,content FROM archived_messages \
-                     WHERE session_id = ?1 ORDER BY seq",
-                )?;
-                for (id, logged) in &latest {
-                    let Some(s) = conn
-                        .query_row(
-                            "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,\
-                             updated_ts,message_count,tool_call_count,input_tokens,output_tokens,\
-                             cache_tokens,source_path,content_hash,archived_ts,source_deleted \
-                             FROM archived_sessions WHERE id = ?1",
-                            [id],
-                            row_to_archived,
-                        )
-                        .optional()?
-                    else {
-                        // Logged but no longer stored. We never delete archived
-                        // sessions ourselves, so this is worth reporting.
-                        out.altered_sessions.push(id.clone());
-                        continue;
-                    };
-                    // Streamed row by row: one session's text is never held
-                    // in memory twice (or at all, beyond the current row).
-                    let mut h = session_digest_start(&s);
-                    let mut rows = ms.query([id])?;
-                    while let Some(r) = rows.next()? {
-                        for i in 0..3 {
-                            match r.get_ref(i)? {
-                                rusqlite::types::ValueRef::Text(b) => {
-                                    use sha2::Digest;
-                                    h.update(b);
-                                    h.update([0u8]);
-                                }
-                                _ => digest_feed(&mut h, ""),
-                            }
-                        }
-                    }
-                    if digest_finish(h) != *logged {
-                        out.altered_sessions.push(id.clone());
-                    }
-                }
-                if !out.altered_sessions.is_empty() {
-                    out.intact = false;
-                    out.altered_sessions.sort();
-                    out.broken_at = Some(format!(
-                        "{} archived session(s) no longer match what was recorded when they \
-                         were preserved",
-                        out.altered_sessions.len()
-                    ));
-                }
-            }
-
-            if let Some(last) = entries.last() {
-                out.head_digest = Some(last.entry_digest.clone());
-                out.head_ts = Some(last.ts);
-            }
-            Ok(out)
-        })
-        .await
+        self.read(|conn| with_read_tx(conn, verify_archive_in_tx))
+            .await
     }
 
     /// [`Self::verify_archive`], reusing the last verdict while the archive's
     /// shape is unchanged and the verdict is younger than `max_age`.
     ///
-    /// The full check re-reads and re-hashes every archived message, which is
-    /// right for an explicit "verify" and wrong for a panel that polls. A
-    /// legitimate change always moves the chain head and so always re-verifies;
-    /// `max_age` bounds how long an out-of-band edit (someone rewriting rows
-    /// directly) can go unnoticed by a polling view.
+    /// Shape and verification run inside the same read snapshot so a concurrent
+    /// write can never cache a newer verdict under an older shape. Serialized
+    /// via `verify_lock` so concurrent cold callers coalesce instead of
+    /// saturating the read pool with duplicate SHA-256 walks.
     pub async fn verify_archive_cached(
         &self,
         max_age: std::time::Duration,
     ) -> Result<ArchiveIntegrity> {
-        let shape = self.read(archive_shape).await?;
-        if let Ok(c) = self.inner.verify_cache.lock() {
-            if let Some((s, at, v)) = c.as_ref() {
-                if *s == shape && at.elapsed() < max_age {
-                    return Ok(v.clone());
+        let _guard = self.inner.verify_lock.lock().await;
+        let inner = self.inner.clone();
+        self.read(move |conn| {
+            with_read_tx(conn, |conn| {
+                let shape = archive_shape(conn)?;
+                if let Ok(c) = inner.verify_cache.lock() {
+                    if let Some((s, at, v)) = c.as_ref() {
+                        if *s == shape && at.elapsed() < max_age {
+                            return Ok(v.clone());
+                        }
+                    }
                 }
-            }
-        }
-        let v = self.verify_archive().await?;
-        if let Ok(mut c) = self.inner.verify_cache.lock() {
-            *c = Some((shape, std::time::Instant::now(), v.clone()));
-        }
-        Ok(v)
+                let v = verify_archive_in_tx(conn)?;
+                if let Ok(mut c) = inner.verify_cache.lock() {
+                    *c = Some((shape, std::time::Instant::now(), v.clone()));
+                }
+                Ok(v)
+            })
+        })
+        .await
+    }
+
+    /// True if at least one session exists in the archive (O(1) existence probe,
+    /// without scanning messages or counting rows).
+    pub async fn has_archived_sessions(&self) -> Result<bool> {
+        self.read(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archived_sessions)",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(exists != 0)
+        })
+        .await
+    }
+
+    /// True if `id` is present in `archived_sessions` (primary-key point probe).
+    pub async fn is_archived(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        self.read(move |conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archived_sessions WHERE id = ?1)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            Ok(exists != 0)
+        })
+        .await
     }
 
     /// Ids of every archived session — for "is this session preserved?"
@@ -1597,74 +1533,438 @@ impl Store {
         .await
     }
 
-    ///
-    /// The byte total is the one expensive figure (it reads every message), so
-    /// it is computed once per archive shape and reused until the next archival.
+    /// Archive footprint: session count, message count, total content bytes,
+    /// and most recent archive timestamp — read directly from `archived_sessions`
+    /// without decrypting `archived_messages`.
     pub async fn archive_stats(&self) -> Result<ArchiveStats> {
-        let inner = self.inner.clone();
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*), \
+                        COALESCE(SUM(message_count), 0), \
+                        COALESCE(SUM(content_bytes), 0), \
+                        MAX(archived_ts) \
+                 FROM archived_sessions",
+                [],
+                |r| {
+                    Ok(ArchiveStats {
+                        count: r.get::<_, i64>(0)? as u64,
+                        messages: r.get::<_, i64>(1)? as u64,
+                        bytes: r.get::<_, i64>(2)? as u64,
+                        latest_ts: r.get::<_, Option<i64>>(3)?,
+                    })
+                },
+            )
+            .map_err(Error::from)
+        })
+        .await
+    }
+
+    /// Distinct PII kinds found for a specific batch of request IDs — used by
+    /// paginated views (`/api/live`, `/api/history`, `/api/quality`) so paging
+    /// back weeks never scans the whole `pii_findings` table.
+    pub async fn pii_kinds_for_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<PiiKind>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids: Vec<String> = ids.to_vec();
         self.read(move |conn| {
-            let shape = archive_shape(conn)?;
-            let cached = inner
-                .bytes_cache
-                .lock()
-                .ok()
-                .and_then(|c| c.filter(|(s, _)| *s == shape).map(|(_, b)| b));
-            let bytes = match cached {
-                Some(b) => b,
-                None => {
-                    let b: u64 = conn.query_row(
-                        "SELECT COALESCE(SUM(LENGTH(content)),0) FROM archived_messages",
-                        [],
-                        |r| Ok(r.get::<_, i64>(0)? as u64),
-                    )?;
-                    if let Ok(mut c) = inner.bytes_cache.lock() {
-                        *c = Some((shape, b));
+            let mut out: std::collections::HashMap<String, Vec<PiiKind>> =
+                std::collections::HashMap::new();
+            for chunk in ids.chunks(400) {
+                let placeholders: String = (1..=chunk.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT DISTINCT record_id, type FROM pii_findings \
+                     WHERE record_id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                let mut rows = stmt.query(params.as_slice())?;
+                while let Some(r) = rows.next()? {
+                    let rec_id: String = r.get(0)?;
+                    let kind = parse_pii_kind(&r.get::<_, String>(1)?);
+                    let entry = out.entry(rec_id).or_default();
+                    if !entry.contains(&kind) {
+                        entry.push(kind);
                     }
-                    b
                 }
-            };
-            let latest_ts: Option<i64> =
-                conn.query_row("SELECT MAX(archived_ts) FROM archived_sessions", [], |r| {
-                    r.get::<_, Option<i64>>(0)
-                })?;
-            Ok(ArchiveStats {
-                latest_ts,
-                count: shape.sessions,
-                messages: shape.messages,
-                bytes,
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// All-time SQL-aggregated PII counts (`by_kind`, `by_app`, `by_model`,
+    /// `total`) for `GET /api/privacy`. Computes exact lifetime rollups inside
+    /// SQLite without loading all `pii_findings` rows into RAM or truncating
+    /// `by_app`/`by_model` to the newest 500 requests.
+    pub async fn privacy_aggregates(&self) -> Result<PrivacyAggregates> {
+        self.read(|conn| {
+            with_read_tx(conn, |conn| {
+                let mut by_kind = Vec::new();
+                let mut total = 0u64;
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT type, \
+                                SUM(CASE WHEN side = 'request' THEN 1 ELSE 0 END), \
+                                SUM(CASE WHEN side = 'response' THEN 1 ELSE 0 END), \
+                                COUNT(*) \
+                         FROM pii_findings \
+                         GROUP BY type \
+                         ORDER BY type ASC",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(r) = rows.next()? {
+                        let kind = parse_pii_kind(&r.get::<_, String>(0)?);
+                        let req = r.get::<_, i64>(1)? as u64;
+                        let resp = r.get::<_, i64>(2)? as u64;
+                        let count = r.get::<_, i64>(3)? as u64;
+                        total += count;
+                        by_kind.push((kind, count, req, resp));
+                    }
+                }
+                let mut by_app = Vec::new();
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT r.source_app, COUNT(*) AS c \
+                         FROM pii_findings pf \
+                         JOIN requests r ON r.id = pf.record_id \
+                         WHERE r.source_app IS NOT NULL \
+                         GROUP BY r.source_app \
+                         ORDER BY c DESC, r.source_app ASC",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(r) = rows.next()? {
+                        by_app.push((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64));
+                    }
+                }
+                let mut by_model = Vec::new();
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT r.model, COUNT(*) AS c \
+                         FROM pii_findings pf \
+                         JOIN requests r ON r.id = pf.record_id \
+                         WHERE r.model IS NOT NULL \
+                         GROUP BY r.model \
+                         ORDER BY c DESC, r.model ASC",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(r) = rows.next()? {
+                        by_model.push((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64));
+                    }
+                }
+                Ok(PrivacyAggregates {
+                    total,
+                    by_kind,
+                    by_app,
+                    by_model,
+                })
             })
         })
         .await
     }
 
-    /// Apply the retention policy (purge by age/size). Runs off the hot path on
-    /// the blocking pool. Cascading deletes of `responses`/`payloads`/findings
-    /// keyed to purged requests keep the store consistent.
-    pub async fn enforce_retention(&self, retention: crate::config::Retention) -> Result<()> {
-        use crate::config::Retention;
-
-        // A purge is a write; route it through a dedicated short-lived writer
-        // connection so it serializes naturally with the single-writer model
-        // (it only deletes, never races metadata inserts for the same id).
-        let path = self.inner.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = open_connection(&path)?;
-            match retention {
-                Retention::Unlimited => Ok(()),
-                Retention::Age { days } => {
-                    let now_ms = now_millis();
-                    let cutoff = now_ms - (days as i64) * 86_400_000;
-                    purge_requests_before(&conn, cutoff)
+    /// Exact 24h KPIs for `GET /api/live` in one snapshot (no 500-row cap and
+    /// no per-row correlated subqueries).
+    pub async fn live_window_kpis(&self, cutoff_ms: i64) -> Result<LiveWindowKpis> {
+        self.read(move |conn| {
+            with_read_tx(conn, |conn| {
+                let mut latencies = Vec::new();
+                let mut requests_today = 0u64;
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT COALESCE(r.latency_ms, resp.total_ms) \
+                         FROM requests r \
+                         LEFT JOIN responses resp ON resp.request_id = r.id \
+                         WHERE r.ts >= ?1",
+                    )?;
+                    let mut rows = stmt.query([cutoff_ms])?;
+                    while let Some(r) = rows.next()? {
+                        requests_today += 1;
+                        if let Some(ms) = r.get::<_, Option<u32>>(0)? {
+                            latencies.push(ms);
+                        }
+                    }
                 }
-                Retention::Size { mb } => {
-                    let target_bytes = (mb as i64) * 1_024 * 1_024;
-                    purge_to_size(&conn, target_bytes)
-                }
-            }
+                let pii_findings_today: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pii_findings pf \
+                     JOIN requests r ON r.id = pf.record_id \
+                     WHERE r.ts >= ?1",
+                    [cutoff_ms],
+                    |r| Ok(r.get::<_, i64>(0)? as u64),
+                )?;
+                let lifetime_requests: u64 = conn.query_row(
+                    "SELECT COUNT(*) FROM requests",
+                    [],
+                    |r| Ok(r.get::<_, i64>(0)? as u64),
+                )?;
+                Ok(LiveWindowKpis {
+                    requests_today,
+                    latencies,
+                    pii_findings_today,
+                    lifetime_requests,
+                })
+            })
         })
         .await
-        .map_err(|e| Error::Store(format!("retention join: {e}")))?
     }
+
+    /// Exact count of requests with `ts >= since_ts` (for Quality coverage).
+    pub async fn request_count_since(&self, since_ts: i64) -> Result<u64> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM requests WHERE ts >= ?1",
+                [since_ts],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )
+            .map_err(Error::from)
+        })
+        .await
+    }
+
+    /// Most recent exchanges that have at least one safety finding (newest
+    /// first), regardless of how many clean exchanges followed them.
+    pub async fn recent_safety_flagged(&self, limit: u32) -> Result<Vec<HistoryRow>> {
+        let lim = limit.min(MAX_HISTORY_QUERY_LIMIT) as i64;
+        self.read(move |conn| {
+            let sql = "SELECT \
+                   r.id, r.ts, r.source_app, r.source_confidence, r.engine, r.model, r.endpoint, \
+                   r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
+                   r.req_bytes, r.user_agent, r.content_type, r.temperature, r.top_p, r.max_tokens, \
+                   r.msg_count, r.has_system, r.tool_count, \
+                   resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
+                   resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, resp.resp_bytes, \
+                   (SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) AS pii_count, \
+                   (SELECT count(*) FROM safety_findings sf WHERE sf.record_id = r.id) AS safety_count \
+                 FROM requests r \
+                 LEFT JOIN responses resp ON resp.request_id = r.id \
+                 WHERE EXISTS (SELECT 1 FROM safety_findings sf WHERE sf.record_id = r.id) \
+                 ORDER BY r.ts DESC \
+                 LIMIT ?1";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt
+                .query_map([lim], row_to_history)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Windowed history rows for `GET /api/analytics` without per-row
+    /// correlated PII/safety subqueries (analytics joins `privacy_summary`
+    /// once in memory) and without `before_ts` millisecond-tie skips.
+    pub async fn analytics_rows(&self, since_ts: i64, max_rows: usize) -> Result<Vec<HistoryRow>> {
+        let lim = max_rows as i64;
+        self.read(move |conn| {
+            let sql = "SELECT \
+                   r.id, r.ts, r.source_app, r.source_confidence, r.engine, r.model, r.endpoint, \
+                   r.stream, r.input_tokens, r.input_tokens_src, r.latency_ms, r.request_hash, \
+                   r.req_bytes, r.user_agent, r.content_type, r.temperature, r.top_p, r.max_tokens, \
+                   r.msg_count, r.has_system, r.tool_count, \
+                   resp.request_id, resp.finish_reason, resp.output_tokens, resp.output_tokens_src, \
+                   resp.ttft_ms, resp.total_ms, resp.status, resp.error_kind, resp.resp_bytes, \
+                   0 AS pii_count, 0 AS safety_count \
+                 FROM requests r \
+                 LEFT JOIN responses resp ON resp.request_id = r.id \
+                 WHERE r.ts >= ?1 \
+                 ORDER BY r.ts DESC \
+                 LIMIT ?2";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since_ts, lim], row_to_history)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// History query with an optional lower timestamp bound (`r.ts >= since_ts`),
+    /// pushed into SQL so filtered endpoints like `/api/timeline` don't fetch
+    /// and discard out-of-window rows.
+    pub async fn history_since(
+        &self,
+        query: HistoryQuery,
+        since_ts: Option<i64>,
+    ) -> Result<Vec<HistoryRow>> {
+        self.read(move |conn| query_history_with_since(conn, &query, since_ts))
+            .await
+    }
+
+    /// Apply the retention policy (purge by age/size). Routed through the single
+    /// writer thread so purges serialize cleanly with ongoing metadata writes
+    /// without SQLITE_BUSY contention.
+    pub async fn enforce_retention(&self, retention: crate::config::Retention) -> Result<()> {
+        if matches!(retention, crate::config::Retention::Unlimited) {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .tx
+            .send(WriterCmd::Retention(retention, tx))
+            .await
+            .map_err(|_| Error::Store("retention enqueue: writer thread gone".into()))?;
+        rx.await
+            .map_err(|_| Error::Store("retention failed: writer thread exited".into()))?
+    }
+}
+
+/// Run a multi-statement read inside a single WAL snapshot (`BEGIN` / `ROLLBACK`)
+/// so concurrent writes from the single writer cannot produce torn reads.
+fn with_read_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN")?;
+    let out = f(conn);
+    let _ = conn.execute_batch("ROLLBACK");
+    out
+}
+
+/// Core integrity verification over an active read transaction snapshot.
+fn verify_archive_in_tx(conn: &Connection) -> Result<ArchiveIntegrity> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, ts, session_id, content_digest, prev_digest, entry_digest \
+         FROM archive_log ORDER BY seq ASC",
+    )?;
+    let entries: Vec<ArchiveLogEntry> = stmt
+        .query_map([], |r| {
+            Ok(ArchiveLogEntry {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                session_id: r.get(2)?,
+                content_digest: r.get(3)?,
+                prev_digest: r.get(4)?,
+                entry_digest: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut stored_ids_stmt = conn.prepare("SELECT id FROM archived_sessions")?;
+    let stored_ids: Vec<String> = stored_ids_stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut out = ArchiveIntegrity {
+        entries: entries.len() as u64,
+        intact: true,
+        ..Default::default()
+    };
+    if entries.is_empty() {
+        if stored_ids.is_empty() {
+            // Nothing archived yet. Vacuously intact, and the UI says so
+            // rather than claiming a verified archive.
+            return Ok(out);
+        }
+        let mut unlogged = stored_ids;
+        unlogged.sort();
+        out.intact = false;
+        out.broken_at = Some(format!(
+            "archive_log is empty, but {} archived session(s) exist without log entries",
+            unlogged.len()
+        ));
+        out.altered_sessions = unlogged;
+        return Ok(out);
+    }
+
+    // 1. Chain.
+    let mut expected_prev = String::new();
+    let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for e in &entries {
+        if e.prev_digest != expected_prev {
+            out.intact = false;
+            out.broken_at = Some(format!(
+                "entry {} does not follow the entry before it — the log was \
+                 edited, reordered, or an entry was removed",
+                e.seq
+            ));
+            break;
+        }
+        let recomputed = entry_digest(
+            e.seq,
+            e.ts,
+            &e.session_id,
+            &e.content_digest,
+            &e.prev_digest,
+        );
+        if recomputed != e.entry_digest {
+            out.intact = false;
+            out.broken_at = Some(format!(
+                "entry {} has been altered since it was written",
+                e.seq
+            ));
+            break;
+        }
+        expected_prev = e.entry_digest.clone();
+        latest.insert(e.session_id.clone(), e.content_digest.clone());
+    }
+    out.sessions = latest.len() as u64;
+
+    // 2. Content, for the sessions still present — plus check for unlogged rows.
+    if out.intact {
+        let mut sess_stmt = conn.prepare(
+            "SELECT id,tool,source_id,title,project,git_branch,model,started_ts,\
+             updated_ts,message_count,tool_call_count,input_tokens,output_tokens,\
+             cache_tokens,source_path,content_hash,archived_ts,source_deleted \
+             FROM archived_sessions WHERE id = ?1",
+        )?;
+        let mut ms = conn.prepare(
+            "SELECT role,kind,content FROM archived_messages \
+             WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        for (id, logged) in &latest {
+            let Some(s) = sess_stmt.query_row([id], row_to_archived).optional()? else {
+                // Logged but no longer stored. We never delete archived
+                // sessions ourselves, so this is worth reporting.
+                out.altered_sessions.push(id.clone());
+                continue;
+            };
+            // Streamed row by row: one session's text is never held
+            // in memory twice (or at all, beyond the current row).
+            let mut h = session_digest_start(&s);
+            let mut rows = ms.query([id])?;
+            while let Some(r) = rows.next()? {
+                for i in 0..3 {
+                    match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Text(b) => {
+                            use sha2::Digest;
+                            h.update(b);
+                            h.update([0u8]);
+                        }
+                        _ => digest_feed(&mut h, ""),
+                    }
+                }
+            }
+            if digest_finish(h) != *logged {
+                out.altered_sessions.push(id.clone());
+            }
+        }
+        // Catch rows inserted directly into `archived_sessions` or left
+        // unlogged after a tail-truncation of `archive_log`.
+        for id in stored_ids {
+            if !latest.contains_key(&id) {
+                out.altered_sessions.push(id);
+            }
+        }
+        if !out.altered_sessions.is_empty() {
+            out.intact = false;
+            out.altered_sessions.sort();
+            out.altered_sessions.dedup();
+            out.broken_at = Some(format!(
+                "{} archived session(s) no longer match what was recorded when they \
+                 were preserved",
+                out.altered_sessions.len()
+            ));
+        }
+    }
+
+    if let Some(last) = entries.last() {
+        out.head_digest = Some(last.entry_digest.clone());
+        out.head_ts = Some(last.ts);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,9 +2035,7 @@ fn table_columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Str
 
 /// `verb INTO to.table (cols) SELECT cols FROM from.table <tail>` over the
 /// columns both sides have (so a delta still applies onto a base the running
-/// binary has since migrated). `keep_rowid` carries the rowid across for
-/// `responses`, the one table with no primary key — that is what makes
-/// re-applying a delta idempotent there. Table and schema names are constants.
+/// binary has since migrated). Table and schema names are constants.
 fn copy_rows<P: rusqlite::Params>(
     conn: &Connection,
     verb: &str,
@@ -1756,10 +2054,7 @@ fn copy_rows<P: rusqlite::Params>(
     if cols.is_empty() {
         return Ok(0);
     }
-    let mut list = cols.join(",");
-    if table == "responses" {
-        list = format!("rowid,{list}");
-    }
+    let list = cols.join(",");
     let sql = format!("{verb} INTO {to}.{table} ({list}) SELECT {list} FROM {from}.{table} {tail}");
     Ok(conn.execute(&sql, params)?)
 }
@@ -1784,6 +2079,11 @@ fn create_delta_file(dest: &Path) -> Result<()> {
 /// caller's transaction; returns the cursor the delta reaches.
 fn write_delta(conn: &Connection, from: &BackupCursor) -> Result<BackupCursor> {
     let to = read_backup_cursor(conn)?;
+    if to.regressed_from(from) {
+        return Err(Error::Store(
+            "store cursor regressed since previous backup; a full backup is required".into(),
+        ));
+    }
     for t in DELTA_WHOLE_TABLES {
         copy_rows(conn, "INSERT", "main", "bk", t, "", [])?;
     }
@@ -1823,6 +2123,20 @@ fn write_delta(conn: &Connection, from: &BackupCursor) -> Result<BackupCursor> {
                 table,
                 "WHERE rowid <= ?2 AND (rowid > ?1 OR ts >= ?3)",
                 rusqlite::params![lo, hi, recent],
+            )?;
+            continue;
+        }
+        if table == "responses" {
+            // Also re-copy responses for any in-flight request we re-copied,
+            // since ON CONFLICT(request_id) DO UPDATE preserves rowid.
+            copy_rows(
+                conn,
+                "INSERT",
+                "main",
+                "bk",
+                table,
+                "WHERE rowid <= ?2 AND (rowid > ?1 OR request_id IN (SELECT id FROM bk.requests))",
+                rusqlite::params![lo, hi],
             )?;
             continue;
         }
@@ -1928,14 +2242,19 @@ fn apply_delta(conn: &Connection) -> Result<()> {
         copy_rows(conn, "INSERT OR REPLACE", "d", "main", t, "", [])?;
     }
     for (table, _, _) in BackupCursor::default().ranges(&BackupCursor::default()) {
+        if table == "responses" {
+            // Dedupe by request_id (works cleanly for both pre-v11 and v11
+            // full backups without relying on potentially renumbered rowids).
+            conn.execute_batch(
+                "DELETE FROM main.responses WHERE request_id IN (SELECT request_id FROM d.responses);",
+            )?;
+            copy_rows(conn, "INSERT", "d", "main", table, "", [])?;
+            continue;
+        }
         copy_rows(conn, "INSERT OR REPLACE", "d", "main", table, "", [])?;
     }
     Ok(())
 }
-
-/// Magic settings key used by [`Store::flush`] as an internal fence. Never read
-/// by the Studio.
-const FLUSH_FENCE_KEY: &str = "__saffev_flush_fence";
 
 // ---------------------------------------------------------------------------
 // Connection setup (writer + read)
@@ -1946,10 +2265,10 @@ const FLUSH_FENCE_KEY: &str = "__saffev_flush_fence";
 /// **before** any other access (required by SQLCipher).
 fn open_connection(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).map_err(Error::from)?;
-    apply_key(&conn)?;
-    // Busy timeout so a brief writer/reader contention waits instead of erroring
-    // (WAL makes this rare, but keeps fail-open behaviour honest).
+    // Set busy_timeout before `apply_key`'s `sqlite_master` sanity query so a
+    // brief writer/reader lock on open waits instead of failing immediately.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    apply_key(&conn)?;
     Ok(conn)
 }
 
@@ -1993,12 +2312,19 @@ fn apply_key(_conn: &Connection) -> Result<()> {
 #[cfg(feature = "sqlcipher")]
 fn cached_db_key() -> Result<String> {
     static DB_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(k) = DB_KEY.get() {
+        return Ok(k.clone());
+    }
+    // Serialize first-run initialization so concurrent openers never race
+    // `get_or_create_db_key` and overwrite each other's newly generated secret.
+    let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(k) = DB_KEY.get() {
         return Ok(k.clone());
     }
     let key = keys::get_or_create_db_key()?;
     let _ = DB_KEY.set(key.clone());
-    Ok(key)
+    Ok(DB_KEY.get().cloned().unwrap_or(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -2009,17 +2335,44 @@ fn cached_db_key() -> Result<String> {
 /// the channel until every `Store` handle is dropped (sender closed). Each op is
 /// applied independently; a single failing write is logged and skipped — the
 /// writer never dies on a bad row (fail-open).
-fn spawn_writer(conn: Connection, mut rx: mpsc::Receiver<WriteOp>) {
+fn spawn_writer(conn: Connection, mut rx: mpsc::Receiver<WriterCmd>) {
     // A blocking OS thread, not a tokio task: rusqlite is sync and we want the
     // connection pinned to one thread for its entire lifetime.
     tokio::task::spawn_blocking(move || {
-        while let Some(op) = rx.blocking_recv() {
-            if let Err(e) = apply_write(&conn, &op) {
-                tracing::warn!(target: "saffev::store", "write failed: {e}");
+        while let Some(cmd) = rx.blocking_recv() {
+            match cmd {
+                WriterCmd::Op(op) => {
+                    if let Err(e) = apply_write(&conn, &op) {
+                        tracing::warn!(target: "saffev::store", "write failed: {e}");
+                    }
+                }
+                WriterCmd::Flush(done) => {
+                    let _ = done.send(());
+                }
+                WriterCmd::Retention(retention, done) => {
+                    let res = apply_retention(&conn, retention);
+                    let _ = done.send(res);
+                }
             }
         }
         tracing::debug!(target: "saffev::store", "writer thread exiting (channel closed)");
     });
+}
+
+fn apply_retention(conn: &Connection, retention: crate::config::Retention) -> Result<()> {
+    use crate::config::Retention;
+    match retention {
+        Retention::Unlimited => Ok(()),
+        Retention::Age { days } => {
+            let now_ms = now_millis();
+            let cutoff = now_ms.saturating_sub((days as i64).saturating_mul(86_400_000));
+            purge_requests_before(conn, cutoff)
+        }
+        Retention::Size { mb } => {
+            let target_bytes = (mb as i64).saturating_mul(1_024 * 1_024);
+            purge_to_size(conn, target_bytes)
+        }
+    }
 }
 
 /// Apply one [`WriteOp`] to the writer connection.
@@ -2054,12 +2407,23 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
         }
         WriteOp::Request(r) => {
             conn.execute(
-                "INSERT OR REPLACE INTO requests \
+                "INSERT INTO requests \
                  (id, ts, source_app, source_confidence, engine, model, endpoint, stream, \
                   input_tokens, input_tokens_src, latency_ms, request_hash, \
                   req_bytes, user_agent, content_type, temperature, top_p, max_tokens, \
                   msg_count, has_system, tool_count) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                  ts=excluded.ts, source_app=excluded.source_app, \
+                  source_confidence=excluded.source_confidence, engine=excluded.engine, \
+                  model=excluded.model, endpoint=excluded.endpoint, stream=excluded.stream, \
+                  input_tokens=excluded.input_tokens, input_tokens_src=excluded.input_tokens_src, \
+                  latency_ms=excluded.latency_ms, request_hash=excluded.request_hash, \
+                  req_bytes=excluded.req_bytes, user_agent=excluded.user_agent, \
+                  content_type=excluded.content_type, temperature=excluded.temperature, \
+                  top_p=excluded.top_p, max_tokens=excluded.max_tokens, \
+                  msg_count=excluded.msg_count, has_system=excluded.has_system, \
+                  tool_count=excluded.tool_count",
                 rusqlite::params![
                     r.id,
                     r.ts,
@@ -2096,16 +2460,22 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
             )?;
         }
         WriteOp::Response(r) => {
-            // One response per request: replace any prior partial row.
-            conn.execute(
-                "DELETE FROM responses WHERE request_id = ?1",
-                [&r.request_id],
-            )?;
+            // One response per request (unique since migration v11): atomic
+            // upsert avoids a non-atomic DELETE/INSERT window and full scan.
             conn.execute(
                 "INSERT INTO responses \
                  (request_id, finish_reason, output_tokens, output_tokens_src, ttft_ms, total_ms, \
                   status, error_kind, resp_bytes) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                 ON CONFLICT(request_id) DO UPDATE SET \
+                  finish_reason=excluded.finish_reason, \
+                  output_tokens=excluded.output_tokens, \
+                  output_tokens_src=excluded.output_tokens_src, \
+                  ttft_ms=excluded.ttft_ms, \
+                  total_ms=excluded.total_ms, \
+                  status=excluded.status, \
+                  error_kind=excluded.error_kind, \
+                  resp_bytes=excluded.resp_bytes",
                 rusqlite::params![
                     r.request_id,
                     r.finish_reason,
@@ -2215,12 +2585,13 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                     "DELETE FROM archived_messages WHERE session_id = ?1 AND seq >= ?2",
                     rusqlite::params![s.id, keep as i64],
                 )?;
+                let content_bytes: i64 = s.messages.iter().map(|m| m.content.len() as i64).sum();
                 tx.execute(
                     "INSERT OR REPLACE INTO archived_sessions \
                      (id,tool,source_id,title,project,git_branch,model,started_ts,updated_ts, \
                       message_count,tool_call_count,input_tokens,output_tokens,cache_tokens, \
-                      source_path,content_hash,archived_ts,source_deleted) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                      source_path,content_hash,archived_ts,source_deleted,content_bytes) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                     rusqlite::params![
                         s.id,
                         s.tool,
@@ -2240,6 +2611,7 @@ fn apply_write(conn: &Connection, op: &WriteOp) -> Result<()> {
                         s.content_hash,
                         s.archived_ts,
                         s.source_deleted as i64,
+                        content_bytes,
                     ],
                 )?;
                 let mut stmt = tx.prepare(
@@ -2372,9 +2744,36 @@ fn unchanged_prefix(
 // Read queries
 // ---------------------------------------------------------------------------
 
+/// SQL-aggregated all-time privacy rollups for `GET /api/privacy`.
+#[derive(Debug, Clone, Default)]
+pub struct PrivacyAggregates {
+    pub total: u64,
+    /// `(kind, total, request_count, response_count)`
+    pub by_kind: Vec<(PiiKind, u64, u64, u64)>,
+    pub by_app: Vec<(String, u64)>,
+    pub by_model: Vec<(String, u64)>,
+}
+
+/// Exact 24h KPIs for `GET /api/live`.
+#[derive(Debug, Clone, Default)]
+pub struct LiveWindowKpis {
+    pub requests_today: u64,
+    pub latencies: Vec<u32>,
+    pub pii_findings_today: u64,
+    pub lifetime_requests: u64,
+}
+
 /// Build + run the history query with optional free-text + pii-only filters and
 /// `before_ts` cursor paging. Joins responses + a per-request finding count.
 fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryRow>> {
+    query_history_with_since(conn, query, None)
+}
+
+fn query_history_with_since(
+    conn: &Connection,
+    query: &HistoryQuery,
+    since_ts: Option<i64>,
+) -> Result<Vec<HistoryRow>> {
     let limit = query.limit.unwrap_or(100).min(MAX_HISTORY_QUERY_LIMIT) as i64;
 
     // Dynamic WHERE assembled with bound params (never string-interpolated user
@@ -2382,6 +2781,10 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
     let mut wheres: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+    if let Some(since) = since_ts {
+        wheres.push(format!("r.ts >= ?{}", params.len() + 1));
+        params.push(Box::new(since));
+    }
     if let Some(before) = query.before_ts {
         wheres.push(format!("r.ts < ?{}", params.len() + 1));
         params.push(Box::new(before));
@@ -2408,7 +2811,7 @@ fn query_history(conn: &Connection, query: &HistoryQuery) -> Result<Vec<HistoryR
         "(SELECT count(*) FROM safety_findings sf WHERE sf.record_id = r.id) AS safety_count";
 
     if query.pii_only {
-        wheres.push("(SELECT count(*) FROM pii_findings pf WHERE pf.record_id = r.id) > 0".into());
+        wheres.push("EXISTS (SELECT 1 FROM pii_findings pf WHERE pf.record_id = r.id)".into());
     }
 
     if query.failed_only {
@@ -2642,50 +3045,91 @@ fn purge_requests_before(conn: &Connection, cutoff_ms: i64) -> Result<()> {
     Ok(())
 }
 
-/// Drop oldest requests until the DB file is under `target_bytes`. Deletes in
-/// age-ordered batches, re-measuring after each batch.
+/// Drop oldest requests in batches until the DB's live page footprint is under
+/// `target_bytes` (or no proxy requests remain to purge).
+///
+/// Uses `(page_count - freelist_count) * page_size` inside the loop because
+/// SQLite's `DELETE` moves freed pages to the freelist without shrinking
+/// `page_count` (and `wal_checkpoint(TRUNCATE)` only truncates the WAL). Once
+/// purging finishes, a single `VACUUM` + checkpoint reclaims freed space back
+/// to disk if the physical file still exceeds `target_bytes`.
 fn purge_to_size(conn: &Connection, target_bytes: i64) -> Result<()> {
     const BATCH: i64 = 500;
+    let mut purged_any = false;
     loop {
-        let size = db_size_bytes(conn)?;
-        if size <= target_bytes {
+        if live_db_size_bytes(conn)? <= target_bytes {
             break;
         }
-        // Find the cutoff ts of the oldest BATCH requests.
-        let cutoff: Option<i64> = conn
-            .query_row(
-                "SELECT ts FROM requests ORDER BY ts ASC LIMIT 1 OFFSET ?1",
-                [BATCH],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match cutoff {
-            // Fewer than BATCH rows left and still over budget: purge everything.
-            None => {
-                let tx = conn.unchecked_transaction()?;
-                tx.execute("DELETE FROM responses", [])?;
-                tx.execute("DELETE FROM payloads", [])?;
-                tx.execute("DELETE FROM pii_findings", [])?;
-                tx.execute("DELETE FROM safety_findings", [])?;
-                tx.execute("DELETE FROM eval_scores", [])?;
-                tx.execute("DELETE FROM requests", [])?;
-                tx.commit()?;
-                break;
-            }
-            Some(cut) => {
-                purge_requests_before(conn, cut)?;
-                // Reclaim freed pages so the size check reflects the delete.
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let tx = conn.unchecked_transaction()?;
+        let ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM requests ORDER BY ts ASC, rowid ASC LIMIT ?1")?;
+            let rows = stmt
+                .query_map([BATCH], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if ids.is_empty() {
+            // Nothing left in proxy history to purge (remaining bytes belong to
+            // the Preservation archive or SQLite overhead).
+            break;
+        }
+        {
+            let mut del_resp = tx.prepare("DELETE FROM responses WHERE request_id = ?1")?;
+            let mut del_pay = tx.prepare("DELETE FROM payloads WHERE request_id = ?1")?;
+            let mut del_pii = tx.prepare("DELETE FROM pii_findings WHERE record_id = ?1")?;
+            let mut del_safe = tx.prepare("DELETE FROM safety_findings WHERE record_id = ?1")?;
+            let mut del_eval = tx.prepare("DELETE FROM eval_scores WHERE record_id = ?1")?;
+            let mut del_req = tx.prepare("DELETE FROM requests WHERE id = ?1")?;
+            for id in &ids {
+                del_resp.execute([id])?;
+                del_pay.execute([id])?;
+                del_pii.execute([id])?;
+                del_safe.execute([id])?;
+                del_eval.execute([id])?;
+                del_req.execute([id])?;
             }
         }
+        tx.commit()?;
+        purged_any = true;
+    }
+    if purged_any {
+        if db_size_bytes(conn)? > target_bytes {
+            let _ = conn.execute_batch("VACUUM;");
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     }
     Ok(())
 }
 
+/// Read a numeric `PRAGMA` value, tolerating SQLCipher returning `TEXT` for
+/// aliased pragmas such as `PRAGMA page_size` (`cipher_page_size`).
+fn pragma_i64(conn: &Connection, pragma: &str) -> Result<i64> {
+    let val = conn.query_row(pragma, [], |row| row.get::<_, rusqlite::types::Value>(0))?;
+    match val {
+        rusqlite::types::Value::Integer(n) => Ok(n),
+        rusqlite::types::Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| Error::Store(format!("{pragma} returned non-integer text {s:?}"))),
+        other => Err(Error::Store(format!(
+            "{pragma} returned unexpected value {other:?}"
+        ))),
+    }
+}
+
+/// Live (in-use) database size in bytes: `(page_count - freelist_count) * page_size`.
+fn live_db_size_bytes(conn: &Connection) -> Result<i64> {
+    let page_count = pragma_i64(conn, "PRAGMA page_count")?;
+    let freelist_count = pragma_i64(conn, "PRAGMA freelist_count")?;
+    let page_size = pragma_i64(conn, "PRAGMA page_size")?;
+    Ok(page_count.saturating_sub(freelist_count) * page_size)
+}
+
 /// Approximate on-disk size in bytes via `page_count * page_size`.
 fn db_size_bytes(conn: &Connection) -> Result<i64> {
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count = pragma_i64(conn, "PRAGMA page_count")?;
+    let page_size = pragma_i64(conn, "PRAGMA page_size")?;
     Ok(page_count * page_size)
 }
 
@@ -4196,5 +4640,199 @@ mod tests {
         assert_eq!(rec.action, PiiAction::Masked);
         assert_eq!(rec.value_hash, "hashed");
         assert_eq!(rec.id, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_flushes_all_succeed_without_polluting_settings() {
+        let dir = std::env::temp_dir().join(format!("saffev-flush-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir.join("test.db")).await.unwrap();
+        for i in 0..20 {
+            store.enqueue(WriteOp::Setting {
+                key: format!("k{i}"),
+                value: format!("v{i}"),
+            });
+        }
+        let mut futs = Vec::new();
+        for _ in 0..10 {
+            let s = store.clone();
+            futs.push(tokio::spawn(async move { s.flush().await }));
+        }
+        for f in futs {
+            f.await.unwrap().expect("concurrent flush must succeed");
+        }
+        assert_eq!(store.get_setting("k19").await.unwrap().as_deref(), Some("v19"));
+        assert_eq!(
+            store.get_setting("__saffev_flush_fence").await.unwrap(),
+            None,
+            "oneshot flush must not write to settings"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn purge_to_size_terminates_on_equal_timestamps_and_preserves_archive() {
+        let dir = std::env::temp_dir().join(format!("saffev-purge-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir.join("test.db")).await.unwrap();
+        // Insert 600 requests with the EXACT same timestamp (previously infinite-looped).
+        let same_ts = 1_700_000_000_000i64;
+        for i in 0..600 {
+            store.enqueue(WriteOp::Request(RequestMeta {
+                id: format!("req-{i:04}"),
+                ts: same_ts,
+                source_app: Some("app".into()),
+                source_confidence: SourceConfidence::Header,
+                engine: "ollama".into(),
+                model: Some("llama3".into()),
+                endpoint: "/api/chat".into(),
+                stream: false,
+                input_tokens: Some(10),
+                input_tokens_src: TokenSource::Exact,
+                latency_ms: None,
+                request_hash: format!("h-{i}"),
+                req_bytes: None,
+                user_agent: None,
+                content_type: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                msg_count: None,
+                has_system: None,
+                tool_count: None,
+            }));
+        }
+        store.flush().await.unwrap();
+        // Target tiny size so loop runs to completion without hanging.
+        store
+            .enforce_retention(crate::config::Retention::Size { mb: 0 })
+            .await
+            .unwrap();
+        let remaining = store.history(HistoryQuery::default()).await.unwrap();
+        assert!(remaining.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verify_archive_catches_deleted_log_and_unlogged_sessions() {
+        let dir = std::env::temp_dir().join(format!("saffev-vfy-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("test.db");
+        let store = Store::open(&path).await.unwrap();
+        let sess = ArchivedSession {
+            id: "codex:s1".into(),
+            tool: "codex".into(),
+            source_id: "s1".into(),
+            title: Some("t".into()),
+            project: None,
+            git_branch: None,
+            model: None,
+            started_ts: 1,
+            updated_ts: 2,
+            message_count: 1,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_tokens: 0,
+            source_path: None,
+            content_hash: "h1".into(),
+            archived_ts: 3,
+            source_deleted: false,
+            messages: vec![ArchivedMessage {
+                role: "user".into(),
+                kind: "text".into(),
+                content: "hello".into(),
+                ts: None,
+                tool_name: None,
+            }],
+        };
+        store.enqueue(WriteOp::ArchiveSession(Box::new(sess)));
+        store.flush().await.unwrap();
+        assert!(store.verify_archive().await.unwrap().intact);
+
+        // Tamper: wipe archive_log while archived_sessions stays populated.
+        {
+            let conn = open_connection(&path).unwrap();
+            conn.execute("DELETE FROM archive_log", []).unwrap();
+        }
+        let v = store.verify_archive().await.unwrap();
+        assert!(!v.intact, "empty archive_log with stored sessions must fail");
+        assert_eq!(v.altered_sessions, vec!["codex:s1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn response_upsert_and_delta_restore_never_duplicate_rows() {
+        let dir = std::env::temp_dir().join(format!("saffev-resp-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir.join("test.db")).await.unwrap();
+        store.enqueue(WriteOp::Request(RequestMeta {
+            id: "r1".into(),
+            ts: 1_000,
+            source_app: None,
+            source_confidence: SourceConfidence::Unknown,
+            engine: "ollama".into(),
+            model: Some("m".into()),
+            endpoint: "/api/chat".into(),
+            stream: false,
+            input_tokens: None,
+            input_tokens_src: TokenSource::Estimated,
+            latency_ms: None,
+            request_hash: "h".into(),
+            req_bytes: None,
+            user_agent: None,
+            content_type: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            msg_count: None,
+            has_system: None,
+            tool_count: None,
+        }));
+        store.enqueue(WriteOp::Response(ResponseMeta {
+            request_id: "r1".into(),
+            finish_reason: Some("partial".into()),
+            output_tokens: Some(1),
+            output_tokens_src: TokenSource::Exact,
+            ttft_ms: Some(10),
+            total_ms: Some(20),
+            status: Some(200),
+            error_kind: None,
+            resp_bytes: Some(10),
+        }));
+        store.flush().await.unwrap();
+        let full = dir.join("full.db");
+        let (_, c0) = store.backup_full_to(full.clone()).await.unwrap();
+
+        // Update the same response row and write a delta.
+        store.enqueue(WriteOp::Response(ResponseMeta {
+            request_id: "r1".into(),
+            finish_reason: Some("stop".into()),
+            output_tokens: Some(42),
+            output_tokens_src: TokenSource::Exact,
+            ttft_ms: Some(10),
+            total_ms: Some(99),
+            status: Some(200),
+            error_kind: None,
+            resp_bytes: Some(100),
+        }));
+        store.flush().await.unwrap();
+        let delta = dir.join("delta.db");
+        store.backup_delta_to(delta.clone(), c0).await.unwrap();
+
+        let restored = dir.join("restored.db");
+        restore_backup_chain(&full, &[delta], &restored).unwrap();
+        let conn = open_connection(&restored).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM responses WHERE request_id = 'r1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tokens: i64 = conn
+            .query_row(
+                "SELECT output_tokens FROM responses WHERE request_id = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "must not duplicate response rows");
+        assert_eq!(tokens, 42, "must contain updated response row");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

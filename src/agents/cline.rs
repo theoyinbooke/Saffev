@@ -263,26 +263,24 @@ impl ClineReader {
                                     });
                                 }
                             }
-                            "tool_result" => {
-                                if with_messages {
-                                    let content = match b.get("content") {
-                                        Some(Value::String(s)) => s.clone(),
-                                        Some(Value::Array(parts)) => parts
-                                            .iter()
-                                            .filter_map(|p| p.get("text").and_then(Value::as_str))
-                                            .collect::<Vec<_>>()
-                                            .join("\n"),
-                                        _ => String::new(),
-                                    };
-                                    if !content.is_empty() {
-                                        messages.push(AgentMessage {
-                                            role: Role::Tool,
-                                            kind: MessageKind::ToolResult,
-                                            content: super::claude_code::truncate(&content, 2000),
-                                            ts,
-                                            tool_name: None,
-                                        });
-                                    }
+                            "tool_result" if with_messages => {
+                                let content = match b.get("content") {
+                                    Some(Value::String(s)) => s.clone(),
+                                    Some(Value::Array(parts)) => parts
+                                        .iter()
+                                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                    _ => String::new(),
+                                };
+                                if !content.is_empty() {
+                                    messages.push(AgentMessage {
+                                        role: Role::Tool,
+                                        kind: MessageKind::ToolResult,
+                                        content: super::claude_code::truncate(&content, 2000),
+                                        ts,
+                                        tool_name: None,
+                                    });
                                 }
                             }
                             _ => {}
@@ -408,6 +406,9 @@ impl AgentReader for ClineReader {
         Some(super::hash_files(files.into_iter()))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
+        if !super::is_safe_path_id(raw_id) {
+            return None;
+        }
         for root in &self.roots {
             if root.join("tasks").join(raw_id).is_dir() {
                 let history = Self::history(root);

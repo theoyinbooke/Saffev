@@ -97,9 +97,11 @@ impl SystemdController {
     /// both.
     pub async fn register_service(&self) -> Result<JournalEntry> {
         let unit_path = format!("/etc/systemd/system/{SAFFEV_UNIT}");
-        let exe = std::env::current_exe()
+        let exe = crate::cli::daemon::current_exe_on_disk()
+            .or_else(|_| std::env::current_exe().map_err(Error::Io))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "/usr/local/bin/saffev".to_string());
+        let quoted_exe = exe.replace('\\', "\\\\").replace('"', "\\\"");
 
         let contents = format!(
             "# Managed by Saffev — do not edit. Remove via `saffev revert`.\n\
@@ -108,7 +110,7 @@ impl SystemdController {
              After=network.target\n\n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={exe} start --foreground\n\
+             ExecStart=\"{quoted_exe}\" start --foreground\n\
              Restart=on-failure\n\n\
              [Install]\n\
              WantedBy=multi-user.target\n"
@@ -217,6 +219,9 @@ impl EngineController for SystemdController {
                     .await
                     .map_err(|e| Error::Engine(format!("re-enabling {unit}: {e}"))),
                 JournalEntry::RegisteredService { unit } => {
+                    // Stop the running service FIRST so the public port is freed
+                    // before Ollama restarts at the end of `revert`.
+                    let _ = systemctl(&["stop", unit]).await;
                     let mut r = systemctl(&["disable", unit])
                         .await
                         .map_err(|e| Error::Engine(format!("disabling {unit}: {e}")));

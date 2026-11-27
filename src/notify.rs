@@ -26,6 +26,7 @@ pub fn command_spec(title: &str, body: &str) -> Option<(&'static str, Vec<String
             "notify-send",
             vec![
                 "--app-name=Saffev".to_string(),
+                "--".to_string(),
                 title.to_string(),
                 body.to_string(),
             ],
@@ -33,8 +34,9 @@ pub fn command_spec(title: &str, body: &str) -> Option<(&'static str, Vec<String
     }
     #[cfg(target_os = "macos")]
     {
-        // A fixed AppleScript program; the title/body arrive as `argv` items,
-        // so quoting in the user text is inert data, not script source.
+        // A fixed AppleScript program; `--` terminates option parsing so a
+        // dash-prefixed title (e.g. `-e...`) can never be interpreted as an
+        // `osascript` flag or script line — title and body are always pure argv.
         Some((
             "osascript",
             vec![
@@ -44,6 +46,7 @@ pub fn command_spec(title: &str, body: &str) -> Option<(&'static str, Vec<String
                 "display notification (item 2 of argv) with title (item 1 of argv)".into(),
                 "-e".into(),
                 "end run".into(),
+                "--".into(),
                 title.to_string(),
                 body.to_string(),
             ],
@@ -119,6 +122,13 @@ mod tests {
                     );
                 }
             }
+            // End-of-options separator `--` must appear immediately before title/body
+            // so dash-prefixed titles (e.g. `-e...`) cannot inject flags/code.
+            let n = args.len();
+            assert!(n >= 3);
+            assert_eq!(args[n - 3], "--");
+            assert_eq!(args[n - 2], title);
+            assert_eq!(args[n - 1], body);
         }
     }
 

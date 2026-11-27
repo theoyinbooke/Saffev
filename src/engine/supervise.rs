@@ -45,7 +45,11 @@ impl Supervisor {
     /// already listening on that port (e.g. systemd brought it up on the shadow
     /// port after adoption), we attach to it without spawning a duplicate.
     pub async fn start(info: &EngineInfo) -> Result<Self> {
-        let public_port = crate::config::DEFAULT_PROXY_PORT;
+        let public_port = match info.engine {
+            EngineKind::Ollama => crate::config::DEFAULT_UPSTREAM_PORT,
+            EngineKind::LmStudio => 1234,
+            _ => info.port,
+        };
 
         // Already up on the shadow port? Attach, don't double-spawn.
         if probe_health(info.engine, info.port).await == HealthState::Healthy {
@@ -69,6 +73,14 @@ impl Supervisor {
         for _ in 0..20 {
             if sup.health().await == HealthState::Healthy {
                 return Ok(sup);
+            }
+            if let Some(child) = sup.child.lock().await.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(Error::Engine(format!(
+                        "engine exited before becoming healthy on shadow port {} ({status})",
+                        info.port
+                    )));
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
@@ -179,23 +191,26 @@ fn spawn_engine(kind: EngineKind, port: u16) -> Result<Child> {
         }
     };
 
+    // Do NOT set `kill_on_drop(true)`: `Supervisor::drop` already kills any
+    // still-owned child on abnormal drop, while `Handover` detaches the handle
+    // cleanly without leaking it via `mem::forget`.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
 
     cmd.spawn()
         .map_err(|e| Error::Engine(format!("failed to spawn engine on {host}: {e}")))
 }
 
-/// Detach a child so dropping its handle does **not** kill the process. We clear
-/// `kill_on_drop` by forgetting the handle through std, leaving the OS process
-/// alive (graceful handover).
-fn detach(child: Child) {
-    // `tokio::process::Child` kills on drop only if `kill_on_drop(true)` was set;
-    // converting away from the kill-on-drop guarantee is done by leaking the
-    // handle so its Drop never runs. The OS process keeps running independently.
-    std::mem::forget(child);
+/// Detach a child for graceful handover: leave the OS process running and reap
+/// its exit status asynchronously if it terminates while this process is still
+/// alive (no zombie and no leaked Tokio child handle).
+fn detach(mut child: Child) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -238,12 +253,12 @@ mod tests {
     #[test]
     fn spawn_unknown_engine_errors() {
         let err = spawn_engine(EngineKind::Unknown, 11999).unwrap_err();
-        matches!(err, Error::Engine(_));
+        assert!(matches!(err, Error::Engine(_)));
     }
 
     #[test]
     fn spawn_lmstudio_is_unsupported() {
         let err = spawn_engine(EngineKind::LmStudio, 11999).unwrap_err();
-        matches!(err, Error::Unsupported(_));
+        assert!(matches!(err, Error::Unsupported(_)));
     }
 }

@@ -186,33 +186,45 @@ async fn run_locked(
     req: Request,
 ) -> Result<Outcome> {
     let base = out.unwrap_or_else(|| cfg.export_base());
-    if !base.is_dir() {
-        return Err(Error::Store(format!(
-            "the backup destination {} is not available (a missing folder or an unplugged drive) — \
-             nothing was written",
-            base.display()
-        )));
-    }
-
     let current_schema = crate::store::schema::target_version();
-    let previous = match req {
+    let last_dir = match req {
         Request::Full => None,
-        Request::Auto => {
-            let last_dir = store.get_setting(KEY_LAST_DIR).await.ok().flatten();
-            last_dir
-                .map(PathBuf::from)
-                .and_then(|d| usable_parent(&d, &base, current_schema, cfg.backup.full_every))
-        }
+        Request::Auto => store.get_setting(KEY_LAST_DIR).await.ok().flatten(),
     };
+    let full_every = cfg.backup.full_every;
+
+    // Destination mount checks and chain validation can hit slow USB/SMB/NAS
+    // volumes; keep all synchronous filesystem I/O off the Tokio worker pool.
+    let base_for_check = base.clone();
+    let mut previous = tokio::task::spawn_blocking(move || -> Result<Option<(PathBuf, Manifest)>> {
+        if !base_for_check.is_dir() {
+            return Err(Error::Store(format!(
+                "the backup destination {} is not available (a missing folder or an unplugged drive) — \
+                 nothing was written",
+                base_for_check.display()
+            )));
+        }
+        Ok(last_dir
+            .map(PathBuf::from)
+            .and_then(|d| usable_parent(&d, &base_for_check, current_schema, full_every)))
+    })
+    .await
+    .map_err(|e| Error::Store(format!("backup precheck task failed: {e}")))??;
 
     if let Some((dir, m)) = &previous {
-        if store.backup_cursor().await? == m.cursor {
+        let cur = store.backup_cursor().await?;
+        if cur == m.cursor {
             let now = now_ms();
             store.enqueue(WriteOp::Setting {
                 key: KEY_LAST_CHECK_TS.into(),
                 value: now.to_string(),
             });
             return Ok(Outcome::Unchanged { dir: dir.clone() });
+        }
+        // If retention emptied a table and SQLite reset MAX(rowid), an
+        // incremental delta would miss new rows or recycle IDs; start fresh.
+        if cur.regressed_from(&m.cursor) {
+            previous = None;
         }
     }
 
@@ -235,7 +247,11 @@ async fn run_locked(
         Kind::Full => format!("{DIR_PREFIX}{stamp}"),
         Kind::Incremental => format!("{DIR_PREFIX}{stamp}-incr"),
     };
-    let (staging, final_dir) = reserve(&base, &name)?;
+    let base_for_reserve = base.clone();
+    let (staging, final_dir) =
+        tokio::task::spawn_blocking(move || reserve(&base_for_reserve, &name))
+            .await
+            .map_err(|e| Error::Store(format!("backup reserve task failed: {e}")))??;
 
     let built = build_link(
         store,
@@ -248,14 +264,24 @@ async fn run_locked(
     let manifest = match built {
         Ok(m) => m,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            let staging_cleanup = staging.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&staging_cleanup))
+                .await;
             return Err(e);
         }
     };
-    if let Err(e) = std::fs::rename(&staging, &final_dir) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(Error::Io(e));
-    }
+
+    let staging_for_rename = staging.clone();
+    let final_for_rename = final_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if let Err(e) = std::fs::rename(&staging_for_rename, &final_for_rename) {
+            let _ = std::fs::remove_dir_all(&staging_for_rename);
+            return Err(Error::Io(e));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Store(format!("backup finalize task failed: {e}")))??;
 
     store.enqueue(WriteOp::Setting {
         key: KEY_LAST_TS.into(),
@@ -271,7 +297,12 @@ async fn run_locked(
     });
 
     let pruned = if manifest.kind == Kind::Full && cfg.backup.keep_chains > 0 {
-        prune(&base, cfg.backup.keep_chains as usize, &final_dir)
+        let keep = cfg.backup.keep_chains as usize;
+        let base_for_prune = base.clone();
+        let final_for_prune = final_dir.clone();
+        tokio::task::spawn_blocking(move || prune(&base_for_prune, keep, &final_for_prune))
+            .await
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -307,35 +338,44 @@ async fn build_link(
             0,
         ),
     };
-    let db_bytes = std::fs::metadata(staging.join(db_file))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let cfg_copied = std::fs::copy(cfg.config_path(), staging.join("saffev.toml")).is_ok();
 
-    let manifest = Manifest {
-        format: FORMAT,
-        kind: if parent.is_some() {
-            Kind::Incremental
-        } else {
-            Kind::Full
-        },
-        created_ms: now_ms(),
-        saffev_version: env!("CARGO_PKG_VERSION").to_string(),
-        schema,
-        cursor,
-        parent,
-        depth,
-        db_file: db_file.to_string(),
-        db_bytes,
-    };
-    let json = serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Store(e.to_string()))?;
-    std::fs::write(staging.join(MANIFEST_FILE), json).map_err(Error::Io)?;
-    std::fs::write(
-        staging.join("README.md"),
-        readme(&manifest, cfg_copied, cfg),
-    )
-    .map_err(Error::Io)?;
-    Ok(manifest)
+    let staging_owned = staging.to_path_buf();
+    let cfg_path = cfg.active_config_path();
+    let cfg_data_dir = cfg.data_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<Manifest> {
+        let db_bytes = std::fs::metadata(staging_owned.join(db_file))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let cfg_copied = std::fs::copy(&cfg_path, staging_owned.join("saffev.toml")).is_ok();
+
+        let manifest = Manifest {
+            format: FORMAT,
+            kind: if parent.is_some() {
+                Kind::Incremental
+            } else {
+                Kind::Full
+            },
+            created_ms: now_ms(),
+            saffev_version: env!("CARGO_PKG_VERSION").to_string(),
+            schema,
+            cursor,
+            parent,
+            depth,
+            db_file: db_file.to_string(),
+            db_bytes,
+        };
+        let json =
+            serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Store(e.to_string()))?;
+        std::fs::write(staging_owned.join(MANIFEST_FILE), json).map_err(Error::Io)?;
+        std::fs::write(
+            staging_owned.join("README.md"),
+            readme(&manifest, cfg_copied, &cfg_data_dir),
+        )
+        .map_err(Error::Io)?;
+        Ok(manifest)
+    })
+    .await
+    .map_err(|e| Error::Store(format!("backup write task failed: {e}")))?
 }
 
 /// Reserve a unique folder name: returns `(staging, final)`. The staging
@@ -397,10 +437,28 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Reject any manifest path field (`db_file` or `parent`) that is not a single
+/// normal filename component — preventing `../` or absolute-path traversal.
+fn validate_single_component(name: &str, label: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(Error::Store(format!(
+            "invalid {label} in backup manifest: {name:?}"
+        )));
+    }
+    let mut comps = Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(Error::Store(format!(
+            "invalid {label} in backup manifest: {name:?}"
+        ))),
+    }
+}
+
 /// The files to replay for the backup in `dir`: the full copy, then every
 /// delta after it, oldest first. A folder without a manifest is a backup from
 /// before chains existed — a plain full copy.
 pub fn resolve_chain(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    const MAX_CHAIN_DEPTH: usize = 1024;
     let Some(mut m) = read_manifest(dir) else {
         let db = dir.join(FULL_DB_FILE);
         if db.is_file() {
@@ -414,7 +472,19 @@ pub fn resolve_chain(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     let schema = m.schema;
     let mut cur = dir.to_path_buf();
     let mut deltas = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     loop {
+        if deltas.len() >= MAX_CHAIN_DEPTH {
+            return Err(Error::Store("backup chain exceeds maximum depth".into()));
+        }
+        let canon = cur.canonicalize().unwrap_or_else(|_| cur.clone());
+        if !visited.insert(canon) {
+            return Err(Error::Store(format!(
+                "backup chain contains a cycle at {}",
+                cur.display()
+            )));
+        }
+        validate_single_component(&m.db_file, "db_file")?;
         let db = cur.join(&m.db_file);
         if !db.is_file() {
             return Err(Error::Store(format!(
@@ -435,6 +505,7 @@ pub fn resolve_chain(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
                 return Ok((db, deltas));
             }
             (Kind::Incremental, Some(parent)) => {
+                validate_single_component(&parent, "parent")?;
                 let depth = m.depth;
                 deltas.push(db);
                 let parent_dir = cur
@@ -448,7 +519,7 @@ pub fn resolve_chain(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
                         cur.display()
                     ))
                 })?;
-                if m.depth + 1 != depth {
+                if m.depth.checked_add(1) != Some(depth) {
                     return Err(Error::Store(format!(
                         "the backup chain at {} is out of order",
                         parent_dir.display()
@@ -526,7 +597,7 @@ fn prune(base: &Path, keep: usize, current: &Path) -> Vec<PathBuf> {
     removed
 }
 
-fn readme(m: &Manifest, cfg_copied: bool, cfg: &Config) -> String {
+fn readme(m: &Manifest, cfg_copied: bool, data_dir: &Path) -> String {
     let created = time::OffsetDateTime::from_unix_timestamp(m.created_ms / 1000)
         .ok()
         .and_then(|t| {
@@ -584,7 +655,7 @@ fn readme(m: &Manifest, cfg_copied: bool, cfg: &Config) -> String {
          \x20  they were at the time of this backup.\n",
         version = m.saffev_version,
         schema = m.schema,
-        data_dir = cfg.data_dir.display(),
+        data_dir = data_dir.display(),
     )
 }
 
@@ -953,5 +1024,59 @@ mod tests {
         assert!(due(&cfg, Some(10 * h), 16 * h));
         cfg.backup.interval_hours = 0;
         assert!(due(&cfg, Some(10 * h), 11 * h), "0 is clamped to 1 hour");
+    }
+
+    #[test]
+    fn resolve_chain_rejects_path_traversal_and_depth_overflow() {
+        let dir = std::env::temp_dir().join(format!("saffev-bk-trav-{}", uuid::Uuid::new_v4()));
+        let link = dir.join("Saffev-Backup-bad");
+        std::fs::create_dir_all(&link).unwrap();
+        std::fs::write(link.join("saffev.db"), b"fake").unwrap();
+
+        let mut m = Manifest {
+            format: FORMAT,
+            kind: Kind::Full,
+            created_ms: 1,
+            saffev_version: "0.9.0".into(),
+            schema: 11,
+            cursor: crate::store::BackupCursor::default(),
+            parent: None,
+            depth: 0,
+            db_file: "../escape.db".into(),
+            db_bytes: 0,
+        };
+        std::fs::write(link.join(MANIFEST_FILE), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(resolve_chain(&link).is_err(), "db_file traversal must fail");
+
+        m.db_file = FULL_DB_FILE.into();
+        m.kind = Kind::Incremental;
+        m.parent = Some("../outside".into());
+        m.depth = 1;
+        std::fs::write(link.join(MANIFEST_FILE), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(resolve_chain(&link).is_err(), "parent traversal must fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn regressed_cursor_forces_full_backup() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = fixture().await;
+        f.store.enqueue(WriteOp::Request(request("r1", 1_000)));
+        f.store.flush().await.unwrap();
+        let (_, m1) = written(run(&f.store, &f.cfg, None, Request::Auto).await.unwrap());
+        assert_eq!(m1.kind, Kind::Full);
+
+        // Simulate retention emptying requests (rowid resets from 1 -> 0).
+        f.store
+            .enforce_retention(crate::config::Retention::Age { days: 0 })
+            .await
+            .unwrap();
+        let (_, m2) = written(run(&f.store, &f.cfg, None, Request::Auto).await.unwrap());
+        assert_eq!(
+            m2.kind,
+            Kind::Full,
+            "regressed cursor must start a fresh full chain instead of writing an empty delta"
+        );
     }
 }

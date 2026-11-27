@@ -117,10 +117,12 @@ pub async fn diagnose_port_conflict(port: u16) -> Result<Option<PortHolder>> {
 #[cfg(unix)]
 async fn port_holder(port: u16) -> Option<PortHolder> {
     // `lsof -nP -iTCP:<port> -sTCP:LISTEN -t` prints listening PIDs, one per line.
-    let out = tokio::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .output()
+    let mut cmd = tokio::process::Command::new("lsof");
+    cmd.args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(2), cmd.output())
         .await
+        .ok()?
         .ok()?;
 
     if !out.status.success() {
@@ -143,10 +145,12 @@ async fn port_holder(_port: u16) -> Option<PortHolder> {
 /// Resolve a PID to a process name via `ps`. Best-effort.
 #[cfg(unix)]
 async fn process_name(pid: u32) -> Option<String> {
-    let out = tokio::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
+    let mut cmd = tokio::process::Command::new("ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "comm="])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(2), cmd.output())
         .await
+        .ok()?
         .ok()?;
     if !out.status.success() {
         return None;

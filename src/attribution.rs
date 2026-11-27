@@ -185,6 +185,11 @@ fn client_socket_inode(contents: &str, want_port: u16) -> Option<u64> {
         if fields.len() < 10 {
             continue;
         }
+        // Only live ESTABLISHED sockets (state 01) with a real inode; skip
+        // TIME_WAIT (06) or kernel-owned rows with inode 0.
+        if !fields[3].eq_ignore_ascii_case("01") {
+            continue;
+        }
         let local = fields[1];
         let Some((_addr_hex, port_hex)) = local.split_once(':') else {
             continue;
@@ -196,7 +201,9 @@ fn client_socket_inode(contents: &str, want_port: u16) -> Option<u64> {
             continue;
         }
         if let Ok(inode) = fields[9].parse::<u64>() {
-            return Some(inode);
+            if inode > 0 {
+                return Some(inode);
+            }
         }
     }
     None
@@ -281,14 +288,23 @@ fn run_lsof_bounded(port: u16) -> Option<std::process::Output> {
         .spawn()
         .ok()?;
 
+    // Drain stdout concurrently on a helper thread so `lsof` can never block
+    // on a full OS pipe buffer while we wait for it to exit.
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = std::time::Instant::now() + LSOF_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_end(&mut stdout);
-                }
+                let stdout = stdout_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
                 return Some(std::process::Output {
                     status,
                     stdout,
@@ -297,9 +313,12 @@ fn run_lsof_bounded(port: u16) -> Option<std::process::Output> {
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // Timed out: reap the child and give up.
+                    // Timed out: reap the child and let the reader thread close.
                     let _ = child.kill();
                     let _ = child.wait();
+                    if let Some(h) = stdout_handle {
+                        let _ = h.join();
+                    }
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -307,6 +326,9 @@ fn run_lsof_bounded(port: u16) -> Option<std::process::Output> {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
                 return None;
             }
         }

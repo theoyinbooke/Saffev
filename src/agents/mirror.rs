@@ -52,10 +52,38 @@ pub fn mirror_path(s: &AgentSession) -> Option<PathBuf> {
     Some(mirror_dir(s.project.as_deref())?.join(format!("{}.md", export::safe_filename_for(s))))
 }
 
+/// Same as [`mirror_path`], applying `redaction` to `s.title` first when
+/// redaction is enabled — matching the exact filename [`write_session`] writes
+/// so incremental snapshots don't re-mirror redacted-title sessions on every pass.
+pub fn mirror_path_for(s: &AgentSession, redaction: &Redaction) -> Option<PathBuf> {
+    if !redaction.is_on() {
+        return mirror_path(s);
+    }
+    let dir = mirror_dir(s.project.as_deref())?;
+    let mut tmp = s.clone();
+    tmp.title = tmp
+        .title
+        .as_deref()
+        .map(|t| redaction.apply(crate::agents::Role::User, t));
+    Some(dir.join(format!("{}.md", export::safe_filename_for(&tmp))))
+}
+
 /// Write one session's Markdown mirror (creating the folder + README on first
 /// use, and removing a stale file left by an earlier title). Returns
 /// `Ok(true)` when written, `Ok(false)` when the session has no eligible repo.
 pub fn write_session(d: &AgentSessionDetail, redaction: &Redaction) -> std::io::Result<bool> {
+    if redaction.is_on() {
+        let redacted = redact_detail(d, redaction);
+        write_pre_redacted(&redacted)
+    } else {
+        write_pre_redacted(d)
+    }
+}
+
+/// Write a session mirror that has already been passed through the desired
+/// redaction posture (avoids double-redacting or deep-cloning when called from
+/// `archive::snapshot_sync`).
+pub fn write_pre_redacted(d: &AgentSessionDetail) -> std::io::Result<bool> {
     let Some(path) = mirror_path(&d.session) else {
         return Ok(false);
     };
@@ -68,12 +96,12 @@ pub fn write_session(d: &AgentSessionDetail, redaction: &Redaction) -> std::io::
     if !readme.exists() {
         std::fs::write(&readme, README)?;
     }
-    remove_stale_siblings(dir, &path, &d.session);
+    // Only scan for renamed siblings when the target path doesn't already exist.
+    if !path.exists() {
+        remove_stale_siblings(dir, &path, &d.session);
+    }
 
-    // Render with the archive's redaction posture applied — never rawer than
-    // what the archive itself stores.
-    let redacted = redact_detail(d, redaction);
-    std::fs::write(&path, export::to_markdown(&redacted))?;
+    std::fs::write(&path, export::to_markdown(d))?;
     Ok(true)
 }
 
@@ -97,9 +125,14 @@ fn remove_stale_siblings(dir: &Path, current: &Path, s: &AgentSession) {
     }
 }
 
-/// Clone a detail with every message body passed through the redaction.
+/// Clone a detail with its title and every message body passed through redaction.
 fn redact_detail(d: &AgentSessionDetail, redaction: &Redaction) -> AgentSessionDetail {
     let mut out = d.clone();
+    out.session.title = out
+        .session
+        .title
+        .as_deref()
+        .map(|t| redaction.apply(crate::agents::Role::User, t));
     for m in &mut out.messages {
         m.content = redaction.apply(m.role, &m.content);
     }
@@ -224,6 +257,36 @@ mod tests {
             !old_file.exists(),
             "stale file for the old title is removed"
         );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn redaction_strips_secrets_from_title_and_mirror_filename() {
+        let repo = repo_dir();
+        let project = repo.to_string_lossy().into_owned();
+        let d = detail(Some(project), "Email alice@secretcorp.example about deploy");
+        let mut cfg = crate::config::Config::default();
+        cfg.archive.redact = true;
+        let redaction = Redaction::from_config(&cfg).unwrap();
+        assert!(write_session(&d, &redaction).unwrap());
+
+        let dir = mirror_dir(d.session.project.as_deref()).unwrap();
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("README.md"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let fname = files[0].file_name().unwrap().to_string_lossy();
+        assert!(!fname.contains("alice"), "secret leaked into filename: {fname}");
+        let body = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(!body.contains("alice@secretcorp.example"), "secret leaked into title: {body}");
+        assert!(body.contains("[EMAIL]"));
+        // `mirror_path_for` must resolve to the exact redacted file written so
+        // incremental snapshots never re-mirror this session in an infinite loop.
+        assert_eq!(mirror_path_for(&d.session, &redaction), Some(files[0].clone()));
 
         let _ = std::fs::remove_dir_all(&repo);
     }

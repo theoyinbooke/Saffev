@@ -76,14 +76,44 @@ impl CodexReader {
             }
         }
         walk(&self.base, 0, &mut files);
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|a| std::cmp::Reverse(a.0));
         files.into_iter().map(|(_, p)| p).collect()
     }
 
-    /// Load `session_index.jsonl` into id → thread_name (best-effort titles).
+    /// Load `session_index.jsonl` into id → thread_name (best-effort titles),
+    /// cached by `(path, mtime_ns, size)` so repeated list/detail calls don't
+    /// re-read and re-parse the index when unchanged.
     fn title_index(&self) -> HashMap<String, String> {
+        use std::sync::{Mutex, OnceLock};
+        type TitleCache = Mutex<HashMap<PathBuf, (i128, u64, HashMap<String, String>)>>;
+        static CACHE: OnceLock<TitleCache> = OnceLock::new();
+
+        let path = self.codex_home().join("session_index.jsonl");
+        let meta = fs::metadata(&path).ok();
+        let key = meta.as_ref().map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0);
+            (mtime, m.len())
+        });
+        let Some((mtime, size)) = key else {
+            return HashMap::new();
+        };
+
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache.lock() {
+            if let Some((cm, cs, hit)) = guard.get(&path) {
+                if *cm == mtime && *cs == size {
+                    return hit.clone();
+                }
+            }
+        }
+
         let mut m = HashMap::new();
-        if let Ok(text) = fs::read_to_string(self.codex_home().join("session_index.jsonl")) {
+        if let Ok(text) = fs::read_to_string(&path) {
             for line in text.lines() {
                 if let Ok(v) = serde_json::from_str::<Value>(line) {
                     if let (Some(id), Some(name)) = (
@@ -94,6 +124,9 @@ impl CodexReader {
                     }
                 }
             }
+        }
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(path, (mtime, size, m.clone()));
         }
         m
     }
@@ -366,27 +399,25 @@ impl super::tail::LineState for ParseState {
                                 });
                             }
                         }
-                        "reasoning" => {
-                            if self.with_messages {
-                                if let Some(sum) = p
-                                    .get("summary")
-                                    .and_then(Value::as_array)
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|s| s.get("text").and_then(Value::as_str))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    })
-                                    .filter(|s| !s.is_empty())
-                                {
-                                    self.messages.push(AgentMessage {
-                                        role: Role::Assistant,
-                                        kind: MessageKind::Thinking,
-                                        content: sum,
-                                        ts: outer_ts,
-                                        tool_name: None,
-                                    });
-                                }
+                        "reasoning" if self.with_messages => {
+                            if let Some(sum) = p
+                                .get("summary")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| s.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .filter(|s| !s.is_empty())
+                            {
+                                self.messages.push(AgentMessage {
+                                    role: Role::Assistant,
+                                    kind: MessageKind::Thinking,
+                                    content: sum,
+                                    ts: outer_ts,
+                                    tool_name: None,
+                                });
                             }
                         }
                         _ => {}
@@ -417,14 +448,23 @@ impl AgentReader for CodexReader {
             .into_iter()
             .take(MAX_LIST)
             // A finished rollout never changes, so unchanged files are answered
-            // from the per-file cache instead of being re-read. Without this,
-            // listing re-parsed every rollout on every page load.
+            // from the per-file cache instead of being re-read. Overlay the
+            // live `session_index.jsonl` title *after* cache lookup so renaming
+            // a thread shows up immediately even when the rollout file is untouched.
             .filter_map(|p| {
-                super::cached_file_parse(&p, |p| {
+                let mut s = super::cached_file_parse(&p, |p| {
                     self.parse(p, &titles, false)
                         .map(|d| d.session)
                         .filter(|s| s.message_count > 0)
-                })
+                })?;
+                if let Some((_, raw_id)) = super::split_id(&s.id) {
+                    if let Some(t) = titles.get(raw_id) {
+                        if !t.is_empty() {
+                            s.title = Some(t.clone());
+                        }
+                    }
+                }
+                Some(s)
             })
             .collect()
     }
@@ -434,15 +474,42 @@ impl AgentReader for CodexReader {
         )
     }
     fn source_fingerprint(&self) -> Option<u64> {
-        Some(super::hash_files(self.rollouts().into_iter()))
+        let idx = self.codex_home().join("session_index.jsonl");
+        let iter = self
+            .rollouts()
+            .into_iter()
+            .chain(idx.is_file().then_some(idx));
+        Some(super::hash_files(iter))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
         let titles = self.title_index();
-        let path = self
-            .rollouts()
-            .into_iter()
-            .find(|p| p.to_string_lossy().contains(raw_id))?;
-        self.parse(&path, &titles, true)
+        let want = AgentSession::make_id(AgentTool::Codex, raw_id);
+        let rollouts = self.rollouts();
+        // Fast path: match files whose filename ends with `-{raw_id}.jsonl` or
+        // contains `raw_id`, verifying exact session id equality.
+        let suffix = format!("-{raw_id}.jsonl");
+        for p in &rollouts {
+            let fname = p
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            if fname.ends_with(&suffix) || fname == format!("{raw_id}.jsonl") {
+                if let Some(d) = self.parse(p, &titles, true) {
+                    if d.session.id == want {
+                        return Some(d);
+                    }
+                }
+            }
+        }
+        // Fallback: metadata-only check before full parse for non-standard names.
+        for p in &rollouts {
+            if let Some(meta) = self.parse(p, &titles, false) {
+                if meta.session.id == want {
+                    return self.parse(p, &titles, true);
+                }
+            }
+        }
+        None
     }
 }
 

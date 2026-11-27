@@ -213,6 +213,9 @@ impl AgentReader for RooReader {
         Some(super::hash_files(files.into_iter()))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
+        if !super::is_safe_path_id(raw_id) {
+            return None;
+        }
         for root in &self.roots {
             if root.join("tasks").join(raw_id).is_dir() {
                 return Self::build(root, raw_id, true);

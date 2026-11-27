@@ -87,7 +87,7 @@ impl VsCodeReader {
                 }
             }
         }
-        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.sort_by_key(|a| std::cmp::Reverse(a.0));
         out
     }
 
@@ -399,6 +399,8 @@ fn flush_assistant(
 }
 
 /// `file:///Users/me/proj` → `/Users/me/proj` (best-effort percent-decode).
+/// Decodes raw ASCII hex bytes directly so `%` followed by multi-byte UTF-8
+/// can never panic on a non-char-boundary `&str` slice.
 fn uri_to_path(uri: &str) -> String {
     let raw = uri.strip_prefix("file://").unwrap_or(uri);
     let bytes = raw.as_bytes();
@@ -406,8 +408,8 @@ fn uri_to_path(uri: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
                 i += 3;
                 continue;
             }
@@ -416,6 +418,15 @@ fn uri_to_path(uri: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +440,11 @@ mod tests {
             "/Users/me/my proj"
         );
         assert_eq!(uri_to_path("/plain/path"), "/plain/path");
+        // `%` followed by multi-byte UTF-8 must not panic on a char boundary.
+        assert_eq!(
+            uri_to_path("file:///Users/me/100%é/proj%"),
+            "/Users/me/100%é/proj%"
+        );
     }
 
     #[test]

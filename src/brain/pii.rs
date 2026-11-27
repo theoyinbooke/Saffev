@@ -164,14 +164,14 @@ static RE_ENV_ASSIGN: Lazy<Regex> = Lazy::new(|| {
     .expect("env assignment regex")
 });
 
-/// Quoting in these grammars is PAIRED: the regex crate has no
-/// backreferences, so every quote kind is a spelled-out alternation branch —
-/// a `['"]…['"]` class would let a `"` open and an apostrophe close
-/// (`password_hint: "mother's maiden name"` mangled its span to `"mother'`;
-/// G1 round-8 critic's span-correctness bug). Double-quoted branches accept
-/// backslash escapes (`"hu\"nter99"`), single-quoted stay literal. Because
-/// alternation multiplies capture groups, the claim loop reads captures
-/// positionally: first participating group = key, second = value.
+// Quoting in these grammars is PAIRED: the regex crate has no
+// backreferences, so every quote kind is a spelled-out alternation branch —
+// a `['"]…['"]` class would let a `"` open and an apostrophe close
+// (`password_hint: "mother's maiden name"` mangled its span to `"mother'`;
+// G1 round-8 critic's span-correctness bug). Double-quoted branches accept
+// backslash escapes (`"hu\"nter99"`), single-quoted stay literal. Because
+// alternation multiplies capture groups, the claim loop reads captures
+// positionally: first participating group = key, second = value.
 
 /// JSON / Python-dict member candidate (`"password": "hunter2"`,
 /// `'password': 'hunter2'` — single quotes cover Python dict reprs).
@@ -348,11 +348,7 @@ impl Detector {
         let mut out = Vec::new();
         // Track byte spans already claimed so a higher-precision detector wins
         // over a looser one (e.g. a card or API key is not also a "phone").
-        let mut claimed: Vec<(usize, usize)> = Vec::new();
-
-        let overlaps = |claimed: &[(usize, usize)], s: usize, e: usize| {
-            claimed.iter().any(|&(cs, ce)| s < ce && cs < e)
-        };
+        let mut claimed = ClaimedSpans::new();
 
         // Detector order = claim precedence: the most specific, highest-severity
         // spans claim first so a looser detector can never relabel (or split) a
@@ -369,7 +365,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 2. Credentialed connection strings — before email, or the
@@ -394,7 +390,7 @@ impl Detector {
                     .rev()
                     .take_while(|b| matches!(b, b'.' | b',' | b';' | b'!' | b'?' | b')'))
                     .count();
-            if overlaps(&claimed, whole.start(), end) {
+            if claimed.overlaps(whole.start(), end) {
                 continue;
             }
             out.push(make_finding(
@@ -406,7 +402,7 @@ impl Detector {
                 Confidence::High,
                 &text[whole.start()..end],
             ));
-            claimed.push((whole.start(), end));
+            claimed.insert(whole.start(), end);
         }
         for caps in RE_CONN_KV.captures_iter(text) {
             let (Some(whole), Some(password)) = (caps.get(0), caps.get(1)) else {
@@ -415,7 +411,7 @@ impl Detector {
             if !conn_password_is_real(password.as_str()) {
                 continue;
             }
-            if overlaps(&claimed, whole.start(), whole.end()) {
+            if claimed.overlaps(whole.start(), whole.end()) {
                 continue;
             }
             out.push(make_finding(
@@ -427,7 +423,7 @@ impl Detector {
                 Confidence::High,
                 whole.as_str(),
             ));
-            claimed.push((whole.start(), whole.end()));
+            claimed.insert(whole.start(), whole.end());
         }
 
         // 2b. Config-file credential assignments — shell/.env, JSON, YAML and
@@ -438,10 +434,16 @@ impl Detector {
         //     forms are pooled and offset-sorted first: where two grammars
         //     propose the same text (`KEY="v"` is both shell and TOML), the
         //     first claim wins and the duplicate dies on the overlap check.
-        let mut config_candidates: Vec<(usize, usize, String, String)> = Vec::new();
+        //
+        //     Filter `env_key_is_secret` BEFORE pushing and borrow `&str`
+        //     slices so non-secret JSON fields (like multi-MB `"content"`
+        //     prompts) are never heap-copied or sorted.
+        let mut config_candidates: Vec<(usize, usize, &str, bool)> = Vec::new();
         for m in RE_ENV_ASSIGN.find_iter(text) {
             if let Some((key, value)) = m.as_str().split_once('=') {
-                config_candidates.push((m.start(), m.end(), key.to_string(), value.to_string()));
+                if env_key_is_secret(key) {
+                    config_candidates.push((m.start(), m.end(), value, false));
+                }
             }
         }
         // JSON/rocket spans start at the whole match (the key's opening quote
@@ -474,6 +476,9 @@ impl Detector {
                 let (Some(key), Some(value)) = (participating.next(), participating.next()) else {
                     continue;
                 };
+                if !env_key_is_secret(key.as_str()) {
+                    continue;
+                }
                 // The YAML form is the only grammar whose value is unquoted
                 // free text, which makes line-start prose shape-legal
                 // ("token: expired yesterday" — G1 round-4 critic, three
@@ -489,20 +494,20 @@ impl Detector {
                     continue;
                 }
                 let start = if from_key { key.start() } else { whole.start() };
-                let carried = if quote_wrap {
-                    format!("\"{val}\"")
-                } else {
-                    val.to_string()
-                };
-                config_candidates.push((start, whole.end(), key.as_str().to_string(), carried));
+                config_candidates.push((start, whole.end(), val, quote_wrap));
             }
         }
         config_candidates.sort_by_key(|c| (c.0, c.1));
-        for (start, end, key, value) in config_candidates {
-            if overlaps(&claimed, start, end) {
+        for (start, end, val, quote_wrap) in config_candidates {
+            if claimed.overlaps(start, end) {
                 continue;
             }
-            if !env_key_is_secret(&key) || !env_value_is_real(&value) {
+            let value_ok = if quote_wrap {
+                env_value_is_real(&format!("\"{val}\""))
+            } else {
+                env_value_is_real(val)
+            };
+            if !value_ok {
                 continue;
             }
             // Defer to the more specific secret detectors — but ONLY when the
@@ -512,7 +517,7 @@ impl Detector {
             // prefix defer made both vanish entirely). A real JWT shape or an
             // accepted key keeps its specific label; everything else stays a
             // config credential.
-            let v = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            let v = val.trim().trim_matches(|c| c == '"' || c == '\'');
             if RE_JWT.is_match(v)
                 || RE_API_KEY
                     .find(v)
@@ -529,12 +534,12 @@ impl Detector {
                 Confidence::High,
                 &text[start..end],
             ));
-            claimed.push((start, end));
+            claimed.insert(start, end);
         }
 
         // 3. Email (high-precision structure; filename guard for `img@2x.png`).
         for m in RE_EMAIL.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             let tld = m
@@ -555,7 +560,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 4. API keys (prefix + entropy gate). High precision; claim early so a
@@ -565,7 +570,7 @@ impl Detector {
             if !api_key_accepts(token) {
                 continue;
             }
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             out.push(make_finding(
@@ -577,12 +582,12 @@ impl Detector {
                 Confidence::High,
                 token,
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 5. JWTs (strong `eyJ` prefix, no entropy gate needed).
         for m in RE_JWT.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             out.push(make_finding(
@@ -594,13 +599,13 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 6. IBAN (mod-97 gated) — before cards, whose Luhn gate an IBAN's
         //    digit tail could coincidentally pass.
         for m in RE_IBAN.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if !iban_valid(m.as_str()) {
@@ -615,18 +620,18 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 7. Credit cards (Luhn-validated to cut false positives).
         for m in RE_CARD.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             // A digit run written with a leading `+` is an international phone
             // number, never a card — 13–15 digit phones pass Luhn by luck ~10%
             // of the time (caught by the G1 bench corpus, round 1).
-            if text[..m.start()].chars().next_back() == Some('+') {
+            if text[..m.start()].ends_with('+') {
                 continue;
             }
             // A digit run right after an IBAN-style prefix (`DE89 …`) is a bank
@@ -662,14 +667,14 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 8. SSN (dashed, structurally validated) — before phone, which would
         //    otherwise catch the same span and mislabel it. The dash-less and
         //    spaced forms additionally require explicit SSN context.
         for m in RE_SSN.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if !ssn_valid(m.as_str()) {
@@ -684,10 +689,10 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
         for m in RE_SSN_LOOSE.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if !ssn_context(text, m.start()) {
@@ -706,7 +711,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 9. IPv6 before IPv4 (the v6 grammar may embed a v4 tail). The regex
@@ -721,7 +726,7 @@ impl Detector {
             if !ipv6_boundaries_clean(text, &m) {
                 continue;
             }
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             out.push(make_finding(
@@ -733,7 +738,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 10. IPv4. A dotted quad right after version-context wording
@@ -742,7 +747,7 @@ impl Detector {
         //     round 2. The gate fires on those exact preceding tokens only, so
         //     addresses in prose ("ping 1.2.3.4", "from 1.2.3.4") are untouched.
         for m in RE_IPV4.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if version_context(text, m.start()) {
@@ -757,7 +762,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 11. MAC addresses (after IP: the v6 grammar never matches six hex
@@ -770,7 +775,7 @@ impl Detector {
             if !mac_boundaries_clean(text, &m) {
                 continue;
             }
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             out.push(make_finding(
@@ -782,7 +787,7 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 11b. Crypto wallets — checksum-validated (base58check / bech32
@@ -790,7 +795,7 @@ impl Detector {
         //      (no shape overlap, keep the order explicit), before the loose
         //      phone pattern.
         for m in RE_WALLET.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if !wallet_valid(m.as_str()) {
@@ -805,12 +810,12 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 12. Phone (loosest builtin — runs last, never re-claims a card/IP/key).
         for m in RE_PHONE.find_iter(text) {
-            if overlaps(&claimed, m.start(), m.end()) {
+            if claimed.overlaps(m.start(), m.end()) {
                 continue;
             }
             if !looks_like_phone(text, &m) {
@@ -825,13 +830,13 @@ impl Detector {
                 Confidence::High,
                 m.as_str(),
             ));
-            claimed.push((m.start(), m.end()));
+            claimed.insert(m.start(), m.end());
         }
 
         // 13. Custom user patterns (carry their label + configured confidence).
         for (label, re, conf) in &self.custom {
             for m in re.find_iter(text) {
-                if overlaps(&claimed, m.start(), m.end()) {
+                if m.start() == m.end() || claimed.overlaps(m.start(), m.end()) {
                     continue;
                 }
                 out.push(make_finding(
@@ -843,7 +848,7 @@ impl Detector {
                     *conf,
                     m.as_str(),
                 ));
-                claimed.push((m.start(), m.end()));
+                claimed.insert(m.start(), m.end());
             }
         }
 
@@ -853,12 +858,39 @@ impl Detector {
     }
 }
 
+/// Pairwise-disjoint, start-sorted non-empty byte spans for O(log M) overlap checks.
+struct ClaimedSpans {
+    spans: Vec<(usize, usize)>,
+}
+
+impl ClaimedSpans {
+    fn new() -> Self {
+        Self { spans: Vec::new() }
+    }
+
+    fn overlaps(&self, s: usize, e: usize) -> bool {
+        if s >= e {
+            return false;
+        }
+        let idx = self.spans.partition_point(|&(cs, _)| cs < e);
+        idx > 0 && self.spans[idx - 1].1 > s
+    }
+
+    fn insert(&mut self, s: usize, e: usize) {
+        if s >= e {
+            return;
+        }
+        let idx = self.spans.partition_point(|&(cs, _)| cs < s);
+        self.spans.insert(idx, (s, e));
+    }
+}
+
 /// A MAC match glued to a further separator-plus-hex-pair on either side is a
 /// fragment of a longer group run (`00:11:22:33:44:55:66` would otherwise
 /// yield its first six pairs), not an address.
 fn mac_boundaries_clean(text: &str, m: &regex::Match) -> bool {
-    let after = text[m.end()..].as_bytes();
-    let before = text[..m.start()].as_bytes();
+    let after = &text.as_bytes()[m.end()..];
+    let before = &text.as_bytes()[..m.start()];
     // TWO hex digits after the separator, so `de:ad:be:ef:00:01-eth0` (an
     // interface suffix — 'e' is hex but 't' is not) keeps its MAC while
     // `…:55:66` and `…:8080` (a further group / port digits) read as a
@@ -900,12 +932,54 @@ fn conn_password_is_real(pw: &str) -> bool {
     )
 }
 
+/// Strip a known API-key prefix and return `(body, min_body_len)`.
+///
+/// Using explicit prefix stripping instead of `split(['-', '_']).next_back()`
+/// ensures base64url keys containing `-`/`_` (OpenAI `sk-proj-`, Google `AIza`,
+/// GitLab `glpat-`) and Anthropic `sk-ant-...-xxxxxxAA` keys are not rejected
+/// when a hyphen or underscore happens to fall near the end of the token.
+fn api_key_body(token: &str) -> (&str, usize) {
+    const PREFIXES: &[(&str, usize)] = &[
+        ("sk-ant-api03-", API_KEY_MIN_BODY),
+        ("sk-ant-", API_KEY_MIN_BODY),
+        ("sk-proj-", API_KEY_MIN_BODY),
+        ("github_pat_", API_KEY_MIN_BODY),
+        ("sk_live_", API_KEY_MIN_BODY),
+        ("sk_test_", API_KEY_MIN_BODY),
+        ("rk_live_", API_KEY_MIN_BODY),
+        ("rk_test_", API_KEY_MIN_BODY),
+        ("glpat-", API_KEY_MIN_BODY),
+        ("ghp_", API_KEY_MIN_BODY),
+        ("gho_", API_KEY_MIN_BODY),
+        ("ghu_", API_KEY_MIN_BODY),
+        ("ghs_", API_KEY_MIN_BODY),
+        ("ghr_", API_KEY_MIN_BODY),
+        ("AKIA", API_KEY_MIN_BODY),
+        ("ASIA", API_KEY_MIN_BODY),
+        ("AIza", API_KEY_MIN_BODY),
+        ("xoxb-", 10),
+        ("xoxa-", 10),
+        ("xoxp-", 10),
+        ("xoxr-", 10),
+        ("xoxs-", 10),
+        ("xapp-", 10),
+        ("sk-", API_KEY_MIN_BODY),
+    ];
+    for &(prefix, min_len) in PREFIXES {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return (rest, min_len);
+        }
+    }
+    let body = token.split(['-', '_']).next_back().unwrap_or("");
+    (body, API_KEY_MIN_BODY)
+}
+
 /// Would the API-key detector claim this exact token? Shared by the scan
 /// step and the config-secret deferral check — deferral must only skip when
 /// the hand-off will actually be caught (G1 round-9 critic).
 fn api_key_accepts(token: &str) -> bool {
-    let body_len = token.split(['-', '_']).next_back().map_or(0, str::len);
-    body_len >= API_KEY_MIN_BODY && shannon_entropy(token) >= API_KEY_MIN_ENTROPY
+    let (body, min_len) = api_key_body(token);
+    body.len() >= min_len && shannon_entropy(token) >= API_KEY_MIN_ENTROPY
 }
 
 /// Structural validation for a dashed SSN candidate: area 001–899 excluding
@@ -2978,5 +3052,46 @@ mod tests {
             .find(|f| f.kind == PiiKind::EnvAssignment)
             .expect("yaml secret");
         assert_eq!(&text[m.start..m.end], "smtp_password: hunter2secret99");
+    }
+
+    #[test]
+    fn detects_anthropic_and_hyphenated_base64url_api_keys() {
+        let d = det();
+        // Anthropic key ending with a short hyphen-delimited suffix (`-xK9mQ2AA`).
+        let anthropic = "key=sk-ant-api03-8kL2mN9pQ4rS7tU1vW5xY0zA3bC6dE9fG2hJ5kL8-xK9mQ2AA";
+        let f = d.scan(Side::Request, anthropic);
+        assert!(
+            has_kind(&f, PiiKind::ApiKey),
+            "Anthropic key with short trailing suffix must be detected: {f:?}"
+        );
+
+        // OpenAI project key with `_` / `-` near the end of its base64url body.
+        let openai = "use sk-proj-9aB3cD5eF7gH2jK4mN6pQ8rS0tU_aB-cD1e";
+        let f2 = d.scan(Side::Request, openai);
+        assert!(
+            has_kind(&f2, PiiKind::ApiKey),
+            "base64url sk-proj key with trailing hyphen must be detected: {f2:?}"
+        );
+    }
+
+    #[test]
+    fn zero_length_custom_regex_does_not_break_claimed_spans() {
+        let d = Detector::new(&[
+            crate::config::CustomPattern {
+                name: "empty".into(),
+                regex: "a*".into(),
+                confidence: Confidence::High,
+            },
+            crate::config::CustomPattern {
+                name: "ticket".into(),
+                regex: r"TCK-[0-9]+".into(),
+                confidence: Confidence::High,
+            },
+        ])
+        .unwrap();
+        let f = d.scan(Side::Request, "see TCK-1234 and alice@example.com");
+        assert!(f.iter().all(|x| x.start < x.end), "zero-len findings must be skipped: {f:?}");
+        assert!(has_kind(&f, PiiKind::Email));
+        assert!(f.iter().any(|x| x.label.as_deref() == Some("ticket")));
     }
 }

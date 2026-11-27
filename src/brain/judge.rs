@@ -15,6 +15,7 @@ use super::{JudgeRecord, Score};
 
 /// An async completion backend the judge calls. `brain` never does I/O itself;
 /// the proxy provides an impl pointed at the local engine.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
     /// Return the model's completion for `prompt`, or `None` on any failure
@@ -76,17 +77,40 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Parse the judge's reply into banded scores. Deliberately robust: extracts each
-/// `"key": "value"` field independently with a regex rather than requiring a
-/// complete, valid JSON object. Small "thinking" models often emit a long
-/// reasoning trace and then a JSON blob that gets truncated by the token cap
-/// (`{"relevance":"good","coherence":"good",` with no closing brace) — this still
-/// recovers the bands that ARE present, and drops anything incomplete.
+/// Parse the judge's reply into banded scores. Strips closed `<think>...</think>`
+/// blocks first (so a model echoing the prompt template inside reasoning never
+/// inverts `"good"` into `"weak"`), tries the last complete JSON object first,
+/// and falls back to extracting the *last* `"key": "value"` match per metric so
+/// truncated JSON still recovers completed bands.
 fn parse_scores(reply: &str) -> Vec<Score> {
-    let notes = field_str(reply, "notes").filter(|s| !s.is_empty());
+    let cleaned = strip_think_blocks(reply);
+    let body = cleaned.trim();
+
+    if let Some(v) = extract_last_json_value(body) {
+        let notes = v
+            .get("notes")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mut out = Vec::new();
+        for metric in METRICS {
+            if let Some(band) = v.get(*metric).and_then(|x| x.as_str()) {
+                out.push(Score {
+                    metric: (*metric).to_string(),
+                    band: normalize_band(band),
+                    rationale: notes.clone(),
+                });
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    let notes = field_str(body, "notes").filter(|s| !s.is_empty());
     let mut out = Vec::new();
     for metric in METRICS {
-        if let Some(band) = field_str(reply, metric) {
+        if let Some(band) = field_str(body, metric) {
             out.push(Score {
                 metric: (*metric).to_string(),
                 band: normalize_band(&band),
@@ -97,14 +121,69 @@ fn parse_scores(reply: &str) -> Vec<Score> {
     out
 }
 
-/// Extract a `"key": "value"` string field from possibly-partial JSON / prose.
-/// Case-insensitive on the key; value must be a *complete* quoted string.
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(start) = out.find("<think>") {
+        if let Some(rel_end) = out[start..].find("</think>") {
+            let end = start + rel_end + "</think>".len();
+            out.replace_range(start..end, "");
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn extract_last_json_value(s: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    let end = s.rfind('}')?;
+    let prefix = &s[..=end];
+    let bytes = prefix.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b'"' {
+            let mut bs = 0usize;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'\\' {
+                bs += 1;
+                j -= 1;
+            }
+            if bs % 2 == 0 {
+                in_str = !in_str;
+            }
+        } else if !in_str {
+            if b == b'}' {
+                depth += 1;
+            } else if b == b'{' {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str::<serde_json::Value>(&prefix[i..=end])
+                        .ok()
+                        .filter(|v| v.is_object());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the *last* `"key": "value"` string field from possibly-partial JSON
+/// or prose. Case-insensitive on the key; handles escaped quotes inside values.
 fn field_str(s: &str, key: &str) -> Option<String> {
-    let pat = format!(r#"(?i)"{}"\s*:\s*"([^"]*)""#, regex::escape(key));
+    let pat = format!(r#"(?i)"{}"\s*:\s*"((?:\\.|[^"\\])*)""#, regex::escape(key));
     let re = regex::Regex::new(&pat).ok()?;
-    re.captures(s)
+    re.captures_iter(s)
+        .last()
         .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
+        .map(|m| m.as_str().replace("\\\"", "\"").trim().to_string())
 }
 
 /// Collapse a free-text band into the canonical `good` / `weak` set.
@@ -201,5 +280,16 @@ mod tests {
         let backend = Canned(None);
         let scores = futures::executor::block_on(RubricJudge::evaluate(&backend, &rec()));
         assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn parse_scores_ignores_think_template_echo_and_handles_escaped_quotes() {
+        let reply = r#"<think>Format is {"relevance":"good|weak","coherence":"good|weak","notes":"<= 12 words"}</think>
+{"relevance":"good","coherence":"good","notes":"answered \"cleanly\""}"#;
+        let scores = parse_scores(reply);
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].band, "good");
+        assert_eq!(scores[1].band, "good");
+        assert_eq!(scores[0].rationale.as_deref(), Some("answered \"cleanly\""));
     }
 }

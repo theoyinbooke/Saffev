@@ -30,7 +30,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -51,12 +51,21 @@ const MAX_DIRS: usize = 20_000;
 /// its fd limit. Fixture readers (`with_roots`) don't memoize.
 const WALK_MEMO_TTL: Duration = Duration::from_secs(60);
 
+type WalkMemoMap = std::collections::HashMap<Vec<PathBuf>, (Instant, Vec<PathBuf>)>;
+
+/// Process-wide walk memo keyed by configured roots so repeated `AiderReader::new()`
+/// calls (from Studio polls and `all_sessions` / `tool_stats`) share the 60s cache
+/// instead of re-walking `$HOME` on every request.
+fn global_walk_memo() -> &'static Mutex<WalkMemoMap> {
+    static MEMO: OnceLock<Mutex<WalkMemoMap>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(WalkMemoMap::new()))
+}
+
 /// Reads Aider's per-project markdown transcripts.
 pub struct AiderReader {
     /// Directories to walk for `.aider.chat.history.md` files.
     roots: Vec<PathBuf>,
-    /// Last walk result + when it was taken; `None` TTL = never memoize.
-    walk_memo: Mutex<Option<(Instant, Vec<PathBuf>)>>,
+    /// Memo TTL; `None` = never memoize (used by fixture readers `with_roots`).
     memo_ttl: Option<Duration>,
 }
 
@@ -65,7 +74,6 @@ impl AiderReader {
     pub fn with_roots(roots: Vec<PathBuf>) -> Self {
         Self {
             roots,
-            walk_memo: Mutex::new(None),
             memo_ttl: None,
         }
     }
@@ -79,7 +87,6 @@ impl AiderReader {
         }
         Self {
             roots,
-            walk_memo: Mutex::new(None),
             memo_ttl: Some(WALK_MEMO_TTL),
         }
     }
@@ -87,8 +94,8 @@ impl AiderReader {
     /// All `.aider.chat.history.md` files under the roots (bounded walk).
     fn history_files(&self) -> Vec<PathBuf> {
         if let Some(ttl) = self.memo_ttl {
-            if let Ok(memo) = self.walk_memo.lock() {
-                if let Some((at, files)) = memo.as_ref() {
+            if let Ok(memo) = global_walk_memo().lock() {
+                if let Some((at, files)) = memo.get(&self.roots) {
                     if at.elapsed() < ttl {
                         return files.clone();
                     }
@@ -104,8 +111,8 @@ impl AiderReader {
             walk(root, 0, *root == home_dir, &mut visited, &mut out);
         }
         if self.memo_ttl.is_some() {
-            if let Ok(mut memo) = self.walk_memo.lock() {
-                *memo = Some((Instant::now(), out.clone()));
+            if let Ok(mut memo) = global_walk_memo().lock() {
+                memo.insert(self.roots.clone(), (Instant::now(), out.clone()));
             }
         }
         out
@@ -420,9 +427,12 @@ fn walk(dir: &Path, depth: u8, fence_home: bool, visited: &mut usize, out: &mut 
     *visited += 1;
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
-        let p = e.path();
+        // Use `file_type()` (does not follow symlinks): avoids extra `stat()`
+        // calls and prevents symlinks from escaping the protected-folder fence
+        // or creating directory cycles.
+        let Ok(ft) = e.file_type() else { continue };
         let name = e.file_name().to_string_lossy().to_string();
-        if p.is_dir() {
+        if ft.is_dir() {
             if name.starts_with('.')
                 || matches!(
                     name.as_str(),
@@ -433,9 +443,9 @@ fn walk(dir: &Path, depth: u8, fence_home: bool, visited: &mut usize, out: &mut 
             {
                 continue;
             }
-            walk(&p, depth + 1, fence_home, visited, out);
-        } else if name == ".aider.chat.history.md" {
-            out.push(p);
+            walk(&e.path(), depth + 1, fence_home, visited, out);
+        } else if ft.is_file() && name == ".aider.chat.history.md" {
+            out.push(e.path());
         }
     }
 }

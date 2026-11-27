@@ -85,6 +85,14 @@ impl StudioServer {
     /// every subsequent `fetch`. The passthrough proxy is an entirely separate
     /// server (port 11434) and is never gated here.
     pub fn router(&self) -> Router {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.router_with_shutdown(rx)
+    }
+
+    /// Build the router wired with a shutdown watch receiver so open SSE
+    /// streams (`/api/stream`) close immediately on graceful shutdown rather
+    /// than stalling `axum::serve` until the drain timeout expires.
+    fn router_with_shutdown(&self, shutdown_rx: tokio::sync::watch::Receiver<bool>) -> Router {
         // Studio port is read once when the router/CORS layer is built — ports are
         // not hot-reloadable (they would rebind the listener), so the startup
         // snapshot is authoritative here.
@@ -135,25 +143,22 @@ impl StudioServer {
             .route("/backup", post(api::backup_run))
             .route("/archive/audit", post(api::archive_audit))
             .route("/stream", get(api::stream))
-            // Order matters: layers run outermost-first on the way in. We want
-            // Host checked first (cheapest reject), then token, then CORS
-            // handling on the response. `layer` stacks so the LAST `.layer`
-            // added is the OUTERMOST. So add token (inner) then host (outer).
+            .layer(axum::Extension(shutdown_rx))
+            // Order matters: layers run outermost-first on the way in. `require_host`
+            // is applied at the top-level router below so BOTH `/api/*` and the
+            // token-injecting static SPA/menubar fallback enforce the Host allowlist.
             .layer(axum::middleware::from_fn_with_state(
                 self.state.clone(),
                 auth::require_token,
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                self.state.clone(),
-                auth::require_host,
             ))
             .layer(auth::cors_layer(studio_port))
             .with_state(self.state.clone());
 
         // The SPA fallback serves embedded assets for everything that is not
-        // `/api/*`. The served `index.html` gets the per-install token injected
-        // (so opening the loopback URL self-authenticates); all other assets are
-        // served as-is. The token is captured by the fallback closure.
+        // `/api/*`. The served `index.html` / `menubar.html` get the per-install
+        // token injected (so opening the loopback URL self-authenticates); all
+        // other assets are served as-is. Gated by `require_host` so a DNS-rebound
+        // or foreign Host header can never retrieve the injected bearer token.
         let token = self.state.token.clone();
         Router::new()
             .nest("/api", api)
@@ -161,6 +166,10 @@ impl StudioServer {
                 let token = token.clone();
                 async move { assets::serve(uri, token).await }
             })
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                auth::require_host,
+            ))
     }
 
     /// Bind to the configured Studio port and serve until the process is killed.
@@ -184,7 +193,8 @@ impl StudioServer {
         let cfg = self.state.config.load();
         let addr = SocketAddr::new(cfg.ports.bind, cfg.ports.studio);
         drop(cfg);
-        let router = self.router();
+        let (sse_shutdown_tx, sse_shutdown_rx) = tokio::sync::watch::channel(false);
+        let router = self.router_with_shutdown(sse_shutdown_rx);
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -202,8 +212,12 @@ impl StudioServer {
         // Scheduled backups (`[backup] auto`): same lifetime as the others.
         let backups = spawn_backup_scheduler(self.state.clone());
 
+        let graceful = async move {
+            shutdown.await;
+            let _ = sse_shutdown_tx.send(true);
+        };
         let served = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(graceful)
             .await;
         scheduler.abort();
         monitors.abort();
@@ -385,24 +399,33 @@ fn spawn_monitor_scheduler(state: StudioState) -> tokio::task::JoinHandle<()> {
                 crate::config::Mode::Gateway => cfg.ports.shadow,
                 crate::config::Mode::Cooperative => cfg.ports.upstream,
             };
+            // Only pass an exposure verdict when a listener was actually
+            // observed (`bound_to.is_some()`), so transient probe failures or
+            // brief engine restarts map to `None` instead of fake flips.
             let exposed = crate::exposure::check(engine_port)
                 .await
                 .ok()
+                .filter(|r| r.bound_to.is_some())
                 .map(|r| r.exposed);
 
-            // Today's spend (G3): blocking JSONL reads, kept off the reactor.
-            let pricing = cfg.pricing.clone();
-            let spend = tokio::task::spawn_blocking(move || {
-                crate::signals::spend_today(
-                    &pricing,
-                    &crate::agents::usage::default_claude_projects_dir(),
-                    crate::agents::now_ms(),
-                )
-            })
-            .await
-            .unwrap_or(None);
-
             let mut mon_state = crate::signals::MonitorState::load(&state.store).await;
+
+            // Today's spend (G3): skip if already fired & deduped for today.
+            let spend = if crate::signals::spend_already_fired_today(&mon_state, now_ms) {
+                None
+            } else {
+                let pricing = cfg.pricing.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::signals::spend_today(
+                        &pricing,
+                        &crate::agents::usage::default_claude_projects_dir(),
+                        now_ms,
+                    )
+                })
+                .await
+                .unwrap_or(None)
+            };
+
             // Preservation gap (rule 6): computed at most once per UTC day
             // (recorded in the state); fail-soft to None inside.
             let at_risk =
@@ -458,7 +481,7 @@ mod tests {
 
     #[test]
     fn stream_channel_capacity_is_sane() {
-        assert!(STREAM_CHANNEL_CAPACITY >= 256);
+        const { assert!(STREAM_CHANNEL_CAPACITY >= 256) };
     }
 
     #[test]

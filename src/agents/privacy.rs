@@ -308,18 +308,22 @@ async fn scan_incremental(
             .map(|r| (r.session_id.clone(), r))
             .collect();
         if let Ok(mut guard) = session_scans().lock() {
-            let hashes: std::collections::HashMap<&str, &str> = sessions
-                .iter()
-                .map(|s| (s.id.as_str(), s.content_hash.as_str()))
-                .collect();
-            for id in stale {
-                let hash = hashes
-                    .get(id.as_str())
-                    .copied()
-                    .unwrap_or_default()
-                    .to_string();
-                let row = by_id.remove(&id);
-                guard.1.insert(id, (hash, row));
+            // Only write results back if the detector config hasn't changed
+            // while the async scan was in flight.
+            if guard.0 == detector_sig {
+                let hashes: std::collections::HashMap<&str, &str> = sessions
+                    .iter()
+                    .map(|s| (s.id.as_str(), s.content_hash.as_str()))
+                    .collect();
+                for id in stale {
+                    let hash = hashes
+                        .get(id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string();
+                    let row = by_id.remove(&id);
+                    guard.1.insert(id, (hash, row));
+                }
             }
         }
     }
@@ -356,6 +360,7 @@ pub fn detector_signature(custom: &[crate::config::CustomPattern]) -> u64 {
     for p in custom {
         p.name.hash(&mut h);
         p.regex.hash(&mut h);
+        std::mem::discriminant(&p.confidence).hash(&mut h);
     }
     custom.len().hash(&mut h);
     h.finish()
@@ -395,9 +400,13 @@ pub async fn report(store: &Store, cfg: &crate::config::Config, range_ms: i64) -
     };
     let rows = scan_incremental(store, std::sync::Arc::new(detector), key.detector, since_ts).await;
 
+    let total_sessions = tokio::task::spawn_blocking(super::all_sessions)
+        .await
+        .map(|s| s.len() as u32)
+        .unwrap_or(0);
     let coverage = Coverage {
         preserved: stats.count as u32,
-        total: super::all_sessions().len() as u32,
+        total: total_sessions,
     };
     let report = aggregate(&rows, range_ms, coverage);
 

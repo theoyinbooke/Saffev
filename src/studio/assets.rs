@@ -73,28 +73,38 @@ fn serve_embedded(path: &str, token: &str) -> Option<Response> {
     let asset = StudioAssets::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
 
-    let body = if TOKEN_SHELLS.contains(&path) {
+    let is_shell = TOKEN_SHELLS.contains(&path);
+    let body = if is_shell {
         let html = String::from_utf8_lossy(&asset.data);
         Body::from(inject_token(&html, token))
     } else {
         Body::from(asset.data.into_owned())
     };
 
-    let resp = Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
         // The shell carries a per-install secret; never let an intermediary cache it.
-        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CACHE_CONTROL, "no-store");
+    if is_shell {
+        // Prevent clickjacking of the self-authenticated Studio/menubar shells.
+        builder = builder
+            .header(header::X_FRAME_OPTIONS, "DENY")
+            .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'");
+    }
+    let resp = builder
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     Some(resp)
 }
 
 /// Insert `<script>window.__SAFFEV_TOKEN__=...;</script>` just before `</head>`
-/// (or prepend it if there is no head). The token is JSON-encoded for safe JS
-/// string escaping.
+/// (or prepend it if there is no head). The token is JSON-encoded with `<`
+/// escaped so it can never break out of the `<script>` tag.
 fn inject_token(html: &str, token: &str) -> String {
-    let encoded = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    let encoded = serde_json::to_string(token)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
     let snippet = format!("<script>window.__SAFFEV_TOKEN__={encoded};</script>");
     if let Some(idx) = html.find("</head>") {
         let mut out = String::with_capacity(html.len() + snippet.len());
@@ -292,5 +302,30 @@ mod tests {
             css.contains("font-display: swap") || css.contains("font-display:swap"),
             "fonts.css should use font-display: swap"
         );
+    }
+
+    #[tokio::test]
+    async fn token_shells_set_anti_framing_headers_and_escape_script_close() {
+        let evil_tok: Arc<str> = Arc::from("tok</script><img src=x>");
+        for path in ["/", "/menubar.html"] {
+            let resp = serve(path.parse::<Uri>().unwrap(), evil_tok.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::X_FRAME_OPTIONS).and_then(|v| v.to_str().ok()),
+                Some("DENY")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("frame-ancestors 'none'")
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&bytes);
+            assert!(!html.contains("tok</script>"));
+            assert!(html.contains(r"\u003c/script>"));
+        }
     }
 }

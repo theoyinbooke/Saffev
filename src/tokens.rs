@@ -72,17 +72,33 @@ pub fn extract_usage(body: &[u8]) -> (Option<TokenCount>, Option<TokenCount>) {
     scan_text(text)
 }
 
-/// Scan a (possibly multi-line / SSE) body for the last usage record.
+/// Scan a (possibly multi-line / pretty-printed / SSE) body for the last usage record.
 fn scan_text(text: &str) -> (Option<TokenCount>, Option<TokenCount>) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+
+    // Fast path for single-document JSON responses (including pretty-printed
+    // multi-line JSON from LM Studio / llama-server).
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let (i, o) = parse_usage_object(&value);
+            return (i.map(TokenCount::exact), o.map(TokenCount::exact));
+        }
+    }
+
+    // Streaming NDJSON / SSE: scan in reverse because cumulative usage rides on
+    // the terminal frame(s), and pre-filter lines lacking usage keys to skip
+    // parsing thousands of token-delta JSON frames.
     let mut input: Option<u32> = None;
     let mut output: Option<u32> = None;
 
-    for raw_line in text.lines() {
+    for raw_line in text.lines().rev() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
-        // SSE framing: payload rides on `data: {...}` lines; `[DONE]` is a sentinel.
         let json_str = match line.strip_prefix("data:") {
             Some(rest) => {
                 let rest = rest.trim();
@@ -93,21 +109,20 @@ fn scan_text(text: &str) -> (Option<TokenCount>, Option<TokenCount>) {
             }
             None => line,
         };
+        if !json_str.contains("usage") && !json_str.contains("eval_count") {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
             continue;
         };
-        // Later records win (terminal/cumulative usage), so overwrite when found.
-        if let (Some(i), Some(o)) = parse_usage_object(&value) {
-            input = Some(i);
-            output = Some(o);
-        } else {
-            // Allow one-sided presence (some engines report only one side).
-            if let Some(i) = ollama_or_openai_input(&value) {
-                input = Some(i);
-            }
-            if let Some(o) = ollama_or_openai_output(&value) {
-                output = Some(o);
-            }
+        if input.is_none() {
+            input = ollama_or_openai_input(&value);
+        }
+        if output.is_none() {
+            output = ollama_or_openai_output(&value);
+        }
+        if input.is_some() && output.is_some() {
+            break;
         }
     }
 
@@ -183,20 +198,39 @@ fn heuristic_token_estimate(text: &str) -> u32 {
 }
 
 /// Concatenate the **prompt** text from a request body, for estimation when the
-/// engine did not report input usage. Handles chat (`messages[].content`) and
-/// completion (`prompt`) shapes across Ollama and OpenAI. Best-effort: an unknown
-/// shape yields `""` (→ 0 tokens), never an error.
+/// engine did not report input usage. Handles chat (`messages[].content`, both
+/// plain string and OpenAI content-part arrays), Ollama top-level `system`, and
+/// completion (`prompt`) shapes across Ollama and OpenAI. Best-effort: an
+/// unknown shape yields `""` (→ 0 tokens), never an error.
 pub fn extract_prompt_text(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return String::new();
     };
+    extract_prompt_text_from_value(&v)
+}
+
+/// Extract prompt text from an already-parsed request JSON [`serde_json::Value`],
+/// avoiding redundant JSON DOM parses when the caller already parsed the body.
+pub fn extract_prompt_text_from_value(v: &serde_json::Value) -> String {
     let mut out = String::new();
-    // Chat: messages: [{ role, content }].
+    // Ollama `/api/generate` top-level system prompt.
+    if let Some(sys) = v.get("system").and_then(|s| s.as_str()) {
+        push_sep(&mut out, sys);
+    }
+    // Chat: messages: [{ role, content }] (string OR OpenAI array-of-parts).
     if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
-            if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
-                push_sep(&mut out, c);
+            match m.get("content") {
+                Some(serde_json::Value::String(c)) => push_sep(&mut out, c),
+                Some(serde_json::Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            push_sep(&mut out, t);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -216,11 +250,23 @@ pub fn extract_prompt_text(body: &[u8]) -> String {
 }
 
 /// Concatenate the **generated** text from a response body, for estimation when
-/// the engine did not report output usage. Handles non-streamed and streamed
-/// (NDJSON / SSE) Ollama and OpenAI shapes. Best-effort.
+/// the engine did not report output usage. Handles non-streamed (including
+/// pretty-printed multi-line JSON) and streamed (NDJSON / SSE) Ollama and
+/// OpenAI shapes. Best-effort.
 pub fn extract_completion_text(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
     let mut out = String::new();
+    // Single-document JSON (e.g. pretty-printed non-streaming response).
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            append_completion_from(&v, &mut out);
+            return out;
+        }
+    }
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
@@ -441,5 +487,25 @@ data: [DONE]\n\n";
             TokenCount::estimated(5).source,
             TokenSource::Estimated
         ));
+    }
+
+    #[test]
+    fn handles_pretty_printed_json_and_array_form_prompt_content() {
+        let pretty = br#"{
+  "choices": [
+    { "message": { "content": "pretty reply" } }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 22
+  }
+}"#;
+        let (i, o) = extract_usage(pretty);
+        assert_eq!(i.map(|c| c.value), Some(11));
+        assert_eq!(o.map(|c| c.value), Some(22));
+        assert_eq!(extract_completion_text(pretty), "pretty reply");
+
+        let req = br#"{"system":"be terse","messages":[{"role":"user","content":[{"type":"text","text":"part one"},{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"part two"}]}]}"#;
+        assert_eq!(extract_prompt_text(req), "be terse part one part two");
     }
 }

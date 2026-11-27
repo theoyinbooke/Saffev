@@ -32,6 +32,7 @@ use crate::Result;
 
 /// The exposure verdict surfaced first-run in Studio + CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExposureReport {
     /// Whether the engine is reachable from a non-loopback interface.
     pub exposed: bool,
@@ -137,6 +138,13 @@ fn classify_addr(ip: IpAddr) -> Binding {
             }
         }
         IpAddr::V6(v6) => {
+            // Dual-stack sockets on macOS/Linux often surface IPv4 binds as
+            // IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`, `::ffff:0.0.0.0`).
+            // Unmap them before classifying so loopback isn't misflagged as
+            // a public LAN address.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return classify_addr(IpAddr::V4(v4));
+            }
             if v6.is_unspecified() {
                 Binding::Wildcard
             } else if v6.is_loopback() {
@@ -153,15 +161,11 @@ fn classify_addr(ip: IpAddr) -> Binding {
 /// address, the port is exposed. Loopback wins only when every listener is
 /// loopback. Blocking; call from `spawn_blocking`.
 fn binding_for_port(port: u16) -> Binding {
-    let addrs = listening_addrs_for_port(port);
+    let Some(addrs) = listening_addrs_for_port(port) else {
+        return Binding::Unknown;
+    };
     if addrs.is_empty() {
-        // Distinguish "couldn't read the table" (Unknown) from "read it, nothing
-        // there" (NotListening). On platforms with no probe we return Unknown.
-        return if can_probe() {
-            Binding::NotListening
-        } else {
-            Binding::Unknown
-        };
+        return Binding::NotListening;
     }
 
     // Fold to the worst case: Wildcard > PublicAddr > Loopback.
@@ -176,32 +180,35 @@ fn binding_for_port(port: u16) -> Binding {
     worst
 }
 
-/// Whether this build has a real socket-table probe for the current OS.
-fn can_probe() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
-}
-
 // ---------------------------------------------------------------------------
 // Linux: read /proc/net/tcp + tcp6 directly (no subprocess).
 // ---------------------------------------------------------------------------
 
-/// Return every local IP that has a *listening* socket on `port`.
+/// Return every local IP that has a *listening* socket on `port`, or `None` if
+/// neither `/proc/net/tcp` nor `/proc/net/tcp6` could be read.
 #[cfg(target_os = "linux")]
-fn listening_addrs_for_port(port: u16) -> Vec<IpAddr> {
+fn listening_addrs_for_port(port: u16) -> Option<Vec<IpAddr>> {
+    let v4 = proc_net_listeners("/proc/net/tcp", port, false);
+    let v6 = proc_net_listeners("/proc/net/tcp6", port, true);
+    if v4.is_none() && v6.is_none() {
+        return None;
+    }
     let mut out = Vec::new();
-    out.extend(proc_net_listeners("/proc/net/tcp", port, false));
-    out.extend(proc_net_listeners("/proc/net/tcp6", port, true));
-    out
+    if let Some(a) = v4 {
+        out.extend(a);
+    }
+    if let Some(a) = v6 {
+        out.extend(a);
+    }
+    Some(out)
 }
 
 /// Parse a `/proc/net/tcp[6]` table for listening sockets (state `0A`) on `port`.
 #[cfg(target_os = "linux")]
-fn proc_net_listeners(path: &str, port: u16, v6: bool) -> Vec<IpAddr> {
+fn proc_net_listeners(path: &str, port: u16, v6: bool) -> Option<Vec<IpAddr>> {
     use std::net::Ipv4Addr;
 
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
+    let contents = std::fs::read_to_string(path).ok()?;
     let mut out = Vec::new();
     for line in contents.lines().skip(1) {
         let mut fields = line.split_whitespace();
@@ -242,7 +249,7 @@ fn proc_net_listeners(path: &str, port: u16, v6: bool) -> Vec<IpAddr> {
             out.push(ip);
         }
     }
-    out
+    Some(out)
 }
 
 /// Parse the 32-hex-char little-endian-per-word IPv6 form in `/proc/net/tcp6`.
@@ -267,22 +274,60 @@ fn parse_hex_ipv6(hex: &str) -> Option<std::net::Ipv6Addr> {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn listening_addrs_for_port(port: u16) -> Vec<IpAddr> {
-    use std::process::Command;
+fn listening_addrs_for_port(port: u16) -> Option<Vec<IpAddr>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     // -nP: no name/port resolution; -iTCP:<port> -sTCP:LISTEN: listening sockets
     // on this port; -Fn: terse, one field ('n' = name/address) per line.
-    let output = Command::new("lsof")
+    let mut child = Command::new("lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fn"])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() && output.stdout.is_empty() {
-        return Vec::new();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut buf);
+                }
+                if !status.success() && buf.is_empty() {
+                    // `lsof` exits 1 when no sockets match; distinguish from
+                    // another-UID daemon by probing TCP connect on loopback.
+                    if std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                        Duration::from_millis(120),
+                    )
+                    .is_ok()
+                    {
+                        return None; // listening under another UID -> Unknown
+                    }
+                    return Some(Vec::new());
+                }
+                let text = String::from_utf8_lossy(&buf);
+                return Some(parse_lsof_names(&text, port));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_lsof_names(&text, port)
 }
 
 /// Parse lsof `-Fn` output lines (`n<addr>:<port>` or `n*:<port>`) into bind IPs.
@@ -314,7 +359,9 @@ fn parse_lsof_names(text: &str, port: u16) -> Vec<IpAddr> {
             // lsof renders the unspecified address as '*'.
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         } else if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-            inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+            // Strip optional macOS link-local zone suffix (`fe80::1%en0`).
+            let stripped = inner.split('%').next().unwrap_or(inner);
+            stripped.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
         } else {
             host.parse::<IpAddr>().ok()
         };
@@ -330,8 +377,8 @@ fn parse_lsof_names(text: &str, port: u16) -> Vec<IpAddr> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(unix))]
-fn listening_addrs_for_port(_port: u16) -> Vec<IpAddr> {
-    Vec::new()
+fn listening_addrs_for_port(_port: u16) -> Option<Vec<IpAddr>> {
+    None
 }
 
 /// Apply the one-click fix: rebind the engine to localhost and/or enable the
@@ -439,6 +486,21 @@ mod tests {
             classify_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Binding::Loopback
         );
+        // IPv4-mapped IPv6 addresses must classify by their mapped IPv4 value.
+        let mapped_loopback: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(classify_addr(IpAddr::V6(mapped_loopback)), Binding::Loopback);
+        let mapped_any: Ipv6Addr = "::ffff:0.0.0.0".parse().unwrap();
+        assert_eq!(classify_addr(IpAddr::V6(mapped_any)), Binding::Wildcard);
+    }
+
+    #[test]
+    fn exposure_report_serializes_camel_case() {
+        let r = classify_binding(11434, &Binding::Wildcard, true);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["boundTo"], "0.0.0.0:11434");
+        assert_eq!(v["tokenProtected"], true);
+        assert!(v.get("bound_to").is_none());
+        assert!(v.get("token_protected").is_none());
     }
 
     #[test]
@@ -505,6 +567,12 @@ mod tests {
         fn ignores_non_n_lines() {
             let out = parse_lsof_names("p1234\ncollama\nf3\n", 11434);
             assert!(out.is_empty());
+        }
+
+        #[test]
+        fn parses_scoped_ipv6() {
+            let out = parse_lsof_names("n[fe80::1%en0]:11434\n", 11434);
+            assert_eq!(out, vec![IpAddr::V6("fe80::1".parse().unwrap())]);
         }
     }
 

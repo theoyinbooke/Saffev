@@ -190,8 +190,18 @@ pub(crate) fn parse<S: LineState>(
         feed_bytes(&mut state, &buf);
     }
 
-    // Remember the state at the last complete line (only if a full line was
-    // ever seen — an empty or all-partial file is cheap to re-read).
+    // Remember the state at the last complete line only when a full line was
+    // seen AND the state fits within the cache budget — avoids deep-cloning
+    // oversized (64+ MB) transcript states only to immediately discard them.
+    let weight = state.weight();
+    let can_cache = offset > 0 && weight <= BUDGET_BYTES;
+    if !can_cache {
+        if let Some(frag) = &partial {
+            feed_bytes(&mut state, frag);
+        }
+        return Some(state);
+    }
+
     let answer = match &partial {
         Some(frag) => {
             let mut out = state.clone();
@@ -200,22 +210,22 @@ pub(crate) fn parse<S: LineState>(
         }
         None => state.clone(),
     };
-    if offset > 0 {
-        let guard = read_guard(path, offset);
-        let weight = state.weight();
-        if let (Some(guard), Ok(mut c)) = (guard, cache().lock()) {
-            c.put(
-                key,
-                Entry {
-                    id,
-                    offset,
-                    guard,
-                    state: Box::new(state),
-                    weight,
-                    used: Instant::now(),
-                },
-            );
-        }
+    // Reuse the already-open file handle to read guard bytes (avoids a second
+    // open() syscall and TOCTOU races if the file is atomically replaced).
+    let mut file = reader.into_inner();
+    let guard = read_guard_from(&mut file, offset);
+    if let (Some(guard), Ok(mut c)) = (guard, cache().lock()) {
+        c.put(
+            key,
+            Entry {
+                id,
+                offset,
+                guard,
+                state: Box::new(state),
+                weight,
+                used: Instant::now(),
+            },
+        );
     }
     Some(answer)
 }
@@ -235,8 +245,7 @@ fn feed_bytes<S: LineState>(state: &mut S, raw: &[u8]) {
     }
 }
 
-fn read_guard(path: &Path, offset: u64) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
+fn read_guard_from(f: &mut std::fs::File, offset: u64) -> Option<Vec<u8>> {
     let from = offset.saturating_sub(GUARD_BYTES);
     f.seek(SeekFrom::Start(from)).ok()?;
     let mut g = vec![0u8; (offset - from) as usize];

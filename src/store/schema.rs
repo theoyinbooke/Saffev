@@ -275,6 +275,37 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_safety_ts ON safety_findings(ts);
     CREATE INDEX IF NOT EXISTS idx_eval_ts ON eval_scores(ts);
     "#,
+    // --- v11: unique index on `responses(request_id)` ---
+    //
+    // `responses` had no primary key or index, so every write did a full table
+    // scan DELETE + INSERT, every history join scanned `responses`, and delta
+    // backup/restore could duplicate rows when rowids shifted. Dedupe to the
+    // newest row per request_id and enforce uniqueness for atomic upserts.
+    r#"
+    DELETE FROM responses WHERE rowid NOT IN (
+        SELECT MAX(rowid) FROM responses GROUP BY request_id
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_request_id ON responses(request_id);
+    "#,
+    // --- v12: denormalized archive `content_bytes` + hot-path indexes ---
+    //
+    // `archive_stats()` used to SUM(LENGTH(content)) over `archived_messages`,
+    // decrypting the whole transcript table whenever a live session re-archived.
+    // Storing `content_bytes` per session makes `archive_stats()` an O(sessions)
+    // metadata aggregate. Also index `archived_sessions(archived_ts)`,
+    // `requests(ts, id)` (covering window joins/counts), and failed responses.
+    r#"
+    ALTER TABLE archived_sessions ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0;
+    UPDATE archived_sessions
+      SET content_bytes = COALESCE(
+        (SELECT SUM(LENGTH(CAST(content AS BLOB))) FROM archived_messages WHERE session_id = archived_sessions.id),
+        0
+      );
+    CREATE INDEX IF NOT EXISTS idx_archived_archived_ts ON archived_sessions(archived_ts);
+    CREATE INDEX IF NOT EXISTS idx_requests_ts_id ON requests(ts, id);
+    CREATE INDEX IF NOT EXISTS idx_responses_failed ON responses(request_id)
+      WHERE error_kind IS NOT NULL OR status >= 400;
+    "#,
 ];
 
 /// Apply WAL + pragmas and run any outstanding migrations against `conn`.
@@ -285,9 +316,10 @@ pub const MIGRATIONS: &[&str] = &[
 /// metadata/payload split stays referentially honest.
 ///
 /// Migrations are gated by `PRAGMA user_version`: each entry in [`MIGRATIONS`]
-/// not yet applied (index `>= current_version`) is executed inside a transaction
-/// and `user_version` is bumped to match. This is idempotent — re-opening an
-/// up-to-date DB is a no-op.
+/// not yet applied (index `>= current_version`) is executed inside a
+/// `BEGIN IMMEDIATE` write lock (re-checking `user_version` inside the lock so
+/// concurrent openers cannot race on DDL) and `user_version` is bumped to match.
+/// This is idempotent — re-opening an up-to-date DB is a no-op.
 pub fn migrate(conn: &Connection) -> Result<()> {
     // WAL + NORMAL: durable enough, never blocks the writer on fsync per-row.
     // `query_row` because `journal_mode` returns the resulting mode as a row.
@@ -295,26 +327,38 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
+    let target = target_version();
     let current: u32 =
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? as u32;
-    let target = target_version();
-
     if current >= target {
         return Ok(());
     }
 
-    for (idx, ddl) in MIGRATIONS.iter().enumerate() {
-        let version = idx as u32 + 1;
-        if version <= current {
-            continue;
+    // Acquire a write lock and re-read `user_version` so two processes opening
+    // the same DB concurrently never execute the same non-idempotent DDL twice.
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let res = (|| -> Result<()> {
+        let locked_current: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? as u32;
+        for (idx, ddl) in MIGRATIONS.iter().enumerate() {
+            let version = idx as u32 + 1;
+            if version <= locked_current {
+                continue;
+            }
+            conn.execute_batch(&format!("{ddl}; PRAGMA user_version = {version};"))?;
         }
-        // Each migration is one batch of statements applied atomically.
-        conn.execute_batch(&format!(
-            "BEGIN; {ddl}; PRAGMA user_version = {version}; COMMIT;"
-        ))?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
-
-    Ok(())
 }
 
 /// Current target schema version ([`MIGRATIONS`] length).

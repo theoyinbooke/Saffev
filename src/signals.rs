@@ -224,17 +224,21 @@ pub async fn evaluate(
     let mut out = Vec::new();
 
     // One bounded read serves the three history-backed rules. Fail-soft: a
-    // read error means "no rows this tick", never a dead monitor loop.
-    let rows = store
+    // read error skips seeding `initialized` so we never fire false "new app"
+    // alerts on the next healthy tick.
+    let (rows, history_ok) = match store
         .history(HistoryQuery {
             limit: Some(HISTORY_SCAN_LIMIT),
             ..HistoryQuery::default()
         })
         .await
-        .unwrap_or_else(|e| {
+    {
+        Ok(r) => (r, true),
+        Err(e) => {
             tracing::debug!(target: "saffev::signals", "monitor history read failed: {e}");
-            Vec::new()
-        });
+            (Vec::new(), false)
+        }
+    };
     let hour_ago = now_ms - HOUR_MS;
     let recent: Vec<_> = rows.iter().filter(|r| r.request.ts >= hour_ago).collect();
     let hour_bucket = now_ms.div_euclid(HOUR_MS);
@@ -258,19 +262,21 @@ pub async fn evaluate(
     // --- rule 2 · new source app (first time ever seen) ---------------------
     // Scans the whole fetched window, not just the last hour: an app that
     // appeared between ticks must not slip through. First run seeds silently.
-    let apps = rows.iter().filter_map(|r| r.request.source_app.as_deref());
-    if !state.initialized {
-        state.seen_apps.extend(apps.map(str::to_string));
-        state.initialized = true;
-    } else {
-        for app in apps {
-            if state.seen_apps.insert(app.to_string()) {
-                out.push(Signal {
-                    kind: SignalKind::NewSourceApp,
-                    title: "New app is using your models".into(),
-                    detail: format!("\"{app}\" sent traffic through Saffev for the first time"),
-                    ts: now_ms,
-                });
+    if history_ok {
+        let apps = rows.iter().filter_map(|r| r.request.source_app.as_deref());
+        if !state.initialized {
+            state.seen_apps.extend(apps.map(str::to_string));
+            state.initialized = true;
+        } else {
+            for app in apps {
+                if state.seen_apps.insert(app.to_string()) {
+                    out.push(Signal {
+                        kind: SignalKind::NewSourceApp,
+                        title: "New app is using your models".into(),
+                        detail: format!("\"{app}\" sent traffic through Saffev for the first time"),
+                        ts: now_ms,
+                    });
+                }
             }
         }
     }
@@ -305,7 +311,16 @@ pub async fn evaluate(
     }
 
     // --- rule 4 · latency p95 over the last hour ----------------------------
-    let mut latencies: Vec<u32> = recent.iter().filter_map(|r| r.request.latency_ms).collect();
+    // Proxy records end-to-end latency on `ResponseMeta.total_ms` (leaving
+    // `RequestMeta.latency_ms` None), so fall back to `response.total_ms`.
+    let mut latencies: Vec<u32> = recent
+        .iter()
+        .filter_map(|r| {
+            r.request
+                .latency_ms
+                .or_else(|| r.response.as_ref().and_then(|x| x.total_ms))
+        })
+        .collect();
     if latencies.len() >= MIN_P95_SAMPLES {
         latencies.sort_unstable();
         // Nearest-rank p95: smallest value with ≥95% of samples at or below it.
@@ -406,11 +421,11 @@ pub async fn at_risk_observation(
     if state.at_risk_checked_day.as_deref() == Some(today.as_str()) {
         return None;
     }
-    state.at_risk_checked_day = Some(today);
     let sessions = tokio::task::spawn_blocking(crate::agents::all_sessions)
         .await
         .unwrap_or_default();
     if sessions.is_empty() {
+        state.at_risk_checked_day = Some(today);
         return None;
     }
     let archived_ids: std::collections::HashSet<String> = match store.archived_ids().await {
@@ -420,6 +435,7 @@ pub async fn at_risk_observation(
             return None;
         }
     };
+    state.at_risk_checked_day = Some(today);
     let (hits, soonest) = crate::agents::at_risk_unpreserved(&sessions, &archived_ids, now_ms);
     let mut tools: Vec<String> = Vec::new();
     for s in &hits {
@@ -435,6 +451,13 @@ pub async fn at_risk_observation(
     })
 }
 
+/// True when the daily spend rule has already fired for `now_ms`'s UTC day
+/// (so callers can skip scanning Claude Code JSONL files for the rest of the day).
+pub fn spend_already_fired_today(state: &MonitorState, now_ms: i64) -> bool {
+    let key = format!("spend_per_day:{}", utc_date(now_ms));
+    state.fired.contains_key(&key)
+}
+
 /// Today's (UTC) estimated coding-agent spend, from the same G3 machinery the
 /// analytics page uses (Claude Code JSONL + the configured price table).
 ///
@@ -447,7 +470,11 @@ pub fn spend_today(
     projects_dir: &std::path::Path,
     now_ms: i64,
 ) -> Option<f64> {
-    let events = crate::agents::usage::claude_code_events(projects_dir);
+    // Only inspect files modified on or after the start of today's UTC day
+    // (minus a 60s clock-skew margin), plus cached per-file parses.
+    let today_start_secs = (now_ms / 1000).div_euclid(86_400) * 86_400 - 60;
+    let events =
+        crate::agents::usage::claude_code_events_since(projects_dir, Some(today_start_secs));
     if events.is_empty() {
         return None;
     }
@@ -721,6 +748,38 @@ mod tests {
         // Same hour bucket → deduped.
         let again = evaluate(&store, &cfg, NOW + 60_000, None, None, None, &mut state).await;
         assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn latency_p95_uses_response_total_ms_fallback() {
+        let store = tmp_store().await;
+        let cfg = Config::default(); // threshold 30_000ms
+        let mut state = seeded_state();
+        state.seen_apps.insert("cursor".into());
+
+        for i in 0..MIN_P95_SAMPLES {
+            let id = format!("resp-lat-{i}");
+            store.enqueue(WriteOp::Request(req(
+                &id,
+                NOW - 10_000 - i as i64,
+                "cursor",
+                None,
+            )));
+            store.enqueue(WriteOp::Response(crate::store::ResponseMeta {
+                request_id: id,
+                status: Some(200),
+                output_tokens: Some(10),
+                output_tokens_src: crate::store::TokenSource::Exact,
+                ttft_ms: Some(120),
+                total_ms: Some(45_000),
+                resp_bytes: Some(64),
+                finish_reason: Some("stop".into()),
+                error_kind: None,
+            }));
+        }
+        store.flush().await.unwrap();
+        let fired = evaluate(&store, &cfg, NOW, None, None, None, &mut state).await;
+        assert_eq!(kinds(&fired), vec![SignalKind::LatencyP95]);
     }
 
     #[tokio::test]

@@ -205,19 +205,46 @@ fn human_bytes(n: u64) -> String {
 pub async fn report(cli: &Cli, days: u32, out: Option<&std::path::Path>) -> Result<()> {
     let cfg = load_config(cli).await;
     let now_ms = crate::agents::now_ms();
-    let since = now_ms - (days as i64) * 86_400_000;
+    let since = now_ms.saturating_sub((days as i64).saturating_mul(86_400_000));
 
     let store = crate::store::Store::open(&cfg.db_path()).await?;
-    let mut history = store
-        .history(crate::store::HistoryQuery {
-            q: None,
-            pii_only: false,
-            failed_only: false,
-            limit: Some(100_000),
-            before_ts: None,
-        })
-        .await?;
-    history.retain(|r| r.request.ts >= since);
+    // Page through history up to the stated 100,000-row cap instead of letting
+    // `Store::history` silently clamp a single call at 2,000 rows.
+    const REPORT_HISTORY_CAP: usize = 100_000;
+    const PAGE_SIZE: u32 = 2_000;
+    let mut history = Vec::new();
+    let mut before_ts: Option<i64> = None;
+    while history.len() < REPORT_HISTORY_CAP {
+        let batch = store
+            .history(crate::store::HistoryQuery {
+                q: None,
+                pii_only: false,
+                failed_only: false,
+                limit: Some(PAGE_SIZE),
+                before_ts,
+            })
+            .await?;
+        let batch_len = batch.len();
+        let oldest_ts = batch.last().map(|r| r.request.ts);
+        let mut hit_floor = false;
+        for r in batch {
+            if r.request.ts < since {
+                hit_floor = true;
+                break;
+            }
+            history.push(r);
+            if history.len() >= REPORT_HISTORY_CAP {
+                break;
+            }
+        }
+        if hit_floor || batch_len < PAGE_SIZE as usize {
+            break;
+        }
+        match oldest_ts {
+            Some(ts) if before_ts.map_or(true, |prev| ts < prev) => before_ts = Some(ts),
+            _ => break,
+        }
+    }
     let ids: std::collections::HashSet<&str> =
         history.iter().map(|r| r.request.id.as_str()).collect();
     let findings: Vec<_> = store
@@ -534,9 +561,13 @@ pub async fn status(cli: &Cli, check: bool) -> Result<()> {
         crate::exposure::check(upstream_port).await
     })
     .await;
-    // Kept for the --check path below: the monitor rules take the same verdict
-    // this display used, so the two can never disagree in one invocation.
-    let exposed_flag = report.as_ref().map(|r| r.exposed);
+    // Kept for the --check path below: only pass a verdict when a real binding
+    // was observed (bound_to.is_some()), matching `spawn_monitor_scheduler` so
+    // transient Unknown/NotListening probes cannot poison MonitorState.
+    let exposed_flag = report
+        .as_ref()
+        .filter(|r| r.bound_to.is_some())
+        .map(|r| r.exposed);
 
     let bound_local = bind.is_loopback();
     let (exp_dot, exp_left, exp_right) = match report {
@@ -547,11 +578,17 @@ pub async fn status(cli: &Cli, check: bool) -> Result<()> {
                     r.bound_to.clone().unwrap_or_else(|| "0.0.0.0".to_string()),
                     p.error("⚠ exposed"),
                 )
-            } else {
+            } else if r.bound_to.is_some() {
                 (
                     Level::Ok,
                     "localhost-only".to_string(),
                     p.success("✓ not exposed"),
+                )
+            } else {
+                (
+                    Level::Warn,
+                    "not listening / unknown".to_string(),
+                    p.muted(&r.detail),
                 )
             }
         }
@@ -910,7 +947,12 @@ pub async fn adopt(cli: &Cli, engine: EngineArg, cooperative: bool) -> Result<()
         // the cooperative no-op. `can_gateway` above already gates this branch to
         // Gateway mode, so we never touch the system in Cooperative mode.
         let controller = crate::engine::default_controller(&cfg_for_adopt);
-        crate::engine::adopt::run_adoption(controller.as_ref(), &info_for_adopt, &store).await
+        let entries =
+            crate::engine::adopt::run_adoption(controller.as_ref(), &info_for_adopt, &store)
+                .await?;
+        // Flush before CLI exit so the recorded adoption journal is durable on disk.
+        store.flush().await?;
+        Ok(entries)
     })
     .await;
 
@@ -984,13 +1026,34 @@ pub async fn revert(cli: &Cli, engine: EngineArg) -> Result<()> {
         let Some(record) = record else {
             return Ok(false);
         };
+        let kind = match target.as_str() {
+            "ollama" => crate::engine::EngineKind::Ollama,
+            "lmstudio" => crate::engine::EngineKind::LmStudio,
+            "llamacpp" => crate::engine::EngineKind::LlamaCpp,
+            _ => crate::engine::EngineKind::Unknown,
+        };
         let journal: Vec<crate::engine::JournalEntry> =
             serde_json::from_str(&record.journal_json).unwrap_or_default();
-        // Mode-appropriate controller so a Gateway adoption is undone by the
-        // SystemdController (removes the drop-in + service, restores the engine
-        // to the public port); cooperative no-op otherwise.
+        let info = crate::engine::EngineInfo {
+            engine: kind,
+            version: record.version.clone(),
+            port: record.public_port,
+            how_it_starts: crate::engine::StartMode::Unknown,
+            adoption_state: record.adoption_state,
+        };
         let controller = crate::engine::default_controller(&cfg_for_revert);
-        crate::engine::EngineController::revert(controller.as_ref(), &journal).await?;
+        // Never wipe a real host journal with a no-op controller (matches
+        // Studio `engines_revert`): if system changes were recorded, the
+        // controller must actually be able to undo them.
+        if !journal.is_empty() && !controller.can_adopt() {
+            return Err(crate::Error::Engine(
+                "cannot revert host adoption changes in Cooperative mode or on this OS; \
+                 switch back to Gateway mode on Linux to replay the journal"
+                    .into(),
+            ));
+        }
+        crate::engine::adopt::run_revert(controller.as_ref(), &info, &journal, &store).await?;
+        store.flush().await?;
         Ok(true)
     })
     .await;
@@ -1149,54 +1212,47 @@ pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
     let proxy_addr = SocketAddr::new(cfg.ports.bind, cfg.ports.proxy);
     let studio_addr = SocketAddr::new(cfg.ports.bind, cfg.ports.studio);
 
-    // Refuse to start if the proxy port is already taken by a foreign process.
-    // On a first run the proxy port was just chosen to be free, so this never
-    // fires there; it remains the guard for an existing user config whose proxy
-    // port is now held (we keep the current "port in use / run doctor" message).
-    let proxy_port = cfg.ports.proxy;
-    if !first_run && port_listening(cfg.ports.bind, proxy_port).await {
-        // Identify what holds the port so the operator can act. Capture only the
-        // port value so `cfg` stays available for the messages below.
-        let holder = guard("port diagnosis", async move {
-            crate::engine::adopt::diagnose_port_conflict(proxy_port).await
-        })
-        .await
-        .flatten();
-        let ours = holder
-            .as_ref()
-            .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
-        let detail = match &holder {
-            Some(h) => format!(
-                "port {} held by {} (pid {})",
-                proxy_port,
-                h.name.as_deref().unwrap_or("unknown"),
-                h.pid
-            ),
-            None => format!("port {proxy_port} already in use"),
-        };
-        println!(
-            "{} {} {}",
-            p.dot(Level::Err),
-            p.label("start"),
-            p.error(&detail)
-        );
-        if ours {
-            // Another saffev already serves this port (possibly an orphaned
-            // daemon whose pid file was lost) — point at the command that now
-            // recovers both cases, instead of the generic doctor advice.
+    // Refuse to start if either the proxy or Studio port is already held.
+    for port in [cfg.ports.proxy, cfg.ports.studio] {
+        if !first_run && port_listening(cfg.ports.bind, port).await {
+            let holder = guard("port diagnosis", async move {
+                crate::engine::adopt::diagnose_port_conflict(port).await
+            })
+            .await
+            .flatten();
+            let ours = holder
+                .as_ref()
+                .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
+            let detail = match &holder {
+                Some(h) => format!(
+                    "port {} held by {} (pid {})",
+                    port,
+                    h.name.as_deref().unwrap_or("unknown"),
+                    h.pid
+                ),
+                None => format!("port {port} already in use"),
+            };
             println!(
-                "{} another saffev is already running — run {} first",
-                p.muted("·"),
-                p.value("saffev stop"),
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("start"),
+                p.error(&detail)
             );
-        } else {
-            println!(
-                "{} run {} to diagnose, or adopt the engine first",
-                p.muted("·"),
-                p.value("saffev doctor"),
-            );
+            if ours {
+                println!(
+                    "{} another saffev is already running — run {} first",
+                    p.muted("·"),
+                    p.value("saffev stop"),
+                );
+            } else {
+                println!(
+                    "{} run {} to diagnose, or adopt the engine first",
+                    p.muted("·"),
+                    p.value("saffev doctor"),
+                );
+            }
+            return Err(crate::Error::Other(anyhow::anyhow!("{detail}")));
         }
-        return Ok(());
     }
 
     // The user-facing welcome summary (Studio URL, proxy base, engine status).
@@ -1250,14 +1306,14 @@ pub async fn start(cli: &Cli, foreground: bool, no_open: bool) -> Result<()> {
             Ok(())
         }
         Err(err) => {
-            tracing::debug!("server lifecycle ended: {err}");
+            tracing::error!("server lifecycle failed: {err}");
             println!(
                 "{} {} {}",
-                p.dot(Level::Warn),
+                p.dot(Level::Err),
                 p.label("start"),
-                p.warn("server components not available in this build"),
+                p.error(&err.to_string()),
             );
-            Ok(())
+            Err(err)
         }
     }
 }
@@ -1295,52 +1351,47 @@ async fn start_background(
         }
     }
 
-    // Refuse to start if the proxy port is already taken by a foreign process.
-    // Skipped on first run: the proxy port was just chosen to be free, and an
-    // engine already holding the well-known port is the expected Cooperative
-    // case — not a conflict.
-    let proxy_port = cfg.ports.proxy;
-    if !first_run && port_listening(cfg.ports.bind, proxy_port).await {
-        // Identify the holder so the advice is actionable: another saffev
-        // (e.g. an orphaned daemon whose pid file was lost) is recovered with
-        // `saffev stop`; anything else keeps the doctor/adopt advice.
-        let holder = guard("port diagnosis", async move {
-            crate::engine::adopt::diagnose_port_conflict(proxy_port).await
-        })
-        .await
-        .flatten();
-        let ours = holder
-            .as_ref()
-            .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
-        let detail = match &holder {
-            Some(h) => format!(
-                "port {} held by {} (pid {})",
-                proxy_port,
-                h.name.as_deref().unwrap_or("unknown"),
-                h.pid
-            ),
-            None => format!("port {proxy_port} already in use"),
-        };
-        println!(
-            "{} {} {}",
-            p.dot(Level::Err),
-            p.label("start"),
-            p.error(&detail),
-        );
-        if ours {
+    // Refuse to start if either the proxy or Studio port is already taken.
+    for port in [cfg.ports.proxy, cfg.ports.studio] {
+        if !first_run && port_listening(cfg.ports.bind, port).await {
+            let holder = guard("port diagnosis", async move {
+                crate::engine::adopt::diagnose_port_conflict(port).await
+            })
+            .await
+            .flatten();
+            let ours = holder
+                .as_ref()
+                .is_some_and(|h| holder_is_saffev(h.name.as_deref()));
+            let detail = match &holder {
+                Some(h) => format!(
+                    "port {} held by {} (pid {})",
+                    port,
+                    h.name.as_deref().unwrap_or("unknown"),
+                    h.pid
+                ),
+                None => format!("port {port} already in use"),
+            };
             println!(
-                "{} another saffev is already running — run {} first",
-                p.muted("·"),
-                p.value("saffev stop"),
+                "{} {} {}",
+                p.dot(Level::Err),
+                p.label("start"),
+                p.error(&detail),
             );
-        } else {
-            println!(
-                "{} run {} to diagnose, or adopt the engine first",
-                p.muted("·"),
-                p.value("saffev doctor"),
-            );
+            if ours {
+                println!(
+                    "{} another saffev is already running — run {} first",
+                    p.muted("·"),
+                    p.value("saffev stop"),
+                );
+            } else {
+                println!(
+                    "{} run {} to diagnose, or adopt the engine first",
+                    p.muted("·"),
+                    p.value("saffev doctor"),
+                );
+            }
+            return Err(crate::Error::Other(anyhow::anyhow!("{detail}")));
         }
-        return Ok(());
     }
 
     let url = format!(
@@ -1357,7 +1408,7 @@ async fn start_background(
     // Background daemons log their tracing stderr to `daemon.log` in the data
     // dir (rotated per start) — otherwise a detached daemon that dies leaves
     // nothing to diagnose.
-    let log_path = daemon::log_path(&cfg);
+    let log_path = daemon::log_path(cfg);
     let pid = match daemon::spawn_background_child(
         cli.config.as_deref(),
         cli.no_color,
@@ -1583,14 +1634,34 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     .await
     .ok_or_else(|| crate::Error::Store("store unavailable".into()))?;
 
-    // Per-install bearer token for the Studio API.
-    let token: Arc<str> = guard_infallible("install token", async {
-        crate::store::keys::get_or_create_install_token().ok()
+    // Per-install bearer token for the Studio API. If the OS keyring is
+    // unavailable (headless Linux, CI, unsigned dev build, or locked keychain),
+    // mint an ephemeral 256-bit per-process token rather than falling back to
+    // an empty string (which would disable Studio auth or break the SPA).
+    let token: Arc<str> = match guard_infallible("install token", async {
+        crate::store::keys::get_or_create_install_token()
     })
     .await
-    .flatten()
-    .unwrap_or_default()
-    .into();
+    {
+        Some(Ok(t)) if !t.is_empty() => t.into(),
+        other => {
+            let reason = match other {
+                Some(Err(e)) => e.to_string(),
+                Some(Ok(_)) => "keyring returned an empty token".to_string(),
+                None => "install token lookup panicked".to_string(),
+            };
+            tracing::warn!(
+                reason = %reason,
+                "Studio install token unavailable from keyring; using ephemeral session token"
+            );
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
+            .into()
+        }
+    };
 
     // Deterministic PII detector shared by the proxy.
     let detector = guard("detector build", {
@@ -1721,6 +1792,7 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     // .with_graceful_shutdown(..)` so in-flight requests drain before the
     // listeners close. `saffev stop` sends SIGTERM; the foreground operator can
     // still press Ctrl-C. The select also exits if either server's bind fails.
+    let drain_store = proxy_state.store.clone();
     let proxy = crate::proxy::ProxyServer::new(proxy_state);
     let studio = crate::studio::StudioServer::new(studio_state);
 
@@ -1728,22 +1800,46 @@ async fn run_servers(cfg: &Config) -> Result<()> {
     let proxy_shutdown = shutdown_signal(shutdown_rx.clone());
     let studio_shutdown = shutdown_signal(shutdown_rx);
 
-    let proxy_task = tokio::spawn(async move { proxy.serve_with_shutdown(proxy_shutdown).await });
-    let studio_task =
+    let mut proxy_task =
+        tokio::spawn(async move { proxy.serve_with_shutdown(proxy_shutdown).await });
+    let mut studio_task =
         tokio::spawn(async move { studio.serve_with_shutdown(studio_shutdown).await });
 
-    // Trigger shutdown on Ctrl-C or SIGTERM, whichever comes first.
-    tokio::select! {
-        r = proxy_task => { let _ = r; }
-        r = studio_task => { let _ = r; }
-        _ = termination_signal() => {
-            // Broadcast to both servers; ignore send errors (receivers may have
-            // already dropped if a server exited first).
-            let _ = shutdown_tx.send(true);
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let unpack = |name: &str, r: std::result::Result<Result<()>, tokio::task::JoinError>| -> Result<()> {
+        match r {
+            Ok(inner) => inner,
+            Err(e) => Err(crate::Error::Other(anyhow::anyhow!(
+                "{name} task panicked: {e}"
+            ))),
         }
-    }
+    };
 
-    Ok(())
+    // Trigger shutdown on Ctrl-C or SIGTERM, or if either server exits early.
+    // Always drain the sibling server and flush queued SQLite writes before returning.
+    let outcome: Result<()> = tokio::select! {
+        r = &mut proxy_task => {
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, studio_task).await;
+            unpack("proxy", r)
+        }
+        r = &mut studio_task => {
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, proxy_task).await;
+            unpack("studio", r)
+        }
+        _ = termination_signal() => {
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+                let _ = tokio::join!(proxy_task, studio_task);
+            })
+            .await;
+            Ok(())
+        }
+    };
+
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain_store.flush()).await;
+    outcome
 }
 
 /// Future that resolves on the first OS termination signal: Ctrl-C (SIGINT)
@@ -2342,6 +2438,7 @@ fn print_log_row(p: &Painter, row: &crate::store::HistoryRow) {
     let model = req.model.as_deref().unwrap_or("—");
     let lat = req
         .latency_ms
+        .or_else(|| row.response.as_ref().and_then(|x| x.total_ms))
         .map(|ms| format!("{ms}ms"))
         .unwrap_or_else(|| "—".to_string());
     let ts = format_clock(req.ts);
@@ -2506,7 +2603,7 @@ async fn resolve_capture_target(
     }
 
     if auto_start {
-        println!("{} {}", p.muted("·"), p.muted("starting Saffev…"));
+        eprintln!("{} {}", p.muted("·"), p.muted("starting Saffev…"));
         // Background start (no browser); first run also persists a fresh config.
         let _ = start(cli, false, true).await;
         if let Some(c) = load_running_config(cli) {
@@ -2520,7 +2617,7 @@ async fn resolve_capture_target(
     }
 
     if require {
-        println!(
+        eprintln!(
             "{} {} {}",
             p.dot(Level::Err),
             p.label("run"),
@@ -2529,7 +2626,7 @@ async fn resolve_capture_target(
         std::process::exit(1);
     }
 
-    println!(
+    eprintln!(
         "{} {}",
         p.dot(Level::Warn),
         p.warn("Saffev proxy isn't reachable — running without tracing. Run `saffev start`, or drop --no-start to auto-start."),
@@ -2537,8 +2634,25 @@ async fn resolve_capture_target(
     None
 }
 
+/// Map a child's `ExitStatus` to a standard shell exit code: normal exit code
+/// when present, `128 + signal` on Unix signal termination, else `1`.
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
+}
+
 /// Apply the capture env (+ a placeholder OpenAI key when the user has none) to a
-/// child process command, and print a one-line "tracing via …" confirmation.
+/// child process command, and print a one-line "tracing via …" confirmation to
+/// stderr so stdout stays pure for pipelines.
 fn apply_capture_env(c: &mut tokio::process::Command, cfg: &Config, p: &Painter, suffix: &str) {
     for (k, v) in capture::capture_env(cfg) {
         c.env(k, v);
@@ -2548,7 +2662,7 @@ fn apply_capture_env(c: &mut tokio::process::Command, cfg: &Config, p: &Painter,
     if std::env::var_os("OPENAI_API_KEY").is_none() {
         c.env("OPENAI_API_KEY", capture::PLACEHOLDER_OPENAI_KEY);
     }
-    println!(
+    eprintln!(
         "{} {} {}",
         p.dot(Level::Ok),
         p.label("tracing"),
@@ -2569,12 +2683,12 @@ pub async fn run_cmd(
         Some((prog, rest)) => (prog.clone(), rest.to_vec()),
         None => {
             // clap enforces required=true; stay defensive.
-            println!(
+            eprintln!(
                 "{} {}",
                 p.dot(Level::Err),
                 p.error("nothing to run — usage: saffev run -- <command> [args…]"),
             );
-            return Ok(());
+            std::process::exit(2);
         }
     };
 
@@ -2589,15 +2703,20 @@ pub async fn run_cmd(
     // Child inherits our stdio. Block on it and propagate its exit code so
     // `saffev run` is transparent in scripts and pipelines.
     match c.status().await {
-        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Ok(status) => std::process::exit(exit_code_from_status(status)),
         Err(e) => {
-            println!(
+            eprintln!(
                 "{} {} {}",
                 p.dot(Level::Err),
                 p.label("run"),
                 p.error(&format!("could not run `{program}`: {e}")),
             );
-            Ok(())
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            std::process::exit(code);
         }
     }
 }
@@ -2612,7 +2731,7 @@ pub async fn shell_cmd(cli: &Cli, auto_start: bool) -> Result<()> {
     if let Some(cfg) = &target {
         apply_capture_env(&mut c, cfg, &p, " — type `exit` to stop");
     } else {
-        println!(
+        eprintln!(
             "{} {}",
             p.dot(Level::Warn),
             p.warn("launching a normal shell (no tracing)."),
@@ -2620,15 +2739,20 @@ pub async fn shell_cmd(cli: &Cli, auto_start: bool) -> Result<()> {
     }
 
     match c.status().await {
-        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Ok(status) => std::process::exit(exit_code_from_status(status)),
         Err(e) => {
-            println!(
+            eprintln!(
                 "{} {} {}",
                 p.dot(Level::Err),
                 p.label("shell"),
                 p.error(&format!("could not launch `{program}`: {e}")),
             );
-            Ok(())
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            std::process::exit(code);
         }
     }
 }
@@ -2811,10 +2935,11 @@ mod tests {
     fn maintenance_plan_gates_prune() {
         use crate::config::Retention;
 
-        let mut cfg = Config::default();
-
         // Defaults: 30-day retention prunes.
-        cfg.retention = Retention::default();
+        let mut cfg = Config {
+            retention: Retention::default(),
+            ..Default::default()
+        };
         assert!(maintenance_plan(&cfg));
 
         // Unlimited retention must not open a writer just to no-op.
@@ -2898,8 +3023,10 @@ mod tests {
 
     #[test]
     fn controller_can_adopt_requires_gateway() {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Cooperative;
+        let mut cfg = Config {
+            mode: Mode::Cooperative,
+            ..Default::default()
+        };
         assert!(!controller_can_adopt(&cfg));
         cfg.mode = Mode::Gateway;
         // On non-Linux this is false; on Linux true. Assert it matches cfg!.

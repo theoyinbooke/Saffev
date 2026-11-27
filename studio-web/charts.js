@@ -64,23 +64,40 @@
       svg.appendChild(s('line', { x1: pl, y1: gy, x2: W - pr, y2: gy, class: 'grid' }));
       svg.appendChild(s('text', { x: pl - 8, y: gy + 3, class: 'axlabel', 'text-anchor': 'end' }, fmtNum(max * (1 - g / 4))));
     }
-    // x labels (first / mid / last)
+    // x labels (first / mid / last), deduped when n <= 2
     const xl = opts.xLabels || [];
-    [0, Math.floor((n - 1) / 2), n - 1].forEach((i) => {
+    Array.from(new Set([0, Math.floor((n - 1) / 2), n - 1])).forEach((i) => {
       if (xl[i]) svg.appendChild(s('text', { x: x(i), y: H - 6, class: 'axlabel', 'text-anchor': i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle' }, xl[i]));
     });
     series.forEach((se, si) => {
       const color = se.color || PALETTE[si % PALETTE.length];
-      const pts = se.values.map((v, i) => [x(i), y(v == null ? 0 : v)]);
-      if (se.area !== false) {
-        let d = `M ${pts[0][0]} ${pt + ih}`;
-        pts.forEach((p) => (d += ` L ${p[0]} ${p[1]}`));
-        d += ` L ${pts[pts.length - 1][0]} ${pt + ih} Z`;
-        svg.appendChild(s('path', { d, fill: color, 'fill-opacity': '0.12', stroke: 'none' }));
-      }
-      let dl = '';
-      pts.forEach((p, i) => (dl += (i ? ' L ' : 'M ') + p[0] + ' ' + p[1]));
-      svg.appendChild(s('path', { d: dl, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+      // Split into contiguous non-null segments so missing buckets create gaps
+      // rather than falsely plummeting to zero.
+      const segs = [];
+      let cur = [];
+      se.values.forEach((v, i) => {
+        if (v == null) {
+          if (cur.length) { segs.push(cur); cur = []; }
+        } else {
+          cur.push([x(i), y(v)]);
+        }
+      });
+      if (cur.length) segs.push(cur);
+      segs.forEach((pts) => {
+        if (pts.length === 1) {
+          svg.appendChild(s('circle', { cx: pts[0][0], cy: pts[0][1], r: 3, fill: color }));
+          return;
+        }
+        if (se.area !== false) {
+          let d = `M ${pts[0][0]} ${pt + ih}`;
+          pts.forEach((p) => (d += ` L ${p[0]} ${p[1]}`));
+          d += ` L ${pts[pts.length - 1][0]} ${pt + ih} Z`;
+          svg.appendChild(s('path', { d, fill: color, 'fill-opacity': '0.12', stroke: 'none' }));
+        }
+        let dl = '';
+        pts.forEach((p, i) => (dl += (i ? ' L ' : 'M ') + p[0] + ' ' + p[1]));
+        svg.appendChild(s('path', { d: dl, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+      });
       // hover dots
       se.values.forEach((v, i) => {
         if (v == null) return;
@@ -160,8 +177,13 @@
     };
     items.forEach((it, i) => {
       const frac = it.value / total;
-      const a1 = ang + frac * Math.PI * 2;
-      const path = s('path', { d: arc(ang, a1 - 0.012, rO, rI), fill: it.color || PALETTE[i % PALETTE.length] });
+      const span = frac * Math.PI * 2;
+      const a1 = ang + span;
+      // Cap the slice gap to 25% of the slice span so tiny slices (< 0.19%)
+      // never invert (`a1 - gap < ang`), and keep a 100% single slice visible.
+      const gap = items.length > 1 ? Math.min(0.012, span * 0.25) : 0.001;
+      const end = Math.max(ang + 0.001, a1 - gap);
+      const path = s('path', { d: arc(ang, end, rO, rI), fill: it.color || PALETTE[i % PALETTE.length] });
       path.appendChild(titleEl(it.label + ': ' + fmtNum(it.value) + ' (' + Math.round(frac * 100) + '%)'));
       svg.appendChild(path);
       ang = a1;
@@ -211,7 +233,7 @@
   function scatter(opts) {
     const pts = opts.points || [];
     if (!pts.length) return empty();
-    const W = 720, H = 240, pl = 50, pr = 14, pt = 14, pb = 30;
+    const W = 720, H = 240, pl = 50, pr = 14, pt = 14, pb = 40;
     const iw = W - pl - pr, ih = H - pt - pb;
     const xmax = niceMax(Math.max(...pts.map((p) => p.x), 1));
     const ymax = niceMax(Math.max(...pts.map((p) => p.y), 1));
@@ -223,8 +245,8 @@
       svg.appendChild(s('line', { x1: pl, y1: gy, x2: W - pr, y2: gy, class: 'grid' }));
       svg.appendChild(s('text', { x: pl - 8, y: gy + 3, class: 'axlabel', 'text-anchor': 'end' }, fmtNum(ymax * (1 - g / 4))));
     }
-    [0, 0.5, 1].forEach((f) => svg.appendChild(s('text', { x: pl + f * iw, y: H - 6, class: 'axlabel', 'text-anchor': f === 0 ? 'start' : f === 1 ? 'end' : 'middle' }, fmtNum(xmax * f))));
-    svg.appendChild(s('text', { x: pl + iw / 2, y: H - 6, class: 'axlabel dim', 'text-anchor': 'middle' }, opts.xLabel || ''));
+    [0, 0.5, 1].forEach((f) => svg.appendChild(s('text', { x: pl + f * iw, y: H - 20, class: 'axlabel', 'text-anchor': f === 0 ? 'start' : f === 1 ? 'end' : 'middle' }, fmtNum(xmax * f))));
+    svg.appendChild(s('text', { x: pl + iw / 2, y: H - 5, class: 'axlabel dim', 'text-anchor': 'middle' }, opts.xLabel || ''));
     pts.forEach((p) => {
       const c = s('circle', { cx: X(p.x), cy: Y(p.y), r: 3.5, fill: 'var(--brand)', 'fill-opacity': '0.5', class: 'dot' });
       c.appendChild(titleEl((opts.xLabel || 'x') + ' ' + fmtNum(p.x) + ' · ' + (opts.yLabel || 'y') + ' ' + fmtNum(p.y)));

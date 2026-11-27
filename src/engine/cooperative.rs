@@ -8,8 +8,6 @@
 //! journal — there is nothing to revert. Detection and health reuse the probes
 //! in [`super::detect`].
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 
 use crate::engine::detect;
@@ -48,15 +46,7 @@ impl EngineController for CooperativeController {
 /// Health probe shared by Cooperative + Supervisor: hit the engine's identifying
 /// endpoint on `port` and map the outcome onto [`HealthState`].
 pub(crate) async fn probe_health(kind: EngineKind, port: u16) -> HealthState {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(800))
-        .connect_timeout(Duration::from_millis(500))
-        .no_proxy()
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return HealthState::Down,
-    };
+    let client = crate::engine::detect::probe_client();
 
     let url = match kind {
         EngineKind::Ollama => format!("http://127.0.0.1:{port}/api/tags"),

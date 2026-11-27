@@ -42,6 +42,9 @@ static UPSTREAM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // Do not impose an overall request timeout: streamed generations can run
         // for minutes. A connect timeout still guards against a dead upstream.
         .connect_timeout(std::time::Duration::from_secs(10))
+        // Transparent reverse proxy: pass 3xx responses back to the client
+        // rather than silently following redirects or leaving loopback.
+        .redirect(reqwest::redirect::Policy::none())
         // We forward chunks ourselves; disable any auto-decompression so bytes
         // are byte-identical to what the engine emitted.
         .no_proxy()
@@ -104,37 +107,15 @@ pub async fn forward_streaming(
         }
     };
 
-    // Decide masking BEFORE forwarding (04 §7.6). Default is observe-only; only
-    // when masking is enabled AND not in dry-run do we redact the request body
-    // before it reaches the engine — the high-value case (keep PII off the
-    // model). Fail-open: any error here yields the ORIGINAL body + `Observed`.
-    //
-    // SCOPE: we mask the REQUEST body here (the full body is in hand).
-    // NON-STREAMING responses are masked on the response path (buffered + redacted
-    // — see `buffer_and_mask_response`). STREAMING responses are masked frame by
-    // frame through the bounded-holdback masker (`stream_and_mask_response`) —
-    // never buffered whole.
-    let (forward_bytes, mask_action) = mask_request_body(state, &req_bytes);
-
-    // Policy block: some things must never reach a model at all, and for those
-    // masking ("we quietly replaced it") is the wrong answer. Evaluated here,
-    // before anything is forwarded. Only a deliberate, live policy can stop a
-    // request — see `block_decision`.
+    // Evaluate masking + policy blocking in ONE config snapshot and ONE scan
+    // (checking block_kinds before allocating redacted bytes, and skipping
+    // mutation on compressed request bodies so binary streams aren't corrupted).
     let cfg = state.config.load();
-    let blocked = block_decision(
-        &cfg.masking,
-        &state.detector,
-        crate::brain::Side::Request,
-        &req_bytes,
-    );
-    let (mask_action, blocked) = match blocked {
-        // Policy names a kind that is present, but masking is still in dry-run:
-        // record the intent and let the request through, exactly like dry-run
-        // masking does. Turning off dry-run is the single explicit step that
-        // makes both masking and blocking real.
-        Some(_) if cfg.masking.dry_run => (MaskAction::WouldBlock, None),
-        Some(kinds) => (MaskAction::Blocked, Some(kinds)),
-        None => (mask_action, None),
+    let masking_live = cfg.masking.enabled && !cfg.masking.dry_run;
+    let (forward_bytes, mask_action, blocked) = if headers_have_content_encoding(&req_headers) {
+        (req_bytes.clone(), MaskAction::Observed, None)
+    } else {
+        evaluate_request_policy(&cfg.masking, &state.detector, &req_bytes)
     };
 
     // Tee the request start with the ORIGINAL (unredacted) body so the logger
@@ -189,7 +170,7 @@ pub async fn forward_streaming(
     // `content-length` is stripped as hop-by-hop and re-derived by reqwest from
     // the body we set, so a length change after redaction stays consistent.
     let mut builder = UPSTREAM_CLIENT.request(method, &url);
-    builder = builder.headers(forward_request_headers(&req_headers));
+    builder = builder.headers(forward_request_headers_for(&req_headers, masking_live));
     if !forward_bytes.is_empty() {
         builder = builder.body(forward_bytes);
     }
@@ -234,11 +215,16 @@ pub async fn forward_streaming(
         let m = &state.config.load().masking;
         m.enabled && !m.dry_run
     };
-    if masking_live && response_is_json(upstream_resp.headers()) {
+    let encoded_resp = headers_have_content_encoding(upstream_resp.headers());
+    let within_buffer_cap = upstream_resp
+        .content_length()
+        .map_or(true, |n| n as usize <= crate::proxy::MAX_RESPONSE_BUFFER);
+    if masking_live && !encoded_resp && within_buffer_cap && response_is_json(upstream_resp.headers())
+    {
         return buffer_and_mask_response(state, id, start, status, resp_headers, upstream_resp)
             .await;
     }
-    if masking_live {
+    if masking_live && !encoded_resp {
         if let Some(kind) = response_stream_kind(upstream_resp.headers()) {
             return stream_and_mask_response(
                 state,
@@ -254,10 +240,6 @@ pub async fn forward_streaming(
 
     // Wrap the upstream byte stream so each chunk is teed as it is forwarded —
     // unbuffered, token-by-token. This is the streaming-passthrough core.
-    //
-    // TTFT is owned by the logger: it timestamps the first `ResponseChunk` it
-    // sees for an id. We deliberately do not thread a clock through the contract
-    // types here — keeping `TeeEvent` unchanged.
     let tee = state.tee.clone();
     let stream_id = id.clone();
 
@@ -267,9 +249,22 @@ pub async fn forward_streaming(
     let stream_errored = Arc::new(AtomicBool::new(false));
     let errored_for_stream = stream_errored.clone();
 
+    // Record exact proxy-side TTFT on the first upstream chunk (0 = unset,
+    // else elapsed_ms + 1) so logger attribution latency never skews TTFT.
+    let first_chunk_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let first_chunk_for_stream = first_chunk_ms.clone();
+
     let byte_stream = upstream_resp.bytes_stream();
     let mapped = byte_stream.map(move |item| match item {
         Ok(chunk) => {
+            if !chunk.is_empty() && first_chunk_for_stream.load(Ordering::Relaxed) == 0 {
+                let _ = first_chunk_for_stream.compare_exchange(
+                    0,
+                    u64::from(elapsed_ms(start)) + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
             // Tee a copy (best-effort, drop-oldest). The send half is cloned so we
             // do not hold a &state across the stream's 'static lifetime.
             send_chunk(&tee, &stream_id, chunk.clone());
@@ -298,6 +293,7 @@ pub async fn forward_streaming(
         tee: finish_tee,
         id: finish_id,
         start,
+        first_chunk_ms,
         sent: false,
         status: Some(status.as_u16()),
         errored: stream_errored,
@@ -350,24 +346,103 @@ async fn buffer_and_mask_response(
     resp_headers: HeaderMap,
     upstream_resp: reqwest::Response,
 ) -> Response {
-    let body_bytes = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, "proxy: failed to read response body for masking; failing open");
-            tee_drop_oldest(
-                state,
-                TeeEvent::ResponseFinished {
-                    id,
-                    ttft_ms: None,
-                    total_ms: Some(elapsed_ms(start)),
-                    status: Some(status.as_u16()),
-                    error_kind: Some("stream_error".to_string()),
-                    resp_mask_action: MaskAction::Observed,
-                },
-            );
-            return (StatusCode::BAD_GATEWAY, "saffev: response read error").into_response();
+    // Bounded read (MAX_RESPONSE_BUFFER): if a JSON response unexpectedly grows
+    // past the cap without Content-Length, fail-open into streaming passthrough
+    // rather than OOMing the proxy.
+    let mut byte_stream = upstream_resp.bytes_stream();
+    let mut acc = Vec::new();
+    let mut overflow_chunk: Option<Bytes> = None;
+    let mut ttft_ms: Option<u32> = None;
+    while let Some(item) = byte_stream.next().await {
+        match item {
+            Ok(chunk) => {
+                if ttft_ms.is_none() && !chunk.is_empty() {
+                    ttft_ms = Some(elapsed_ms(start));
+                }
+                if acc.len().saturating_add(chunk.len()) > crate::proxy::MAX_RESPONSE_BUFFER {
+                    tracing::warn!(
+                        "proxy: JSON response exceeded {} bytes; falling back to passthrough (fail-open)",
+                        crate::proxy::MAX_RESPONSE_BUFFER
+                    );
+                    overflow_chunk = Some(chunk);
+                    break;
+                }
+                acc.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "proxy: failed to read response body for masking; failing open");
+                tee_drop_oldest(
+                    state,
+                    TeeEvent::ResponseFinished {
+                        id,
+                        ttft_ms,
+                        total_ms: Some(elapsed_ms(start)),
+                        status: Some(status.as_u16()),
+                        error_kind: Some("stream_error".to_string()),
+                        resp_mask_action: MaskAction::Observed,
+                    },
+                );
+                return (StatusCode::BAD_GATEWAY, "saffev: response read error").into_response();
+            }
         }
-    };
+    }
+
+    if let Some(extra) = overflow_chunk {
+        let prefix = Bytes::from(acc);
+        let tee = state.tee.clone();
+        let stream_id = id.clone();
+        let status_code = status.as_u16();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        tokio::spawn(async move {
+            let mut error_kind: Option<String> = None;
+            let mut client_alive = true;
+            if !prefix.is_empty() {
+                send_chunk(&tee, &stream_id, prefix.clone());
+                if tx.send(Ok(prefix)).await.is_err() {
+                    client_alive = false;
+                }
+            }
+            if client_alive {
+                send_chunk(&tee, &stream_id, extra.clone());
+                if tx.send(Ok(extra)).await.is_ok() {
+                    while let Some(item) = byte_stream.next().await {
+                        match item {
+                            Ok(c) => {
+                                send_chunk(&tee, &stream_id, c.clone());
+                                if tx.send(Ok(c)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error_kind = Some("stream_error".to_string());
+                                let _ = tx.send(Err(std::io::Error::other(e))).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = tee.try_send(TeeEvent::ResponseFinished {
+                id: stream_id,
+                ttft_ms,
+                total_ms: Some(elapsed_ms(start)),
+                status: Some(status_code),
+                error_kind,
+                resp_mask_action: MaskAction::Observed,
+            });
+        });
+        let body_stream =
+            futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|i| (i, rx)) });
+        let mut response = Response::builder().status(status);
+        if let Some(h) = response.headers_mut() {
+            *h = resp_headers;
+        }
+        return response
+            .body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "saffev: response build error").into_response());
+    }
+
+    let body_bytes = Bytes::from(acc);
 
     // Decide + apply response masking. Live-only here (dry-run/off never reach
     // this path), so the action is `Masked` (redacted) or `Observed` (nothing
@@ -390,7 +465,7 @@ async fn buffer_and_mask_response(
         state,
         TeeEvent::ResponseFinished {
             id: id.clone(),
-            ttft_ms: None,
+            ttft_ms,
             total_ms: Some(elapsed_ms(start)),
             status: Some(status.as_u16()),
             error_kind: None,
@@ -570,14 +645,17 @@ impl FrameMasker {
         }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(chunk.len());
+        let mut pos = 0usize;
         loop {
-            let frame_end = match self.kind {
-                StreamKind::Ndjson => self.buf.iter().position(|&b| b == b'\n').map(|p| p + 1),
-                StreamKind::Sse => find_sse_event_end(&self.buf),
+            let slice = &self.buf[pos..];
+            let frame_len = match self.kind {
+                StreamKind::Ndjson => slice.iter().position(|&b| b == b'\n').map(|p| p + 1),
+                StreamKind::Sse => find_sse_event_end(slice),
             };
-            match frame_end {
-                Some(end) => {
-                    let frame: Vec<u8> = self.buf.drain(..end).collect();
+            match frame_len {
+                Some(len) => {
+                    let frame = self.buf[pos..pos + len].to_vec();
+                    pos += len;
                     match self.kind {
                         StreamKind::Ndjson => out.extend(self.process_ndjson_line(&frame)),
                         StreamKind::Sse => out.extend(self.process_sse_event(&frame)),
@@ -586,13 +664,17 @@ impl FrameMasker {
                 None => break,
             }
         }
+        if pos > 0 {
+            self.buf.drain(..pos);
+        }
         if self.buf.len() > MAX_FRAME_BUF {
-            // No terminator in over a megabyte: this is not the stream shape we
-            // understand. Fall back to passthrough for the rest of the stream.
+            // No terminator in over a megabyte: flush held-back tokens FIRST so
+            // output stays in chronological order, then fall back to passthrough.
             tracing::warn!(
                 "proxy: stream frame exceeded {} bytes; falling back to passthrough (fail-open)",
                 MAX_FRAME_BUF
             );
+            out.extend(self.synthesize_flush());
             self.broken = true;
             out.append(&mut self.buf);
         }
@@ -627,7 +709,7 @@ impl FrameMasker {
             return line.to_vec();
         };
         let text = get_text(&v, path).unwrap_or_default().to_string();
-        if !done {
+        if !done && self.template.is_none() {
             self.template = Some((v.clone(), path));
         }
         let mut masked = self.masker.push(&text);
@@ -653,9 +735,15 @@ impl FrameMasker {
         let Ok(text) = std::str::from_utf8(event) else {
             return event.to_vec();
         };
+        // Strip the event's blank-line terminator before splitting lines so we
+        // emit exactly `\n\n` (not `\n\n\n`).
+        let body = text
+            .strip_suffix("\r\n\r\n")
+            .or_else(|| text.strip_suffix("\n\n"))
+            .unwrap_or(text);
         // Exactly one `data:` line is the shape LLM engines emit; anything else
         // (multi-line data, comments-only) passes through verbatim.
-        let data_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("data:")).collect();
+        let data_lines: Vec<&str> = body.lines().filter(|l| l.starts_with("data:")).collect();
         if data_lines.len() != 1 {
             return event.to_vec();
         }
@@ -684,7 +772,7 @@ impl FrameMasker {
             return event.to_vec();
         };
         let delta = get_text(&v, path).unwrap_or_default().to_string();
-        if !finished {
+        if !finished && self.template.is_none() {
             self.template = Some((v.clone(), path));
         }
         let mut masked = self.masker.push(&delta);
@@ -698,9 +786,9 @@ impl FrameMasker {
             return event.to_vec();
         };
         // Rebuild the event: swap the data line, keep every other line (event:,
-        // id:, retry:, comments) verbatim.
+        // id:, retry:, comments) verbatim, ending with exactly one blank line.
         let mut rebuilt = String::with_capacity(event.len() + json.len());
-        for line in text.lines() {
+        for line in body.lines() {
             if line.starts_with("data:") {
                 rebuilt.push_str("data: ");
                 rebuilt.push_str(&json);
@@ -802,10 +890,14 @@ fn stream_and_mask_response(
 
     tokio::spawn(async move {
         let mut error_kind: Option<String> = None;
+        let mut ttft_ms: Option<u32> = None;
         while let Some(item) = byte_stream.next().await {
             match item {
                 Ok(chunk) => {
-                    // Tee the ORIGINAL chunk (logger derives TTFT + true findings).
+                    if ttft_ms.is_none() && !chunk.is_empty() {
+                        ttft_ms = Some(elapsed_ms(start));
+                    }
+                    // Tee the ORIGINAL chunk (logger derives true findings).
                     send_chunk(&tee, &id, chunk.clone());
                     let out = frames.feed(&chunk);
                     if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
@@ -832,7 +924,7 @@ fn stream_and_mask_response(
         };
         if let Err(e) = tee.try_send(TeeEvent::ResponseFinished {
             id,
-            ttft_ms: None,
+            ttft_ms,
             total_ms: Some(elapsed_ms(start)),
             status: Some(status_code),
             error_kind,
@@ -898,43 +990,151 @@ fn send_chunk(tee: &crate::proxy::TeeSender, id: &str, chunk: Bytes) {
     }
 }
 
-/// Decide + apply request-body masking (04 §7.6). Returns the bytes to forward
-/// upstream and the [`MaskAction`] taken.
-///
-/// Behaviour (observe-by-default invariant):
-/// - masking disabled -> `(original, Observed)` — pure passthrough.
-/// - masking enabled + dry-run -> `(original, WouldMask)` — body unchanged, but
-///   findings are recorded as `would_mask` by the logger.
-/// - masking enabled + live -> scan, redact HIGH-confidence spans in scope,
-///   and forward the redacted bytes as `Masked`. If nothing was actually
-///   maskable, returns `(original, Observed)` so we never claim a mask we did
-///   not perform.
-///
-/// **Fail-open:** this function never errors and never panics. Worst case it
-/// returns the ORIGINAL body untouched. Only HIGH-confidence findings in the
-/// configured kind allow-list are ever redacted (delegated to
-/// [`crate::brain::pii::mask`] / `should_mask`); low-confidence findings are
-/// never masked.
-fn mask_request_body(state: &ProxyState, body: &Bytes) -> (Bytes, MaskAction) {
-    // Masking (enabled / dry_run / kinds) is HOT-RELOADABLE: load the current
-    // config snapshot on every request so a Studio settings change applies live,
-    // without a restart. `.load()` is a cheap RCU read — fine on the hot path.
-    let cfg = state.config.load();
-    mask_body_with(
-        &cfg.masking,
-        &state.detector,
-        crate::brain::Side::Request,
-        body,
-    )
+/// Evaluate both policy blocking and live masking in a single JSON-aware pass
+/// over `body` so the hot path never parses or scans the request twice.
+fn evaluate_request_policy(
+    masking: &crate::config::MaskingConfig,
+    detector: &crate::brain::pii::Detector,
+    body: &Bytes,
+) -> (Bytes, MaskAction, Option<Vec<crate::brain::PiiKind>>) {
+    if !masking.enabled || body.is_empty() {
+        return (body.clone(), MaskAction::Observed, None);
+    }
+
+    if masking.dry_run {
+        if !masking.block_kinds.is_empty()
+            && block_decision(masking, detector, crate::brain::Side::Request, body).is_some()
+        {
+            return (body.clone(), MaskAction::WouldBlock, None);
+        }
+        return (body.clone(), MaskAction::WouldMask, None);
+    }
+
+    // Live mode: if valid JSON, walk decoded string leaf values once to check
+    // `block_kinds` AND redact maskable spans without corrupting JSON syntax.
+    let kinds = masking.kinds.as_deref();
+    if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(body) {
+        let mut hit_block: Vec<crate::brain::PiiKind> = Vec::new();
+        let mut masked_total = 0usize;
+        walk_json_strings_policy(
+            &mut val,
+            detector,
+            crate::brain::Side::Request,
+            &masking.block_kinds,
+            kinds,
+            &mut hit_block,
+            &mut masked_total,
+        );
+        if !hit_block.is_empty() {
+            return (body.clone(), MaskAction::Blocked, Some(hit_block));
+        }
+        if masked_total == 0 {
+            return (body.clone(), MaskAction::Observed, None);
+        }
+        return match serde_json::to_vec(&val) {
+            Ok(bytes) => (Bytes::from(bytes), MaskAction::Masked, None),
+            Err(_) => (body.clone(), MaskAction::Observed, None),
+        };
+    }
+
+    // Non-JSON fallback: single raw-text scan.
+    let text = String::from_utf8_lossy(body);
+    let findings = detector.scan(crate::brain::Side::Request, &text);
+    if !masking.block_kinds.is_empty() {
+        let mut hit: Vec<crate::brain::PiiKind> = Vec::new();
+        for f in &findings {
+            if f.confidence == crate::brain::Confidence::High
+                && masking.block_kinds.contains(&f.kind)
+                && !hit.contains(&f.kind)
+            {
+                hit.push(f.kind);
+            }
+        }
+        if !hit.is_empty() {
+            return (body.clone(), MaskAction::Blocked, Some(hit));
+        }
+    }
+    let (redacted, masked) = crate::brain::pii::mask(&text, &findings, kinds);
+    if masked == 0 {
+        return (body.clone(), MaskAction::Observed, None);
+    }
+    (Bytes::from(redacted.into_bytes()), MaskAction::Masked, None)
+}
+
+/// Recursively scan/mask decoded JSON string leaves in place. Stops masking
+/// once a block kind is found (since the whole request will be rejected).
+fn walk_json_strings_policy(
+    val: &mut serde_json::Value,
+    detector: &crate::brain::pii::Detector,
+    side: crate::brain::Side,
+    block_kinds: &[crate::brain::PiiKind],
+    mask_kinds: Option<&[crate::brain::PiiKind]>,
+    hit_block: &mut Vec<crate::brain::PiiKind>,
+    masked_total: &mut usize,
+) {
+    match val {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                return;
+            }
+            let findings = detector.scan(side, s);
+            if findings.is_empty() {
+                return;
+            }
+            for f in &findings {
+                if f.confidence == crate::brain::Confidence::High
+                    && block_kinds.contains(&f.kind)
+                    && !hit_block.contains(&f.kind)
+                {
+                    hit_block.push(f.kind);
+                }
+            }
+            if hit_block.is_empty() {
+                let (redacted, n) = crate::brain::pii::mask(s, &findings, mask_kinds);
+                if n > 0 {
+                    *s = redacted;
+                    *masked_total += n;
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                walk_json_strings_policy(
+                    item,
+                    detector,
+                    side,
+                    block_kinds,
+                    mask_kinds,
+                    hit_block,
+                    masked_total,
+                );
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                walk_json_strings_policy(
+                    v,
+                    detector,
+                    side,
+                    block_kinds,
+                    mask_kinds,
+                    hit_block,
+                    masked_total,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Core masking routine, decoupled from [`ProxyState`] so it is unit testable
 /// without a live store/tee. Used for both the request body ([`Side::Request`])
-/// and non-streamed response bodies ([`Side::Response`]); see `mask_request_body`
-/// for the behaviour / fail-open / low-confidence guarantees.
+/// and non-streamed response bodies ([`Side::Response`]).
 ///
-/// [`Side::Request`]: crate::brain::Side::Request
-/// [`Side::Response`]: crate::brain::Side::Response
+/// JSON-aware: parses JSON bodies and masks decoded string leaf values so
+/// regexes never corrupt JSON syntax (e.g. `RE_CONN_KV` or `RE_JSON_SECRET`)
+/// and properly inspect JSON-escaped newlines/quotes. Falls back to raw text
+/// only when the body is not valid JSON.
 fn mask_body_with(
     masking: &crate::config::MaskingConfig,
     detector: &crate::brain::pii::Detector,
@@ -946,17 +1146,33 @@ fn mask_body_with(
     }
 
     if masking.dry_run {
-        // Preview only: forward unchanged. The logger stamps `would_mask` on the
-        // findings (it re-scans the original body), so we do no work here beyond
-        // signalling the action.
         return (body.clone(), MaskAction::WouldMask);
     }
 
-    // Live masking. Scan the body text and redact maskable spans. A body that is
-    // not valid UTF-8 yields a lossy view; we only forward redacted bytes when at
-    // least one span was masked, otherwise we observe (never claim a no-op mask).
-    let text = String::from_utf8_lossy(body);
     let kinds = masking.kinds.as_deref();
+    if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(body) {
+        let mut ignored_blocks = Vec::new();
+        let mut masked_total = 0usize;
+        walk_json_strings_policy(
+            &mut val,
+            detector,
+            side,
+            &[],
+            kinds,
+            &mut ignored_blocks,
+            &mut masked_total,
+        );
+        if masked_total == 0 {
+            return (body.clone(), MaskAction::Observed);
+        }
+        return match serde_json::to_vec(&val) {
+            Ok(bytes) => (Bytes::from(bytes), MaskAction::Masked),
+            Err(_) => (body.clone(), MaskAction::Observed),
+        };
+    }
+
+    // Non-JSON fallback.
+    let text = String::from_utf8_lossy(body);
     let findings = detector.scan(side, &text);
     let (redacted, masked) = crate::brain::pii::mask(&text, &findings, kinds);
     if masked == 0 {
@@ -968,15 +1184,8 @@ fn mask_body_with(
 /// Decide whether a request must be **stopped** rather than masked.
 ///
 /// Returns the kinds that triggered the block, or `None` to proceed.
-///
-/// Blocking is the one place Saffev deliberately interferes with traffic, so the
-/// conditions are narrow and all of them must hold: masking is enabled, it is out
-/// of dry-run, the policy names at least one kind, and that kind is actually
-/// present. Anything else proceeds.
-///
-/// This does **not** weaken fail-open. Fail-open means an *internal error* never
-/// harms the user's traffic; every error path here still forwards. A block is not
-/// an error, it is the user's stated policy being carried out.
+/// JSON-aware so secrets inside JSON-escaped prompt strings (YAML/TOML/JSON
+/// credentials with `\n` / `\"`) are caught accurately.
 fn block_decision(
     masking: &crate::config::MaskingConfig,
     detector: &crate::brain::pii::Detector,
@@ -986,11 +1195,22 @@ fn block_decision(
     if !masking.enabled || masking.block_kinds.is_empty() || body.is_empty() {
         return None;
     }
-    let text = String::from_utf8_lossy(body);
     let mut hit: Vec<crate::brain::PiiKind> = Vec::new();
+    if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(body) {
+        let mut dummy_masked = 0usize;
+        walk_json_strings_policy(
+            &mut val,
+            detector,
+            side,
+            &masking.block_kinds,
+            Some(&[]),
+            &mut hit,
+            &mut dummy_masked,
+        );
+        return (!hit.is_empty()).then_some(hit);
+    }
+    let text = String::from_utf8_lossy(body);
     for f in detector.scan(side, &text) {
-        // Low-confidence guesses never stop a request. Blocking on a maybe would
-        // make the feature unusable and teach people to switch it off.
         if f.confidence != crate::brain::Confidence::High {
             continue;
         }
@@ -1052,11 +1272,32 @@ pub fn hash_body(body: &Bytes) -> String {
 // Header translation
 // ---------------------------------------------------------------------------
 
+/// True when `Content-Encoding` indicates a non-identity compressed body.
+fn headers_have_content_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+        })
+}
+
 /// Build the outgoing request headers: copy everything except hop-by-hop.
 fn forward_request_headers(src: &HeaderMap) -> HeaderMap {
+    forward_request_headers_for(src, false)
+}
+
+/// Like [`forward_request_headers`], stripping `Accept-Encoding` when live
+/// response masking is active so upstream returns uncompressed JSON/SSE we can
+/// safely inspect and redact.
+fn forward_request_headers_for(src: &HeaderMap, strip_accept_encoding: bool) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(src.len());
     for (name, value) in src.iter() {
         if is_hop_by_hop(name) {
+            continue;
+        }
+        if strip_accept_encoding && name == axum::http::header::ACCEPT_ENCODING {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -1112,6 +1353,8 @@ struct FinishGuard {
     tee: crate::proxy::TeeSender,
     id: String,
     start: Instant,
+    /// Proxy-observed TTFT (`0` = unset, else `elapsed_ms + 1`).
+    first_chunk_ms: Arc<std::sync::atomic::AtomicU64>,
     sent: bool,
     /// Upstream HTTP status for this exchange (we got a response).
     status: Option<u16>,
@@ -1126,6 +1369,10 @@ impl FinishGuard {
         }
         self.sent = true;
         let total = self.start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        let ttft_ms = match self.first_chunk_ms.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some((v - 1).min(u64::from(u32::MAX)) as u32),
+        };
         // A mid-stream failure is a transport error even though we saw a 2xx
         // status; record it so a truncated stream is distinguishable from a clean
         // finish. HTTP 4xx/5xx are carried by `status`, not `error_kind`.
@@ -1137,9 +1384,7 @@ impl FinishGuard {
         // Best-effort enqueue; never block on drop.
         let _ = self.tee.try_send(TeeEvent::ResponseFinished {
             id: self.id.clone(),
-            // TTFT is recomputed by the logger from the first ResponseChunk's
-            // arrival time; we pass None here and let the logger own the TTFT.
-            ttft_ms: None,
+            ttft_ms,
             total_ms: Some(total),
             status: self.status,
             error_kind,
@@ -1726,5 +1971,50 @@ mod tests {
         out.extend(fm.finish());
         let text = ndjson_text(&out);
         assert_eq!(text, "short text [EMAIL]");
+    }
+
+    #[test]
+    fn json_aware_masking_preserves_valid_json_and_catches_escaped_secrets() {
+        let cfg = crate::config::MaskingConfig {
+            enabled: true,
+            dry_run: false,
+            block_kinds: vec![crate::brain::PiiKind::EnvAssignment],
+            ..Default::default()
+        };
+
+        // 1. RE_CONN_KV inside JSON must NOT swallow `"}]}` and corrupt JSON.
+        let conn_body = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":"Server=db.internal;Password=hunter2secret99"}]}"#,
+        );
+        let (masked, action) =
+            mask_body_with(&cfg, &detector(), crate::brain::Side::Request, &conn_body);
+        assert_eq!(action, MaskAction::Masked);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&masked).expect("masked body must stay valid JSON");
+        let content = parsed["messages"][0]["content"].as_str().unwrap();
+        assert!(!content.contains("hunter2secret99"));
+        assert!(content.contains("[CONNECTION_STRING]"));
+
+        // 2. JSON-escaped YAML secret (`\n` inside content string) must be caught by block_decision.
+        let escaped_yaml = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":"config:\nsmtp_password: hunter2secret99\n"}]}"#,
+        );
+        let blocked = block_decision(
+            &cfg,
+            &detector(),
+            crate::brain::Side::Request,
+            &escaped_yaml,
+        );
+        assert_eq!(blocked, Some(vec![crate::brain::PiiKind::EnvAssignment]));
+    }
+
+    #[test]
+    fn sse_frame_masker_does_not_emit_triple_newlines() {
+        let mut fm = frame_masker(StreamKind::Sse);
+        let mut out = Vec::new();
+        out.extend(fm.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"));
+        out.extend(fm.feed(b"data: [DONE]\n\n"));
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("\n\n\n"), "triple newline emitted in SSE: {s:?}");
     }
 }

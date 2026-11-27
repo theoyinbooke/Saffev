@@ -126,3 +126,24 @@ async fn update_get_rejects_foreign_host() {
         "GET /api/update with a foreign Host must be 403"
     );
 }
+
+/// The static SPA/menubar fallback injects the per-install bearer token, so it
+/// must also enforce the Host allowlist against DNS rebinding.
+#[tokio::test]
+async fn static_token_shells_reject_foreign_host() {
+    for path in ["/", "/menubar.html", "/settings"] {
+        let router = test_router().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::HOST, "evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "GET {path} with a foreign Host must be 403"
+        );
+    }
+}

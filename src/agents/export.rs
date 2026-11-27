@@ -129,15 +129,22 @@ pub fn safe_filename_for(s: &super::AgentSession) -> String {
     format!("{}_{}_{}", s.tool.key(), slug, short_id_for(s))
 }
 
-/// The stable short-id suffix of [`safe_filename_for`] (used by mirroring to
-/// find files for a session whose title — the slug half — has changed).
+/// The stable, collision-resistant, filesystem- and header-safe short-id
+/// suffix of [`safe_filename_for`] (used by mirroring to find files for a
+/// session whose title — the slug half — has changed).
+///
+/// Uses a 10-hex-char SHA-256 prefix over the full `s.id`: guaranteed `[0-9a-f]`
+/// (never `/`, `..`, `:`, `"`, or `\r\n`) and never collides across same-day
+/// Goose (`YYYYMMDD_N`), same-project Aider, or bursty Cline epoch-ms IDs.
 pub fn short_id_for(s: &super::AgentSession) -> String {
-    super::split_id(&s.id)
-        .map(|(_, r)| r)
-        .unwrap_or(&s.id)
-        .chars()
-        .take(8)
-        .collect()
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(s.id.as_bytes());
+    let mut out = String::with_capacity(10);
+    for b in &digest[..5] {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 fn role_label(r: Role) -> &'static str {
@@ -226,8 +233,27 @@ mod tests {
 
     #[test]
     fn filename_is_safe() {
-        let f = safe_filename(&detail());
-        assert_eq!(f, "codex_fix-the-login-bug_abc123de");
+        let d = detail();
+        let f = safe_filename(&d);
+        assert_eq!(f, format!("codex_fix-the-login-bug_{}", short_id_for(&d.session)));
+        assert_eq!(short_id_for(&d.session).len(), 10);
+        assert!(short_id_for(&d.session)
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert!(!f.contains(' ') && !f.contains('!'));
+    }
+
+    #[test]
+    fn short_id_is_traversal_safe_and_collision_free() {
+        let mut s1 = detail().session;
+        s1.id = "codex:/../../evil\"\r\n".into();
+        let f = safe_filename_for(&s1);
+        assert!(!f.contains('/') && !f.contains("..") && !f.contains('"') && !f.contains('\n'));
+
+        let mut g1 = detail().session;
+        g1.id = "goose:20261127_1".into();
+        let mut g2 = detail().session;
+        g2.id = "goose:20261127_2".into();
+        assert_ne!(short_id_for(&g1), short_id_for(&g2));
     }
 }

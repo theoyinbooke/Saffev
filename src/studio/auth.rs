@@ -59,7 +59,9 @@ pub async fn require_token(State(state): State<StudioState>, req: Request, next:
         .and_then(|v| v.strip_prefix(BEARER_PREFIX));
 
     match presented {
-        Some(token) if token_matches(token, state.token.as_ref()) => next.run(req).await,
+        Some(token) if !state.token.is_empty() && token_matches(token, state.token.as_ref()) => {
+            next.run(req).await
+        }
         _ => api_error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -112,14 +114,14 @@ pub fn cors_layer(studio_port: u16) -> CorsLayer {
 pub fn token_matches(presented: &str, expected: &str) -> bool {
     let a = presented.as_bytes();
     let b = expected.as_bytes();
-    // Fold the length difference into the accumulator so mismatched lengths
-    // still take a full pass and always fail.
-    let mut diff: u8 = (a.len() ^ b.len()) as u8;
+    // Fold the full usize length difference into the accumulator (never cast to
+    // u8, which would alias lengths differing by multiples of 256).
+    let mut diff: usize = a.len() ^ b.len();
     let n = a.len().max(b.len());
     for i in 0..n {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -140,6 +142,10 @@ mod tests {
         assert!(!token_matches("abc123", "abc"));
         assert!(!token_matches("", "abc"));
         assert!(!token_matches("abc", ""));
+        // Regression: 256-byte NUL padding must not alias length via `as u8`.
+        let mut padded = String::from("abc123");
+        padded.push_str(&"\0".repeat(256));
+        assert!(!token_matches(&padded, "abc123"));
     }
 
     #[test]

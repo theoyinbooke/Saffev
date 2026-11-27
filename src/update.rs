@@ -221,15 +221,23 @@ fn build_updater() -> (AxoUpdater, bool) {
 }
 
 /// Check whether a newer release is available. **Fail-soft**: any error (no
-/// receipt, offline, GitHub unreachable, rate-limited) yields a status with
-/// `available = false` rather than an `Err`, so the Studio can call this on every
-/// load without risk. PRIVACY: contacts GitHub release metadata only.
+/// receipt, offline, GitHub unreachable, rate-limited, timeout) yields a status
+/// with `available = false` rather than an `Err`, so the Studio can call this
+/// on every load without risk. PRIVACY: contacts GitHub release metadata only.
 pub async fn check() -> UpdateStatus {
-    let (mut updater, _has_receipt) = build_updater();
+    let Ok((mut updater, _has_receipt)) = tokio::task::spawn_blocking(build_updater).await else {
+        return UpdateStatus::unknown();
+    };
 
-    // Query the latest version. This is the single outbound metadata call.
-    match updater.query_new_version().await {
-        Ok(Some(latest)) => {
+    // Query the latest version with a hard timeout so a blackholed network
+    // never stalls `GET /api/update` or `check_cached()`.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        updater.query_new_version(),
+    )
+    .await
+    {
+        Ok(Ok(Some(latest))) => {
             let latest = latest.to_string();
             let available = is_newer(CURRENT_VERSION, &latest);
             UpdateStatus {
@@ -238,8 +246,8 @@ pub async fn check() -> UpdateStatus {
                 available,
             }
         }
-        // No release found, or any error — degrade quietly to "couldn't check".
-        Ok(None) | Err(_) => UpdateStatus::unknown(),
+        // No release found, timeout, or any error — degrade quietly.
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => UpdateStatus::unknown(),
     }
 }
 
@@ -251,22 +259,36 @@ pub async fn check() -> UpdateStatus {
 /// limit within minutes. The CLI's explicit `saffev update --check` still
 /// calls [`check`] directly.
 pub async fn check_cached() -> UpdateStatus {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     static LAST: Mutex<Option<(Instant, UpdateStatus)>> = Mutex::new(None);
+    static REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     const KNOWN_TTL: Duration = Duration::from_secs(6 * 3600);
     const UNKNOWN_TTL: Duration = Duration::from_secs(30 * 60);
-    if let Ok(last) = LAST.lock() {
-        if let Some((at, status)) = last.as_ref() {
-            let ttl = if status.latest_version.is_some() {
-                KNOWN_TTL
-            } else {
-                UNKNOWN_TTL
-            };
-            if at.elapsed() < ttl {
-                return status.clone();
-            }
-        }
+
+    let read_fresh = || {
+        LAST.lock().ok().and_then(|last| {
+            last.as_ref().and_then(|(at, status)| {
+                let ttl = if status.latest_version.is_some() {
+                    KNOWN_TTL
+                } else {
+                    UNKNOWN_TTL
+                };
+                (at.elapsed() < ttl).then(|| status.clone())
+            })
+        })
+    };
+
+    if let Some(hit) = read_fresh() {
+        return hit;
+    }
+    // Coalesce concurrent cold callers onto one outbound check.
+    let _guard = REFRESH_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    if let Some(hit) = read_fresh() {
+        return hit;
     }
     let status = check().await;
     if let Ok(mut last) = LAST.lock() {
@@ -280,12 +302,35 @@ pub async fn check_cached() -> UpdateStatus {
 /// [`UpdateError::NoReceipt`] so callers can show the friendly guidance. On
 /// success returns the installed version; if already current, `updated = false`.
 pub async fn apply() -> Result<ApplyOutcome, UpdateError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static APPLY_RUNNING: AtomicBool = AtomicBool::new(false);
+    struct ResetGuard<'a>(&'a AtomicBool);
+    impl Drop for ResetGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    if APPLY_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(UpdateError::Failed(
+            "An update is already in progress.".to_string(),
+        ));
+    }
+    let _reset = ResetGuard(&APPLY_RUNNING);
+
     // Refuse up front when this install can't self-apply (no receipt, or a
     // DMG .app whose receipt would update the WRONG binary) — before any
     // network call.
-    apply_capability()?;
+    tokio::task::spawn_blocking(apply_capability)
+        .await
+        .map_err(|e| UpdateError::Failed(e.to_string()))??;
 
-    let (mut updater, _has_receipt) = build_updater();
+    let (mut updater, _has_receipt) = tokio::task::spawn_blocking(build_updater)
+        .await
+        .map_err(|e| UpdateError::Failed(e.to_string()))?;
 
     match updater.run().await {
         // An update was installed.

@@ -371,69 +371,56 @@ async fn run_eval_worker(
         if cfg.eval.safety {
             run_safety_guard(&store, &events, &rec);
         }
-        // Model-backed safety guard: the plug-in slot for a purpose-trained
-        // (e.g. localized) guard. Additive to the deterministic floor above, and
-        // gated exactly like the judge — same non-blocking slot reservation, so
-        // under load an extra guard call is DROPPED rather than queued and the
-        // user's engine is never thrashed.
-        if cfg.eval.safety {
-            if let Some(model) = cfg
-                .eval
+        // Model-backed safety guard + quality judge share `judge_sem` (default
+        // concurrency 1 so the local engine is never thrashed). When BOTH are
+        // enabled for a record, run them sequentially inside ONE spawned task
+        // under ONE permit so `guard_model` never permanently starves `judge_model`.
+        let guard_model = if cfg.eval.safety {
+            cfg.eval
                 .guard_model
                 .clone()
                 .filter(|m| !m.trim().is_empty())
-            {
-                if let Some(permit) = reserve_judge_slot(&judge_sem, &metrics) {
-                    let backend = EngineBackend {
-                        base: upstream.clone(),
-                        model: model.clone(),
-                        timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
-                    };
-                    let store = store.clone();
-                    let events = events.clone();
-                    let rec = rec.clone();
-                    let metrics = metrics.clone();
-                    metrics.inflight.fetch_add(1, Relaxed);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        run_model_guard(&store, &events, &backend, &model, &rec).await;
-                        metrics.inflight.fetch_sub(1, Relaxed);
-                        metrics.completed.fetch_add(1, Relaxed);
-                    });
-                }
-            }
-        }
-
-        // Quality judge: model-backed, opt-in, sampled, concurrency-gated. We
-        // reserve a slot in the LOOP (non-blocking): if all slots are busy the
-        // judge is dropped for this record — shedding load rather than queueing
-        // unboundedly. On success we spawn so the loop keeps draining.
-        if cfg.eval.quality {
-            if let Some(model) = cfg
-                .eval
+        } else {
+            None
+        };
+        let judge_model = if cfg.eval.quality && sampled(&rec.record_id, cfg.eval.sample_rate) {
+            cfg.eval
                 .judge_model
                 .clone()
                 .filter(|m| !m.trim().is_empty())
-            {
-                if sampled(&rec.record_id, cfg.eval.sample_rate) {
-                    if let Some(permit) = reserve_judge_slot(&judge_sem, &metrics) {
+        } else {
+            None
+        };
+        if guard_model.is_some() || judge_model.is_some() {
+            if let Some(permit) = reserve_judge_slot(&judge_sem, &metrics) {
+                let timeout = std::time::Duration::from_millis(cfg.eval.timeout_ms as u64);
+                let upstream = upstream.clone();
+                let store = store.clone();
+                let events = events.clone();
+                let rec = rec.clone();
+                let metrics = metrics.clone();
+                metrics.inflight.fetch_add(1, Relaxed);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Some(model) = guard_model {
                         let backend = EngineBackend {
                             base: upstream.clone(),
-                            model,
-                            timeout: std::time::Duration::from_millis(cfg.eval.timeout_ms as u64),
+                            model: model.clone(),
+                            timeout,
                         };
-                        let store = store.clone();
-                        let rec = rec.clone();
-                        let metrics = metrics.clone();
-                        metrics.inflight.fetch_add(1, Relaxed);
-                        tokio::spawn(async move {
-                            let _permit = permit; // held for the call's lifetime
-                            run_quality_judge(&store, &backend, &rec).await;
-                            metrics.inflight.fetch_sub(1, Relaxed);
-                            metrics.completed.fetch_add(1, Relaxed);
-                        });
+                        run_model_guard(&store, &events, &backend, &model, &rec).await;
                     }
-                }
+                    if let Some(model) = judge_model {
+                        let backend = EngineBackend {
+                            base: upstream,
+                            model,
+                            timeout,
+                        };
+                        run_quality_judge(&store, &backend, &rec).await;
+                    }
+                    metrics.inflight.fetch_sub(1, Relaxed);
+                    metrics.completed.fetch_add(1, Relaxed);
+                });
             }
         }
     }
@@ -588,16 +575,10 @@ async fn run_model_guard(
     model: &str,
     rec: &crate::brain::JudgeRecord,
 ) {
-    let mut text = String::new();
-    if let Some(p) = &rec.prompt {
-        text.push_str(p);
-        text.push('\n');
-    }
-    if let Some(r) = &rec.response {
-        text.push_str(r);
-    }
     let guard = crate::brain::guard::ModelGuard::new(model);
-    let hits = guard.scan_with(backend, &text).await;
+    let hits = guard
+        .scan_exchange_with(backend, rec.prompt.as_deref(), rec.response.as_deref())
+        .await;
     if hits.is_empty() {
         return;
     }
@@ -672,10 +653,18 @@ fn run_safety_guard(
 const MAX_RESPONSE_BUFFER: usize = 16 * 1024 * 1024;
 
 /// In-flight state for one exchange, keyed by correlation id.
+/// Hard cap and TTL on tracked in-flight exchanges so a dropped
+/// `ResponseFinished` tee event under load can never leak memory indefinitely.
+const MAX_INFLIGHT: usize = 512;
+const INFLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
 struct InFlight {
     endpoint: String,
     source_app: Option<String>,
     request_body: Bytes,
+    /// Pre-extracted prompt text from the single request JSON parse (reused for
+    /// token estimation and the eval pipeline without re-parsing JSON).
+    prompt_text: String,
     model: Option<String>,
     stream: bool,
     input_tokens: Option<u32>,
@@ -690,7 +679,7 @@ struct InFlight {
     resp_bytes: u64,
     /// When the request started (for latency).
     started: Instant,
-    /// When the first response chunk arrived (for TTFT).
+    /// When the first response chunk arrived (fallback TTFT).
     first_chunk_at: Option<Instant>,
     /// Unix-millis timestamp the request started (for the stored `ts`).
     ts_millis: i64,
@@ -732,8 +721,9 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
                     body,
                     mask_action,
                     peer,
-                    &headers,
-                );
+                    headers,
+                )
+                .await;
             }
             TeeEvent::ResponseChunk { id, chunk } => {
                 if let Some(entry) = inflight.get_mut(&id) {
@@ -790,8 +780,55 @@ async fn run_logger(state: ProxyState, mut rx: TeeReceiver) {
     tracing::debug!("proxy: tee closed, logger exiting");
 }
 
+/// Evict stale entries from `inflight` if it reaches [`MAX_INFLIGHT`] so a
+/// dropped `ResponseFinished` event can never leak up to 80 MiB indefinitely.
+fn evict_stale_inflight(inflight: &mut HashMap<String, InFlight>) {
+    if inflight.len() < MAX_INFLIGHT {
+        return;
+    }
+    inflight.retain(|_, v| v.started.elapsed() < INFLIGHT_TTL);
+    if inflight.len() >= MAX_INFLIGHT {
+        if let Some(oldest_id) = inflight
+            .iter()
+            .min_by_key(|(_, v)| v.started)
+            .map(|(k, _)| k.clone())
+        {
+            inflight.remove(&oldest_id);
+        }
+    }
+}
+
+/// Scan decoded JSON string leaves so logger findings stay 1-for-1 with the
+/// JSON-aware masking/blocking path (catching JSON-escaped YAML/TOML/JSON
+/// secrets and avoiding JSON syntax noise).
+fn scan_json_strings(
+    val: &serde_json::Value,
+    detector: &crate::brain::pii::Detector,
+    side: Side,
+    out: &mut Vec<crate::brain::Finding>,
+) {
+    match val {
+        serde_json::Value::String(s) => {
+            if !s.is_empty() {
+                out.extend(detector.scan(side, s));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                scan_json_strings(item, detector, side, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                scan_json_strings(v, detector, side, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn on_request_started(
+async fn on_request_started(
     state: &ProxyState,
     inflight: &mut HashMap<String, InFlight>,
     engine_label: &str,
@@ -801,36 +838,57 @@ fn on_request_started(
     body: Bytes,
     mask_action: MaskAction,
     peer: Option<std::net::SocketAddr>,
-    headers: &axum::http::HeaderMap,
+    headers: axum::http::HeaderMap,
 ) {
     let started = Instant::now();
     let ts_millis = now_millis();
 
-    // Parse the request JSON cheaply for `model` and `stream`, plus the
-    // metadata-only shape/params (G4): sampling params, message/tool counts,
-    // system-prompt presence. Never the content itself.
-    let (model, stream) = parse_request_meta(&body);
-    let params = parse_request_params(&body);
+    // Parse the request JSON ONCE to extract model, stream, sampling/shape
+    // params, prompt text, and JSON-decoded PII findings.
+    let parsed_json = (!body.is_empty())
+        .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .flatten();
+    let (model, stream, params, prompt_text) = match parsed_json.as_ref() {
+        Some(v) => {
+            let (m, s) = parse_request_meta_from_value(v);
+            let p = parse_request_params_from_value(v);
+            let pt = crate::tokens::extract_prompt_text_from_value(v);
+            (m, s, p, pt)
+        }
+        None => (None, false, RequestParams::default(), String::new()),
+    };
 
-    // Inline-cheap deterministic PII scan of the request body text.
-    let request_text = lossy_str(&body);
-    let findings = state.detector.scan(Side::Request, &request_text);
+    // Deterministic PII scan over decoded JSON leaves (or raw text if non-JSON).
+    let request_text = if payload_storage || parsed_json.is_none() {
+        lossy_str(&body)
+    } else {
+        String::new()
+    };
+    let findings = match parsed_json.as_ref() {
+        Some(v) => {
+            let mut found = Vec::new();
+            scan_json_strings(v, &state.detector, Side::Request, &mut found);
+            found
+        }
+        None => state.detector.scan(Side::Request, &request_text),
+    };
 
-    // Engine-reported input usage is rarely on the request; estimate is async
-    // and off-path (not done here). Leave input tokens unknown for now.
     let input_tokens = None;
     let input_tokens_src = TokenSource::Estimated;
-
     let request_hash = upstream::hash_body(&body);
+    let user_agent = header_value(&headers, axum::http::header::USER_AGENT, 120);
+    let content_type = header_value(&headers, axum::http::header::CONTENT_TYPE, 60);
 
-    // Resolve source-app **here**, off the request hot path (04 §7.2): socket-PID
-    // first (highest confidence), then the header fallback, then Unknown. The
-    // PID probe is best-effort and fail-soft — any error degrades to the header
-    // layer without disturbing logging. When we have no peer (connect info was
-    // unavailable) we resolve from headers alone.
-    let resolved = crate::attribution::resolve_opt(peer, headers);
-    let source_app = resolved.name;
-    let source_confidence = resolved.confidence;
+    // Offload socket-PID attribution (`lsof` on macOS / `/proc` walk on Linux)
+    // onto the blocking thread pool so it never stalls a Tokio worker thread.
+    let (source_app, source_confidence) = match tokio::task::spawn_blocking(move || {
+        crate::attribution::resolve_opt(peer, &headers)
+    })
+    .await
+    {
+        Ok(r) => (r.name, r.confidence),
+        Err(_) => (None, crate::store::SourceConfidence::Unknown),
+    };
 
     let meta = RequestMeta {
         id: id.clone(),
@@ -846,8 +904,8 @@ fn on_request_started(
         latency_ms: None,
         request_hash,
         req_bytes: Some(body.len().min(u32::MAX as usize) as u32),
-        user_agent: header_value(headers, axum::http::header::USER_AGENT, 120),
-        content_type: header_value(headers, axum::http::header::CONTENT_TYPE, 60),
+        user_agent,
+        content_type,
         temperature: params.temperature,
         top_p: params.top_p,
         max_tokens: params.max_tokens,
@@ -881,25 +939,39 @@ fn on_request_started(
     let request_meta = meta.clone();
     state.store.enqueue(WriteOp::Request(meta));
 
-    // Enqueue request-side PII findings (if any). The action recorded per
-    // finding reflects what masking did to the forwarded body: `observed` (off /
-    // nothing maskable), `would_mask` (dry-run), or `masked` (redacted before
-    // forwarding). Only HIGH-confidence findings are eligible for the non-observe
-    // actions — a low-confidence finding is always recorded as `observed` since
-    // it is never masked (see `pii::should_mask`).
+    // Enqueue request-side PII findings (if any). For `Blocked` / `WouldBlock`,
+    // stamp findings according to `block_kinds` (not `masking.kinds`), so only
+    // the kinds that actually triggered the block are marked blocked.
     if !findings.is_empty() {
-        // Masking kind allow-list is HOT-RELOADABLE: load the live snapshot so the
-        // recorded action matches what the request path actually did.
         let cfg = state.config.load();
         let mask_kinds = cfg.masking.kinds.as_deref();
+        let block_kinds = &cfg.masking.block_kinds;
         let records: Vec<PiiFindingRecord> = findings
             .iter()
             .map(|f| {
                 let action = match mask_action {
                     MaskAction::Observed => PiiAction::Observed,
+                    MaskAction::Blocked => {
+                        if f.confidence == crate::brain::Confidence::High
+                            && block_kinds.contains(&f.kind)
+                        {
+                            PiiAction::Blocked
+                        } else {
+                            PiiAction::Observed
+                        }
+                    }
+                    MaskAction::WouldBlock => {
+                        if f.confidence == crate::brain::Confidence::High
+                            && block_kinds.contains(&f.kind)
+                        {
+                            PiiAction::WouldBlock
+                        } else if crate::brain::pii::should_mask(f, mask_kinds) {
+                            PiiAction::WouldMask
+                        } else {
+                            PiiAction::Observed
+                        }
+                    }
                     other if crate::brain::pii::should_mask(f, mask_kinds) => other.to_pii_action(),
-                    // Masking was active but this specific finding is not
-                    // maskable (low confidence / out of allow-list): observe it.
                     _ => PiiAction::Observed,
                 };
                 PiiFindingRecord::from_finding(&id, f, action)
@@ -924,12 +996,14 @@ fn on_request_started(
         }));
     }
 
+    evict_stale_inflight(inflight);
     inflight.insert(
         id,
         InFlight {
             endpoint,
             source_app,
             request_body: body,
+            prompt_text,
             model,
             stream,
             input_tokens,
@@ -954,7 +1028,7 @@ fn on_response_finished(
     payload_storage: bool,
     id: String,
     entry: InFlight,
-    _ttft_from_event: Option<u32>,
+    ttft_from_event: Option<u32>,
     total_ms: Option<u32>,
     status: Option<u16>,
     error_kind: Option<String>,
@@ -963,14 +1037,21 @@ fn on_response_finished(
     let response_bytes = entry.response_buf.freeze();
     let response_text = lossy_str(&response_bytes);
 
-    // TTFT: prefer the logger-observed first-chunk timestamp (authoritative for
-    // streamed responses); fall back to None for non-streamed.
-    let ttft_ms = entry
-        .first_chunk_at
-        .map(|t| millis_between(entry.started, t));
+    // TTFT: prefer the proxy-measured first-chunk timestamp (unaffected by
+    // logger attribution latency); fall back to logger-observed arrival time.
+    let ttft_ms = ttft_from_event.or_else(|| {
+        entry
+            .first_chunk_at
+            .map(|t| millis_between(entry.started, t))
+    });
 
     // Total time: prefer the value the forwarder measured; else derive it.
     let total = total_ms.or_else(|| Some(millis_since(entry.started)));
+
+    // Extract decoded completion text ONCE — reused for response PII scanning
+    // (catching multi-token streamed PII across SSE/NDJSON frames), fallback
+    // output token estimation, and the eval pipeline.
+    let completion = crate::tokens::extract_completion_text(&response_bytes);
 
     // Token accounting: trust engine-reported usage when present (exact).
     let (in_count, out_count) = crate::tokens::extract_usage(&response_bytes);
@@ -978,10 +1059,6 @@ fn on_response_finished(
     let (output_tokens, output_tokens_src) = match out_count {
         Some(tc) => (Some(tc.value), tc.source),
         None => {
-            // Engine reported no output usage (e.g. OpenAI streaming without
-            // `include_usage`). Estimate from the generated text so the row shows
-            // a `~count` instead of nothing. Off the hot path (logger task).
-            let completion = crate::tokens::extract_completion_text(&response_bytes);
             if completion.is_empty() {
                 (None, TokenSource::Estimated)
             } else {
@@ -1000,15 +1077,12 @@ fn on_response_finished(
         Some(tc) => (Some(tc.value), tc.source),
         None => match entry.request_meta.input_tokens {
             Some(v) => (Some(v), entry.request_meta.input_tokens_src),
-            // No engine-reported input usage anywhere: estimate from the prompt
-            // text of the original request body (off the hot path).
             None => {
-                let prompt = crate::tokens::extract_prompt_text(&entry.request_body);
-                if prompt.is_empty() {
+                if entry.prompt_text.is_empty() {
                     (None, TokenSource::Estimated)
                 } else {
                     (
-                        Some(crate::tokens::estimate_count(&prompt)),
+                        Some(crate::tokens::estimate_count(&entry.prompt_text)),
                         TokenSource::Estimated,
                     )
                 }
@@ -1037,12 +1111,18 @@ fn on_response_finished(
         resp_bytes: Some(entry.resp_bytes.min(u32::MAX as u64) as u32),
     };
 
-    // Response-side PII findings (computed before building the live item so the
-    // finished row carries the full request+response kind set).
-    let resp_findings = if response_text.is_empty() {
+    // Response-side PII findings: scan reassembled completion text when present
+    // so multi-token streamed PII is caught, falling back to raw response text
+    // for non-chat endpoints.
+    let resp_scan_text = if !completion.is_empty() {
+        completion.as_str()
+    } else {
+        response_text.as_str()
+    };
+    let resp_findings = if resp_scan_text.is_empty() {
         Vec::new()
     } else {
-        state.detector.scan(Side::Response, &response_text)
+        state.detector.scan(Side::Response, resp_scan_text)
     };
 
     // Live SSE: the exchange settled — push the final row (latency = total_ms,
@@ -1070,10 +1150,7 @@ fn on_response_finished(
 
     state.store.enqueue(WriteOp::Response(response_meta));
 
-    // Persist response-side findings + surface them live. The action reflects
-    // what masking did to the RESPONSE body: `masked` when a non-streamed body
-    // was redacted before forwarding, else `observed` (streamed responses are not
-    // masked). Only HIGH-confidence findings in the allow-list are ever masked.
+    // Persist response-side findings + surface them live.
     if !resp_findings.is_empty() {
         let cfg = state.config.load();
         let mask_kinds = cfg.masking.kinds.as_deref();
@@ -1109,18 +1186,13 @@ fn on_response_finished(
         }));
     }
 
-    // Eval pipeline (async, off the request hot path): when enabled, hand a record
-    // to the eval worker. Best-effort `try_send` — a full queue drops it
-    // (fail-open); we never block the logger. The prompt/response text is passed
-    // transiently to the worker and is NOT persisted here (payload storage is a
-    // separate, explicit opt-in above).
+    // Eval pipeline (async, off the request hot path): reuse already-extracted
+    // prompt + completion text without re-parsing JSON.
     if state.config.load().eval.enabled {
-        let prompt = crate::tokens::extract_prompt_text(&entry.request_body);
-        let response = crate::tokens::extract_completion_text(&response_bytes);
         let jr = crate::brain::JudgeRecord {
             record_id: id.clone(),
-            prompt: (!prompt.is_empty()).then_some(prompt),
-            response: (!response.is_empty()).then_some(response),
+            prompt: (!entry.prompt_text.is_empty()).then_some(entry.prompt_text),
+            response: (!completion.is_empty()).then_some(completion),
             context: None,
         };
         if state.eval_tx.try_send(jr).is_err() {
@@ -1157,26 +1229,25 @@ fn lossy_str(b: &Bytes) -> String {
 /// Defaults: `stream=true` for chat/generate-style bodies when unspecified
 /// (Ollama defaults to streaming), `stream=false` when the field is absent and
 /// the body is empty (e.g. GET routes).
+fn parse_request_meta_from_value(v: &serde_json::Value) -> (Option<String>, bool) {
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let stream = match v.get("stream") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        _ => model.is_some(),
+    };
+    (model, stream)
+}
+
+#[cfg(test)]
 fn parse_request_meta(body: &Bytes) -> (Option<String>, bool) {
     if body.is_empty() {
         return (None, false);
     }
     match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(v) => {
-            let model = v
-                .get("model")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string());
-            // `stream` is `true` by default for Ollama /api/chat & /api/generate
-            // and must be opt-in `true` for OpenAI; we read the explicit field
-            // and default to `true` when a model is present but stream is unset
-            // (matches Ollama's default-on behavior).
-            let stream = match v.get("stream") {
-                Some(serde_json::Value::Bool(b)) => *b,
-                _ => model.is_some(),
-            };
-            (model, stream)
-        }
+        Ok(v) => parse_request_meta_from_value(&v),
         Err(_) => (None, false),
     }
 }
@@ -1193,20 +1264,19 @@ struct RequestParams {
     tool_count: Option<u32>,
 }
 
-/// Best-effort extract of sampling params + body shape from a request JSON
-/// body. OpenAI-style bodies carry params at the root; Ollama-style bodies nest
-/// them under `options` ({"options":{"temperature":0,...}}) — the root is
-/// checked first, then `options`. The completion cap is `max_tokens` (OpenAI)
-/// or `num_predict` (Ollama options). Non-JSON / empty bodies yield all-`None`.
+#[cfg(test)]
 fn parse_request_params(body: &Bytes) -> RequestParams {
-    let mut p = RequestParams::default();
     if body.is_empty() {
-        return p;
+        return RequestParams::default();
     }
-    let v: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return p,
-    };
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(v) => parse_request_params_from_value(&v),
+        Err(_) => RequestParams::default(),
+    }
+}
+
+fn parse_request_params_from_value(v: &serde_json::Value) -> RequestParams {
+    let mut p = RequestParams::default();
 
     let options = v.get("options");
     let lookup = |field: &str| v.get(field).or_else(|| options.and_then(|o| o.get(field)));
@@ -1218,8 +1288,6 @@ fn parse_request_params(body: &Bytes) -> RequestParams {
         .and_then(|x| x.as_u64())
         .map(|n| n.min(u32::MAX as u64) as u32);
 
-    // Body shape: a chat body has a `messages` array; a completion body has a
-    // `prompt` string (counted as 1 message). Anything else stays unknown.
     let has_top_system = v.get("system").is_some();
     if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
         p.msg_count = Some(msgs.len().min(u32::MAX as usize) as u32);

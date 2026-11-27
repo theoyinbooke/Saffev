@@ -38,6 +38,11 @@ pub const HOLDBACK_BYTES: usize = 160;
 /// unbounded buffer (fail-open).
 pub const MAX_TAIL_BYTES: usize = 4096;
 
+/// Left-context bytes retained (read-only) across cuts so context-sensitive
+/// guards (`version 1.2.3.4`, mid-line YAML/TOML, phone `+`, IBAN prefix) keep
+/// working after a holdback cut.
+const CONTEXT_BYTES: usize = 48;
+
 /// Incremental masker over a stream of decoded text deltas.
 ///
 /// Feed deltas with [`push`], which returns the masked text that is now safe
@@ -52,9 +57,15 @@ pub struct StreamMasker {
     detector: Arc<Detector>,
     side: Side,
     kinds: Option<Vec<PiiKind>>,
+    /// Read-only raw context immediately preceding `tail` (up to `CONTEXT_BYTES`).
+    prev_context: String,
     /// Raw (unmasked) text not yet emitted. Kept raw so offsets from rescans
     /// stay valid; masking is applied only at emission time.
     tail: String,
+    /// True while suppressing a PEM private-key body whose header was already
+    /// masked to `[PRIVATE_KEY]` (spanning beyond `MAX_TAIL_BYTES`) until its
+    /// matching `-----END ... PRIVATE KEY-----` footer arrives.
+    in_pem: bool,
     masked_total: usize,
 }
 
@@ -66,7 +77,9 @@ impl StreamMasker {
             detector,
             side,
             kinds,
+            prev_context: String::new(),
             tail: String::new(),
+            in_pem: false,
             masked_total: 0,
         }
     }
@@ -79,49 +92,186 @@ impl StreamMasker {
     /// Append a decoded text delta; return the masked text now safe to emit.
     pub fn push(&mut self, delta: &str) -> String {
         self.tail.push_str(delta);
+        if self.in_pem {
+            return self.drain_pem_body();
+        }
         self.emit_up_to_holdback()
     }
 
     /// Stream end: mask and drain everything still held back.
     pub fn flush(&mut self) -> String {
+        if self.in_pem {
+            let mut out = self.drain_pem_body();
+            if self.in_pem {
+                // Stream ended mid-PEM without an END banner; drop the raw key
+                // body (we already emitted `[PRIVATE_KEY]` when entering `in_pem`).
+                self.tail.clear();
+                self.in_pem = false;
+                return out;
+            }
+            out.push_str(&self.flush());
+            return out;
+        }
         if self.tail.is_empty() {
             return String::new();
         }
         let text = std::mem::take(&mut self.tail);
-        let findings = self.detector.scan(self.side, &text);
+        let findings = self.scan_with_context(&text);
         let (masked, n) = mask(&text, &findings, self.kinds.as_deref());
         self.masked_total += n;
+        self.prev_context.clear();
         masked
+    }
+
+    /// True if `kind` is enabled for live masking under this stream's config.
+    fn kind_maskable(&self, kind: PiiKind) -> bool {
+        self.kinds
+            .as_ref()
+            .map_or(true, |allowed| allowed.contains(&kind))
+    }
+
+    /// Scan `tail` with `prev_context` prepended so line-start and left-context
+    /// guards stay accurate across cuts. Returns findings with offsets relative
+    /// to `tail` (filtering out anything starting in `prev_context`).
+    fn scan_with_context(&self, text: &str) -> Vec<crate::brain::Finding> {
+        if self.prev_context.is_empty() {
+            return self.detector.scan(self.side, text);
+        }
+        let prefix_len = self.prev_context.len();
+        let mut combined = String::with_capacity(prefix_len + text.len());
+        combined.push_str(&self.prev_context);
+        combined.push_str(text);
+        self.detector
+            .scan(self.side, &combined)
+            .into_iter()
+            .filter(|f| f.start >= prefix_len)
+            .map(|mut f| {
+                f.start -= prefix_len;
+                f.end -= prefix_len;
+                f
+            })
+            .collect()
+    }
+
+    /// Consume raw PEM body bytes until `-----END ... PRIVATE KEY-----` arrives,
+    /// then resume normal streaming on any trailing text after the footer.
+    fn drain_pem_body(&mut self) -> String {
+        if let Some(end_idx) = find_pem_end_after(&self.tail, 0) {
+            self.tail.drain(..end_idx);
+            self.prev_context.clear();
+            self.in_pem = false;
+            return self.emit_up_to_holdback();
+        }
+        // Keep only enough tail bytes to recognize a split `-----END ... PRIVATE KEY-----`.
+        const PEM_END_KEEP: usize = 64;
+        if self.tail.len() > PEM_END_KEEP {
+            let mut drop_to = self.tail.len() - PEM_END_KEEP;
+            while drop_to > 0 && !self.tail.is_char_boundary(drop_to) {
+                drop_to -= 1;
+            }
+            self.tail.drain(..drop_to);
+        }
+        String::new()
     }
 
     /// Emit the prefix of `tail` that is outside the holdback window, masked.
     /// The cut never lands inside a maskable finding (it is moved back to the
-    /// finding's start so the span stays whole in the tail for the next round)
-    /// and always lands on a UTF-8 char boundary.
+    /// finding's start so the span stays whole in the tail for the next round),
+    /// holds open PEM blocks and long `eyJ` JWTs, and always lands on a UTF-8
+    /// char boundary.
     fn emit_up_to_holdback(&mut self) -> String {
         if self.tail.len() <= HOLDBACK_BYTES {
             return String::new();
         }
-        let text = &self.tail;
-        let findings = self.detector.scan(self.side, text);
+        let findings = self.scan_with_context(&self.tail);
+        let text = self.tail.as_str();
 
-        let mut cut = text.len() - HOLDBACK_BYTES;
+        let default_cut = {
+            let mut c = text.len() - HOLDBACK_BYTES;
+            while c > 0 && !text.is_char_boundary(c) {
+                c -= 1;
+            }
+            c
+        };
+        let mut cut = default_cut;
+
+        // Snap `cut` backward up to 32 bytes to a whitespace boundary BEFORE
+        // finding-straddle / PEM / JWT protection so tokens and context words
+        // aren't sliced mid-word, while any space-containing finding (e.g. a
+        // credit card or phone number) straddling the snapped cut is still
+        // pulled back cleanly to `f.start` below.
+        if cut > 0 {
+            let mut floor = cut.saturating_sub(32);
+            while floor < cut && !text.is_char_boundary(floor) {
+                floor += 1;
+            }
+            if let Some(ws) = text[floor..cut]
+                .rfind(|c: char| c.is_ascii_whitespace())
+                .map(|rel| floor + rel + 1)
+            {
+                if ws > 0 {
+                    cut = ws;
+                }
+            }
+        }
+        let mut open_pem_start: Option<usize> = None;
+
         // Never split a maskable span: if one straddles the cut, hold the whole
-        // span back. (Non-maskable findings may be split — they are forwarded
-        // verbatim either way.)
+        // span back. For an unclosed `-----BEGIN ... PRIVATE KEY-----` header,
+        // hold from its start so key material never leaks after the banner.
         for f in findings
             .iter()
             .filter(|f| should_mask(f, self.kinds.as_deref()))
         {
-            if f.start < cut && f.end > cut {
+            if f.kind == PiiKind::PrivateKey && !text[f.start..f.end].contains("-----END ") {
+                cut = cut.min(f.start);
+                open_pem_start = Some(open_pem_start.map_or(f.start, |prev| prev.min(f.start)));
+            } else if f.start < cut && f.end > cut {
                 cut = f.start;
             }
         }
-        // Fail-open bound: a pathological straddler must not grow the tail
-        // without limit — past MAX_TAIL_BYTES we force the plain holdback cut.
-        if text.len() - cut > MAX_TAIL_BYTES {
-            cut = text.len() - HOLDBACK_BYTES;
+
+        // Hold back an incomplete long JWT (`eyJ...` still growing past 160B)
+        // up to `MAX_TAIL_BYTES` so real OIDC/Auth0 JWTs don't lose `eyJ`.
+        if self.kind_maskable(PiiKind::Jwt) {
+            if let Some(jwt_start) = find_unclosed_jwt_start(text, cut) {
+                cut = cut.min(jwt_start);
+            }
         }
+
+        // Handle oversized tails (> MAX_TAIL_BYTES).
+        if text.len() - cut > MAX_TAIL_BYTES {
+            if let Some(pem_start) = open_pem_start {
+                // Emit anything cleanly before the PEM banner, emit one
+                // `[PRIVATE_KEY]` placeholder, and enter `in_pem` suppression
+                // so the multi-KB private key body never leaks in plaintext.
+                let head = &text[..pem_start];
+                let head_findings: Vec<_> = findings
+                    .iter()
+                    .filter(|f| f.end <= pem_start)
+                    .cloned()
+                    .collect();
+                let (mut out, n) = mask(head, &head_findings, self.kinds.as_deref());
+                out.push_str("[PRIVATE_KEY]");
+                self.masked_total += n + 1;
+                self.tail.drain(..pem_start);
+                // Advance past the BEGIN marker itself so drain_pem_body only
+                // searches for the END marker.
+                let skip = self
+                    .tail
+                    .find("PRIVATE KEY-----")
+                    .map(|p| p + "PRIVATE KEY-----".len())
+                    .unwrap_or(0);
+                self.tail.drain(..skip);
+                self.prev_context.clear();
+                self.in_pem = true;
+                out.push_str(&self.drain_pem_body());
+                return out;
+            }
+            // Fail-open bound for any other pathological straddler.
+            cut = default_cut;
+        }
+
         while cut > 0 && !text.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -135,9 +285,63 @@ impl StreamMasker {
         let head_findings: Vec<_> = findings.iter().filter(|f| f.end <= cut).cloned().collect();
         let (masked_head, n) = mask(head, &head_findings, self.kinds.as_deref());
         self.masked_total += n;
-        self.tail = text[cut..].to_string();
+
+        // Retain the last `CONTEXT_BYTES` of raw text before `cut` as read-only
+        // left-context for the next scan.
+        let mut ctx_start = cut.saturating_sub(CONTEXT_BYTES);
+        while ctx_start < cut && !text.is_char_boundary(ctx_start) {
+            ctx_start += 1;
+        }
+        self.prev_context.clear();
+        self.prev_context.push_str(&text[ctx_start..cut]);
+
+        self.tail.drain(..cut);
         masked_head
     }
+}
+
+/// If `text` contains a `-----END ... PRIVATE KEY-----` footer starting at or
+/// after `from`, return the byte offset immediately after that footer.
+fn find_pem_end_after(text: &str, from: usize) -> Option<usize> {
+    let slice = &text[from..];
+    let rel = slice.find("-----END ")?;
+    let after_end = &slice[rel..];
+    let tail_marker = "PRIVATE KEY-----";
+    let end_rel = after_end.find(tail_marker)?;
+    // Ensure it's a plausible single-line PEM footer (no newlines inside).
+    let header_span = &after_end[..end_rel];
+    if header_span.contains('\n') || header_span.len() > 48 {
+        return None;
+    }
+    Some(from + rel + end_rel + tail_marker.len())
+}
+
+/// If an unbroken base64url JWT candidate (`eyJ...`) starts before `cut` and
+/// extends across `cut` (so cutting at `cut` would slice off `eyJ` before the
+/// 3rd segment finishes), return its start offset.
+fn find_unclosed_jwt_start(text: &str, cut: usize) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..cut].find("eyJ") {
+        let start = search_from + rel;
+        // Word-boundary check on the left.
+        let left_ok = start == 0
+            || !text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if left_ok {
+            let rest = &text[start..];
+            let token_len = rest
+                .bytes()
+                .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                .count();
+            if start + token_len > cut {
+                return Some(start);
+            }
+        }
+        search_from = start + 3;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -262,5 +466,80 @@ mod tests {
             "tail must stay bounded, got {}",
             m.tail.len()
         );
+    }
+
+    #[test]
+    fn streams_pem_private_key_without_leaking_body() {
+        // Test both normal (~600B) and oversized (>MAX_TAIL_BYTES) PEM blocks.
+        for reps in [12usize, 100usize] {
+            let mut m = masker(None);
+            let mut pem = String::from("before -----BEGIN RSA PRIVATE KEY-----\n");
+            for i in 0..reps {
+                pem.push_str(&format!("MIIEowIBAAKCAQEAsecretKEYmaterial{i:04}abcdef0123456789\n"));
+            }
+            pem.push_str("-----END RSA PRIVATE KEY----- after");
+            let mut out = String::new();
+            for chunk in pem.as_bytes().chunks(24) {
+                out.push_str(&m.push(std::str::from_utf8(chunk).unwrap()));
+            }
+            out.push_str(&m.flush());
+            assert!(out.contains("before [PRIVATE_KEY] after"), "got: {out}");
+            assert!(!out.contains("secretKEYmaterial"), "PEM body leaked: {out}");
+        }
+    }
+
+    #[test]
+    fn streams_long_jwt_over_holdback_without_leaking() {
+        let mut m = masker(None);
+        let header = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9";
+        let payload = "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFsaWNlIiwic2NvcGUiOiJhZG1pbiB3cml0ZSByZWFkIiwiZXhwIjoxOTAwMDAwMDAwLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20vIiwiYXVkIjoic2FmZmV2LWFwaSJ9";
+        let sig = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5cSignatureTailXYZ";
+        let jwt = format!("{header}.{payload}.{sig}");
+        assert!(jwt.len() > HOLDBACK_BYTES + 80);
+        let full = format!("Authorization: Bearer {jwt} done");
+        let mut out = String::new();
+        for chunk in full.as_bytes().chunks(17) {
+            out.push_str(&m.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        out.push_str(&m.flush());
+        assert_eq!(out, "Authorization: Bearer [JWT] done");
+    }
+
+    #[test]
+    fn preserves_left_context_version_guard_across_cuts() {
+        let mut m = masker(None);
+        let pad = "a ".repeat(100);
+        let full = format!("{pad}version 1.2.3.4 {pad}");
+        let mut out = String::new();
+        for chunk in full.as_bytes().chunks(13) {
+            out.push_str(&m.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        out.push_str(&m.flush());
+        assert_eq!(out, full, "version 1.2.3.4 must not false-positive across cuts");
+    }
+
+    #[test]
+    fn whitespace_snap_never_splits_space_separated_credit_card() {
+        // Place a space-separated credit card right before `default_cut` followed
+        // by non-whitespace so the 32-byte backward whitespace snap lands inside
+        // the card. Finding-straddle protection must still pull `cut` before the
+        // card so zero digits ever leak in plaintext.
+        let card = "4111 1111 1111 1111";
+        let tail_pad = "x".repeat(HOLDBACK_BYTES + 6);
+        for prefix_len in [0usize, 1, 5, 11, 23] {
+            let prefix = "p".repeat(prefix_len);
+            // Non-word, non-whitespace punctuation `,` closes the card boundary
+            // while still forcing the 32-byte backward whitespace snap to land
+            // inside the card's spaces.
+            let full = format!("{prefix}card={card},{tail_pad}");
+            let mut m = masker(None);
+            let mut out = String::new();
+            out.push_str(&m.push(&full));
+            out.push_str(&m.flush());
+            assert!(
+                out.contains("[CARD]") && !out.contains("4111"),
+                "prefix_len={prefix_len} leaked card: {out}"
+            );
+        }
     }
 }

@@ -642,7 +642,9 @@ impl Default for PricingConfig {
 }
 
 /// Built-in price table. Public list prices at the time of writing; correct them
-/// in config rather than waiting for a release.
+/// in config rather than waiting for a release. Specific variants (`-mini`,
+/// `-nano`, `-flash`) precede generic prefixes so substring matching picks the
+/// right tier.
 pub fn default_model_prices() -> Vec<ModelPrice> {
     let p = |m: &str, i: f64, o: f64, c: f64, cw: f64| ModelPrice {
         match_: m.to_string(),
@@ -659,12 +661,99 @@ pub fn default_model_prices() -> Vec<ModelPrice> {
         p("fable", 1.0, 5.0, 0.1, 1.25),
         // OpenAI/Google bill no separate write premium; readers for those
         // vendors never report write tokens, so the write rate mirrors input.
+        p("gpt-5-nano", 0.05, 0.4, 0.005, 0.05),
+        p("gpt-5-mini", 0.25, 2.0, 0.025, 0.25),
         p("gpt-5", 1.25, 10.0, 0.125, 1.25),
         p("gpt5", 1.25, 10.0, 0.125, 1.25),
+        p("gpt-4o-mini", 0.15, 0.6, 0.075, 0.15),
         p("gpt-4o", 2.5, 10.0, 0.25, 2.5),
+        p("gpt-4.1-nano", 0.1, 0.4, 0.025, 0.1),
+        p("gpt-4.1-mini", 0.4, 1.6, 0.1, 0.4),
         p("gpt-4.1", 2.5, 10.0, 0.25, 2.5),
+        p("o4-mini", 1.1, 4.4, 0.275, 1.1),
+        p("o3-mini", 1.1, 4.4, 0.55, 1.1),
+        p("o3", 2.0, 8.0, 0.5, 2.0),
+        p("o1-mini", 1.1, 4.4, 0.55, 1.1),
+        p("o1", 15.0, 60.0, 7.5, 15.0),
+        p("gemini-2.5-flash", 0.3, 2.5, 0.075, 0.3),
+        p("gemini-2.0-flash", 0.1, 0.4, 0.025, 0.1),
+        p("gemini-flash", 0.15, 0.6, 0.0375, 0.15),
         p("gemini", 1.25, 10.0, 0.125, 1.25),
     ]
+}
+
+fn cached_default_prices() -> &'static [(String, ModelPrice)] {
+    static DEFAULTS: std::sync::OnceLock<Vec<(String, ModelPrice)>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        default_model_prices()
+            .into_iter()
+            .map(|e| (e.match_.to_lowercase(), e))
+            .collect()
+    })
+}
+
+/// Match a short OpenAI reasoning model id (`o1`, `o3`, `o4-mini`) at a model-name
+/// root boundary (start-of-string or after `/`), followed by end-of-string or
+/// `-`/`:`/`.` — so local Ollama models like `marco-o1:latest` or `pro3:8b` are
+/// never misclassified as paid OpenAI models.
+fn matches_bounded_id(model: &str, pat: &str) -> bool {
+    let bytes = model.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = model[start..].find(pat) {
+        let pos = start + rel;
+        let end = pos + pat.len();
+        let before_ok = pos == 0 || bytes[pos - 1] == b'/';
+        let after_ok = end == bytes.len() || matches!(bytes[end], b'-' | b':' | b'.');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+fn matches_model_pattern(model: &str, pat: &str) -> bool {
+    if pat.is_empty() {
+        return false;
+    }
+    if matches!(pat, "o1" | "o3" | "o1-mini" | "o3-mini" | "o4-mini") {
+        return matches_bounded_id(model, pat);
+    }
+    model.contains(pat)
+}
+
+/// True when `m` (already lowercased) is a locally-run model (zero dollar cost).
+/// Ollama tags use `:` (`llama3.2:latest`, `qwen2.5:14b`), but AWS Bedrock
+/// (`anthropic.claude-sonnet-4-20250514-v1:0`) and OpenRouter suffixes
+/// (`claude-3.7-sonnet:thinking`) also contain `:` — keep those priced.
+fn is_local_model(m: &str) -> bool {
+    if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") {
+        return true;
+    }
+    if m.contains(':') {
+        const CLOUD_MARKERS: &[&str] = &[
+            "anthropic",
+            "claude",
+            "opus",
+            "sonnet",
+            "haiku",
+            "openai",
+            "gpt-",
+            "gpt5",
+            "gemini",
+            "google/",
+            "bedrock",
+        ];
+        if CLOUD_MARKERS.iter().any(|c| m.contains(c))
+            || matches_bounded_id(m, "o1")
+            || matches_bounded_id(m, "o3")
+            || matches_bounded_id(m, "o4-mini")
+        {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 impl PricingConfig {
@@ -674,17 +763,19 @@ impl PricingConfig {
     /// lookup — a local model must never show a dollar figure.
     pub fn lookup(&self, model: &str) -> (f64, f64, f64) {
         let m = model.to_lowercase();
-        if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") || m.contains(':')
-        {
+        if is_local_model(&m) {
             return (0.0, 0.0, 0.0);
         }
-        let table = if self.models.is_empty() {
-            return Self::default().lookup(model);
-        } else {
-            &self.models
-        };
-        for e in table {
-            if !e.match_.is_empty() && m.contains(&e.match_.to_lowercase()) {
+        if self.models.is_empty() {
+            for (pat, e) in cached_default_prices() {
+                if matches_model_pattern(&m, pat.as_str()) {
+                    return (e.input, e.output, e.cache);
+                }
+            }
+            return (0.0, 0.0, 0.0);
+        }
+        for e in &self.models {
+            if matches_model_pattern(&m, &e.match_.to_lowercase()) {
                 return (e.input, e.output, e.cache);
             }
         }
@@ -697,23 +788,28 @@ impl PricingConfig {
     /// the only vendor whose readers report write tokens separately today).
     pub fn lookup_split(&self, model: &str) -> (f64, f64, f64, f64) {
         let m = model.to_lowercase();
-        if m.contains("ollama") || m.contains("lmstudio") || m.contains("local") || m.contains(':')
-        {
+        if is_local_model(&m) {
             return (0.0, 0.0, 0.0, 0.0);
         }
-        let table = if self.models.is_empty() {
-            return Self::default().lookup_split(model);
-        } else {
-            &self.models
+        let resolve = |e: &ModelPrice| {
+            let cw = if e.cache_write > 0.0 {
+                e.cache_write
+            } else {
+                e.input * 1.25
+            };
+            (e.input, e.output, e.cache, cw)
         };
-        for e in table {
-            if !e.match_.is_empty() && m.contains(&e.match_.to_lowercase()) {
-                let cw = if e.cache_write > 0.0 {
-                    e.cache_write
-                } else {
-                    e.input * 1.25
-                };
-                return (e.input, e.output, e.cache, cw);
+        if self.models.is_empty() {
+            for (pat, e) in cached_default_prices() {
+                if matches_model_pattern(&m, pat.as_str()) {
+                    return resolve(e);
+                }
+            }
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        for e in &self.models {
+            if matches_model_pattern(&m, &e.match_.to_lowercase()) {
+                return resolve(e);
             }
         }
         (0.0, 0.0, 0.0, 0.0)
@@ -895,9 +991,12 @@ impl Config {
         match &self.export_dir {
             Some(dir) => {
                 let s = dir.to_string_lossy();
-                match s.strip_prefix("~/") {
-                    Some(rest) => crate::agents::home().join(rest),
-                    None => dir.clone(),
+                if s == "~" {
+                    crate::agents::home()
+                } else if let Some(rest) = s.strip_prefix("~/") {
+                    crate::agents::home().join(rest)
+                } else {
+                    dir.clone()
                 }
             }
             None => crate::agents::home(),
@@ -944,32 +1043,69 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The config file currently governing this instance: the explicit
+    /// `--config` path it was loaded from when set, otherwise `data_dir/saffev.toml`.
+    pub fn active_config_path(&self) -> std::path::PathBuf {
+        self.source_path
+            .clone()
+            .unwrap_or_else(|| self.config_path())
+    }
+
     /// Persist this config back to the TOML file it was loaded from (Settings
     /// write-through); a config built in memory goes to `data_dir/saffev.toml`.
     pub fn save(&self) -> Result<()> {
-        let path = self
-            .source_path
-            .clone()
-            .unwrap_or_else(|| self.config_path());
+        let path = self.active_config_path();
         self.save_to(&path)
     }
 
-    /// Persist this config to an explicit path, creating parent dirs as needed.
+    /// Persist this config to an explicit path atomically (write sibling temp
+    /// file, `sync_all`, rename into place), creating parent dirs as needed.
     ///
     /// Public so the zero-config first-run path in `saffev start` can write the
     /// resolved config to the exact path it resolved (which may be an explicit
     /// `--config` whose filename differs from the default `saffev.toml`).
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    Error::Config(format!("creating config dir {}: {e}", parent.display()))
-                })?;
-            }
-        }
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::Config(format!("creating config dir {}: {e}", parent.display()))
+        })?;
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text)
-            .map_err(|e| Error::Config(format!("writing config {}: {e}", path.display())))?;
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("saffev.toml");
+        let tmp = parent.join(format!(
+            ".{fname}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Config(format!(
+                "writing config {}: {e}",
+                path.display()
+            )));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Config(format!(
+                "replacing config {}: {e}",
+                path.display()
+            )));
+        }
         Ok(())
     }
 
@@ -1117,9 +1253,11 @@ impl Config {
     /// caller decides when to write so a dry/probe path can resolve without
     /// touching disk.
     pub fn resolve_first_run(data_dir: PathBuf, upstream_port: u16) -> Result<Config> {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Cooperative;
-        cfg.data_dir = data_dir;
+        let mut cfg = Config {
+            mode: Mode::Cooperative,
+            data_dir,
+            ..Default::default()
+        };
 
         let bind = cfg.ports.bind;
         // Upstream is left exactly where the engine already listens (the whole
@@ -1232,8 +1370,10 @@ mod tests {
 
     #[test]
     fn eval_validation_rejects_bad_sample_rate_and_zero_concurrency() {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Cooperative;
+        let mut cfg = Config {
+            mode: Mode::Cooperative,
+            ..Default::default()
+        };
         cfg.ports.proxy = 8088; // make ports valid
         cfg.eval.sample_rate = 1.5;
         assert!(cfg.validate().is_err(), "sample_rate > 1 must fail");
@@ -1357,8 +1497,10 @@ mod tests {
         let dir = unique_temp_dir("roundtrip");
         let path = dir.join(CONFIG_FILE_NAME);
 
-        let mut original = Config::default();
-        original.data_dir = dir.clone();
+        let mut original = Config {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
         // Make it pass validate(): cooperative proxy must differ from upstream.
         original.ports.upstream = 12321;
 
@@ -1487,8 +1629,10 @@ days = 14
     /// cannot forward to itself).
     #[test]
     fn validate_rejects_cooperative_proxy_upstream_collision() {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Cooperative;
+        let mut cfg = Config {
+            mode: Mode::Cooperative,
+            ..Default::default()
+        };
         cfg.ports.proxy = 12000;
         cfg.ports.upstream = 12000;
         // Keep studio distinct so we isolate the proxy/upstream collision.
@@ -1503,8 +1647,10 @@ days = 14
     /// (c, cont.) In gateway mode, proxy == shadow is rejected.
     #[test]
     fn validate_rejects_gateway_proxy_shadow_collision() {
-        let mut cfg = Config::default();
-        cfg.mode = Mode::Gateway;
+        let mut cfg = Config {
+            mode: Mode::Gateway,
+            ..Default::default()
+        };
         cfg.ports.proxy = 11434;
         cfg.ports.shadow = 11434;
 
@@ -1548,8 +1694,10 @@ days = 14
     /// configs without the field load with it unset.
     #[test]
     fn export_dir_round_trips_and_defaults_off() {
-        let mut cfg = Config::default();
-        cfg.export_dir = Some(PathBuf::from("/media/user/SDCARD"));
+        let cfg = Config {
+            export_dir: Some(PathBuf::from("/media/user/SDCARD")),
+            ..Default::default()
+        };
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         let loaded: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(loaded.export_dir, cfg.export_dir);
@@ -1717,5 +1865,51 @@ days = 14
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pricing_matches_specific_tiers_and_colon_cloud_models() {
+        let pricing = PricingConfig::default();
+        // Specific mini/flash tiers must resolve before generic parent prefixes.
+        let (in_4o, _, _) = pricing.lookup("gpt-4o");
+        let (in_4o_mini, _, _) = pricing.lookup("gpt-4o-mini");
+        assert!(
+            in_4o_mini > 0.0 && in_4o_mini < in_4o,
+            "gpt-4o-mini must use mini pricing, not gpt-4o"
+        );
+
+        let (in_5, _, _) = pricing.lookup("gpt-5");
+        let (in_5_mini, _, _) = pricing.lookup("gpt-5-mini");
+        assert!(in_5_mini > 0.0 && in_5_mini < in_5);
+
+        let (in_gem_pro, _, _) = pricing.lookup("gemini-2.5-pro");
+        let (in_gem_flash, _, _) = pricing.lookup("gemini-2.5-flash");
+        assert!(in_gem_flash > 0.0 && in_gem_flash < in_gem_pro);
+
+        // Cloud model IDs containing `:` (Bedrock/OpenRouter) remain priced.
+        let (in_bedrock, out_bedrock, _) =
+            pricing.lookup("anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert!(in_bedrock > 0.0 && out_bedrock > 0.0);
+
+        // Local Ollama models with `:` remain free ($0), including ones whose
+        // names contain `o1`/`o3` substrings like `marco-o1:latest`.
+        let (in_local, out_local, cache_local) = pricing.lookup("llama3:latest");
+        assert_eq!((in_local, out_local, cache_local), (0.0, 0.0, 0.0));
+        assert_eq!(pricing.lookup("marco-o1:latest"), (0.0, 0.0, 0.0));
+        assert_eq!(pricing.lookup("pro3:8b"), (0.0, 0.0, 0.0));
+
+        // OpenAI reasoning models still resolve accurately.
+        let (in_o1, _, _) = pricing.lookup("o1");
+        let (in_o1_mini, _, _) = pricing.lookup("o1-mini");
+        let (in_o3_mini, _, _) = pricing.lookup("openai/o3-mini");
+        assert!(in_o1_mini > 0.0 && in_o1_mini < in_o1);
+        assert!(in_o3_mini > 0.0);
+
+        // Bare `~` expands to home() in export_base().
+        let cfg = Config {
+            export_dir: Some(PathBuf::from("~")),
+            ..Default::default()
+        };
+        assert_eq!(cfg.export_base(), crate::agents::home());
     }
 }

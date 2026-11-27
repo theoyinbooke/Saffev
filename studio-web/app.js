@@ -451,7 +451,11 @@
   }
   // Human label for a PII finding's action (snake_case from /history/:id).
   function piiActionLabel(a) {
-    return a === 'masked' ? 'masked' : a === 'would_mask' ? 'would mask' : 'observed';
+    if (a === 'blocked') return 'blocked';
+    if (a === 'would_block') return 'would block';
+    if (a === 'masked') return 'masked';
+    if (a === 'would_mask') return 'would mask';
+    return 'observed';
   }
 
   // Short human label for a failed exchange (for badges/drawer).
@@ -479,10 +483,13 @@
   /* -------------------------------------------------------------------------
      Detail drawer (History detail).
      ------------------------------------------------------------------------- */
+  let detailSeq = 0;
   async function openDetail(id) {
+    const seq = ++detailSeq;
     let detail;
     try { detail = await api('/history/' + encodeURIComponent(id)); }
-    catch (e) { handleApiError(e); return; }
+    catch (e) { if (seq === detailSeq) handleApiError(e); return; }
+    if (seq !== detailSeq) return;
     closeDrawer();
     const bg = el('div', { class: 'drawer-bg', onclick: closeDrawer });
     const it = detail.item;
@@ -529,9 +536,15 @@
     // findings
     if (detail.findings && detail.findings.length) {
       // Header reflects what actually happened to this exchange's findings.
+      const anyBlocked = detail.findings.some((f) => f.action === 'blocked');
+      const anyWouldBlock = detail.findings.some((f) => f.action === 'would_block');
       const anyMasked = detail.findings.some((f) => f.action === 'masked');
       const anyWould = detail.findings.some((f) => f.action === 'would_mask');
-      const hdr = anyMasked ? 'PII findings (some redacted)' : anyWould ? 'PII findings (dry-run · would redact)' : 'PII findings (observe-only)';
+      const hdr = anyBlocked ? 'PII findings (blocked)'
+        : anyMasked ? 'PII findings (some redacted)'
+        : anyWouldBlock ? 'PII findings (dry-run · would block)'
+        : anyWould ? 'PII findings (dry-run · would redact)'
+        : 'PII findings (observe-only)';
       const fl = el('div', { class: 'payblk' }, [el('h4', { text: hdr })]);
       const list = el('div', { class: 'findlist' });
       detail.findings.forEach((f) => {
@@ -563,7 +576,7 @@
 
     // quality scores (eval pipeline)
     if (detail.eval && detail.eval.length) {
-      const ef = el('div', { class: 'payblk' }, [el('h4', { text: 'Quality (' + esc(detail.eval[0].judgeModel) + ')' })]);
+      const ef = el('div', { class: 'payblk' }, [el('h4', { text: 'Quality (' + detail.eval[0].judgeModel + ')' })]);
       const list = el('div', { class: 'findlist' });
       detail.eval.forEach((e) => {
         const r = el('div', { class: 'find' });
@@ -979,12 +992,15 @@
       // fake data.
       view.appendChild(el('div', { id: 'cliMirror' }, [cliBlock(null)]));
 
+      const myNav = navSeq;
       await this.refresh();
+      if (myNav !== navSeq) return;
       this.connectStream();
       this.startPulse();
     },
 
     startPulse() {
+      if (this._pulseTimer) { clearInterval(this._pulseTimer); this._pulseTimer = null; }
       this._pulse = this._pulse || [];
       this.renderPulse();
       this._pulseTimer = setInterval(() => this.renderPulse(), 1500);
@@ -997,8 +1013,16 @@
     },
 
     async refresh() {
-      try {
-        const snap = await api('/live');
+      const myNav = navSeq;
+      const [liveRes, engRes, setRes] = await Promise.allSettled([
+        api('/live'),
+        api('/engines'),
+        api('/settings'),
+      ]);
+      if (myNav !== navSeq) return;
+
+      if (liveRes.status === 'fulfilled') {
+        const snap = liveRes.value;
         hideBanner();
         this.kpis.requestsToday = snap.requestsToday;
         this.kpis.p50 = snap.p50LatencyMs;
@@ -1031,17 +1055,18 @@
         // first request is ever captured (lifetime total, not the 24h window).
         this._needOnboard = (snap.lifetimeRequests || 0) === 0;
         this.renderOnboard(this._needOnboard);
-      } catch (e) { handleApiError(e); }
+      } else {
+        handleApiError(liveRes.reason);
+      }
 
       // engine + exposure (best-effort, independent of /live)
-      try {
-        const ev = await api('/engines');
+      if (engRes.status === 'fulfilled') {
+        const ev = engRes.value;
         this._ev = ev;
         this.renderEngine(ev);
         this.renderExposureHero(ev.exposure);
         setEnginePill(ev);
-        this.renderCliMirror();
-      } catch (e) {
+      } else {
         // Don't leave the cards stuck on their loading text · show a small
         // error/retry state instead.
         const engBox = $('#liveEngine');
@@ -1051,16 +1076,16 @@
       }
 
       // masking state (best-effort) · keeps the Live toggle in sync with Settings.
-      try {
-        const s = await api('/settings');
+      if (setRes.status === 'fulfilled') {
+        const s = setRes.value;
         this.masking = { enabled: !!s.maskingEnabled, dryRun: !!s.maskingDryRun };
         this.renderMaskingBar();
         // Pick up the real proxy port so onboarding copy-blocks are accurate.
         this.proxyPort = s.proxyPort || this.proxyPort;
         this._payloadStorage = !!s.payloadStorage;
         if (this._needOnboard) this.renderOnboard(true);
-        this.renderCliMirror();
-      } catch (e) { /* leave the bar at its last-known state */ }
+      }
+      this.renderCliMirror();
     },
 
     // Rebuild the status-mirror terminal from the freshest data we hold.
@@ -1232,16 +1257,12 @@
     },
 
     /* ---- SSE ----
-       The wire contract gates /api/* with `Authorization: Bearer <token>`. The
-       browser `EventSource` API cannot set request headers, so we consume the
-       SSE stream with `fetch()` + a streaming `ReadableStream` reader, which can
-       send the bearer header (same-origin → no CORS preflight). We parse the
-       text/event-stream framing ourselves and auto-reconnect with backoff. */
+       Shares the single app-wide `/api/stream` connection managed by LeakAlerts
+       so navigating to Live never opens a duplicate persistent SSE stream. */
     connectStream() {
-      this.disconnectStream();
-      this._stopStream = false;
-      this._streamRetry = 0;
-      this._runStream();
+      this._streamSubscribed = true;
+      this.setLiveTag(LeakAlerts._state || 'idle');
+      LeakAlerts.ensureRunning();
     },
 
     setLiveTag(state) {
@@ -1252,65 +1273,8 @@
       else { tag.className = 'tag live off'; tag.innerHTML = '<span class="blip"></span> Idle'; }
     },
 
-    async _runStream() {
-      if (this._stopStream) return;
-      const ctrl = new AbortController();
-      this._streamCtrl = ctrl;
-      const headers = { Accept: 'text/event-stream' };
-      if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
-      // ?token= kept as a hint for any backend that also accepts a query token.
-      const url = TOKEN ? '/api/stream?token=' + encodeURIComponent(TOKEN) : '/api/stream';
-      try {
-        const res = await fetch(url, { headers, signal: ctrl.signal, cache: 'no-store' });
-        if (!res.ok || !res.body) {
-          if (res.status === 401 || res.status === 403) { handleApiError({ status: res.status }); }
-          throw new Error('stream HTTP ' + res.status);
-        }
-        hideBanner();
-        this._streamRetry = 0;
-        this.setLiveTag('live');
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          // SSE frames are separated by a blank line.
-          let idx;
-          while ((idx = buf.indexOf('\n\n')) !== -1) {
-            const frame = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
-            this._handleFrame(frame);
-          }
-        }
-      } catch (e) {
-        if (this._stopStream || (e && e.name === 'AbortError')) return;
-      }
-      // Connection ended/failed · reconnect with capped backoff.
-      if (this._stopStream) return;
-      this.setLiveTag('reconnecting');
-      this._streamRetry = Math.min(this._streamRetry + 1, 6);
-      const delay = Math.min(1000 * Math.pow(2, this._streamRetry - 1), 15000);
-      this._streamTimer = setTimeout(() => this._runStream(), delay);
-    },
-
-    // Parse one SSE frame ("data:" / multi-line "data:" / ignored "event:"/":").
-    _handleFrame(frame) {
-      const dataLines = [];
-      frame.split('\n').forEach((line) => {
-        if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
-      });
-      if (!dataLines.length) return;
-      let msg;
-      try { msg = JSON.parse(dataLines.join('\n')); } catch (e) { return; }
-      this.onEvent(msg);
-    },
-
     disconnectStream() {
-      this._stopStream = true;
-      if (this._streamTimer) { clearTimeout(this._streamTimer); this._streamTimer = null; }
-      if (this._streamCtrl) { try { this._streamCtrl.abort(); } catch (e) {} this._streamCtrl = null; }
+      this._streamSubscribed = false;
     },
 
     onEvent(msg) {
@@ -1348,8 +1312,21 @@
         const fresh = reqRow(it, { columns: LIVE_COLS });
         const old = this.seen[it.id];
         if (old && old.parentNode) { old.parentNode.replaceChild(fresh, old); }
-        else { stream.prepend(fresh); }
+        else {
+          stream.prepend(fresh);
+          while (stream.children.length > 14) {
+            const last = stream.lastElementChild;
+            if (last && last.dataset.id) delete this.seen[last.dataset.id];
+            last.remove();
+          }
+        }
         this.seen[it.id] = fresh;
+        // Fold response-side PII kinds into the recent lens so it stays live.
+        const prev = this._lastRecent || [];
+        const idx = prev.findIndex((x) => x.id === it.id);
+        if (idx >= 0) { prev[idx] = it; this._lastRecent = prev; }
+        else { this._lastRecent = [it, ...prev].slice(0, 50); }
+        this.renderPrivacyLens(this._lastRecent);
       } else if (msg.type === 'pii') {
         // Badges render from the row item's piiKinds (collapsed to "first + N");
         // the live finding event just advances the KPI + privacy lens.
@@ -1522,16 +1499,20 @@
     },
 
     async reload() {
+      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      this.loading = false;
       this.pages = []; this.pageIndex = 0; this.exhausted = false;
       const list = $('#histList');
       if (list) { list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Loading history…' })])); }
       this.setPagerDisabled(true);
-      await this.fetchNextPage();
+      await this.fetchNextPage(seq);
+      if (seq !== this._reqSeq) return;
       this.renderPage();
     },
 
     // Fetch the page after the last one we hold (cursor = ts of its last row).
-    async fetchNextPage() {
+    async fetchNextPage(seq) {
+      const reqSeq = seq != null ? seq : (this._reqSeq = this._reqSeq || 1);
       if (this.loading || this.exhausted) return;
       this.loading = true;
       const params = new URLSearchParams();
@@ -1543,7 +1524,11 @@
       if (last && last.length) params.set('beforeTs', String(last[last.length - 1].ts));
       let rows;
       try { rows = await api('/history?' + params.toString()); hideBanner(); }
-      catch (e) { handleApiError(e); this.loading = false; return; }
+      catch (e) {
+        if (reqSeq === this._reqSeq) { handleApiError(e); this.loading = false; }
+        return;
+      }
+      if (reqSeq !== this._reqSeq) return;
       if (rows.length < this.pageSize) this.exhausted = true;
       if (rows.length > 0) this.pages.push(rows);
       this.loading = false;
@@ -1573,7 +1558,7 @@
       if (page.length === 0) {
         list.appendChild(el('div', { class: 'state' }, [
           el('div', { class: 'big', text: 'No matching exchanges' }),
-          el('div', { class: 'sm', text: (this.q || this.piiOnly) ? 'Try clearing the filters.' : 'Traffic will appear here as your apps talk to local models.' }),
+          el('div', { class: 'sm', text: (this.q || this.piiOnly || this.failedOnly) ? 'Try clearing the filters.' : 'Traffic will appear here as your apps talk to local models.' }),
         ]));
       } else {
         page.forEach((it) => list.appendChild(reqRow(it, { columns: HIST_COLS })));
@@ -1600,7 +1585,9 @@
       const next = $('#histNext'); if (next) next.disabled = d;
     },
 
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* =========================================================================
@@ -1611,11 +1598,17 @@
   // the tab can add window-scoped charts from /analytics data.
   const Privacy = {
     async render(view, an) {
+      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      const myNav = navSeq;
       view.innerHTML = '';
       view.appendChild(loadingState('Aggregating findings…'));
       let s;
       try { s = await api('/privacy'); hideBanner(); }
-      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load privacy data', e.message || '')); return; }
+      catch (e) {
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
+        handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load privacy data', e.message || '')); return;
+      }
+      if (seq !== this._reqSeq || myNav !== navSeq) return;
       view.innerHTML = '';
 
       const totalKinds = s.byKind || [];
@@ -1684,7 +1677,9 @@
       }
       updatePiiBadge(s.total);
     },
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* Sub-label for the Tokens KPI. Per-row views mark an estimated count with a
@@ -1732,11 +1727,19 @@
     },
 
     async refresh(view) {
+      const myNav = navSeq;
       view = view || $('#view');
-      let ev, s = null;
-      try { ev = await api('/engines'); hideBanner(); }
-      catch (e) { handleApiError(e); view.innerHTML = ''; view.appendChild(emptyState('Could not load engines', e.message || '')); return; }
-      try { s = await api('/settings'); } catch (e) { /* proxy port is best-effort */ }
+      const [evRes, setRes] = await Promise.allSettled([api('/engines'), api('/settings')]);
+      if (myNav !== navSeq) return;
+      if (evRes.status !== 'fulfilled') {
+        handleApiError(evRes.reason);
+        view.innerHTML = '';
+        view.appendChild(emptyState('Could not load engines', (evRes.reason && evRes.reason.message) || ''));
+        return;
+      }
+      const ev = evRes.value;
+      const s = setRes.status === 'fulfilled' ? setRes.value : null;
+      hideBanner();
       view.innerHTML = '';
       setEnginePill(ev);
 
@@ -1747,7 +1750,9 @@
       const proxyPort = (s && s.proxyPort) || 8088;
       const activeEng = (ev.engines || []).find((e) => e.isActive);
       const engName = activeEng ? (engineDisplayName(activeEng.engine) || activeEng.engine) : 'Engine';
-      const engPort = activeEng ? activeEng.publicPort : (ev.mode === 'gateway' && activeEng && activeEng.shadowPort) || '11434';
+      const engPort = activeEng
+        ? ((ev.mode === 'gateway' && activeEng.shadowPort) || activeEng.publicPort)
+        : '11434';
       const node = (t, d, brand) => el('div', { class: 'flow-node' + (brand ? ' brandnode' : '') }, [
         el('div', { class: 'flow-t', text: t }), el('div', { class: 'flow-d', text: d }),
       ]);
@@ -1861,7 +1866,9 @@
       } catch (e) { handleApiError(e); setBusy(btn, false); }
       this.busy = false;
     },
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* =========================================================================
@@ -1923,8 +1930,10 @@
       // card and flash it so the user lands on the exact control they were
       // sent to (e.g. the Agents "Turn on Preservation" banner). One-shot.
       if (this._focus) {
-        const target = panel.querySelector('[data-focus="' + this._focus + '"]');
+        const focusKey = this._focus;
         this._focus = null;
+        const target = Array.from(panel.querySelectorAll('[data-focus]'))
+          .find((n) => n.getAttribute('data-focus') === focusKey);
         if (target) {
           // Let the entrance animation place the card before scrolling to it.
           setTimeout(() => {
@@ -2111,7 +2120,9 @@
       const modelInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. qwen3.5:2b', value: s.evalJudgeModel || '' });
       if (!s.evalEnabled) modelInput.setAttribute('disabled', '');
       let mt;
-      modelInput.addEventListener('input', () => { clearTimeout(mt); mt = setTimeout(() => this.save(view, { evalJudgeModel: modelInput.value.trim() }), 600); });
+      // Save quietly without redrawing the panel mid-edit so typing doesn't
+      // steal focus from the text input.
+      modelInput.addEventListener('input', () => { clearTimeout(mt); mt = setTimeout(() => this.save(view, { evalJudgeModel: modelInput.value.trim() }, { redraw: false }), 600); });
       evalCard.appendChild(setRow('Judge model', 'A small model on your running engine (Ollama/LM Studio) to score quality. Leave blank to disable.', el('div', { class: 'ctl' }, [modelInput])));
 
       const rateSel = dropdown(
@@ -2173,14 +2184,22 @@
           ? 'On · every ' + (s.backupIntervalHours || 24) + ' h Saffev writes a backup to ' + s.exportDirEffective + ' (the export destination). After the first full copy each backup holds only what changed since the previous one; restore any of them with `saffev restore <folder>`.'
           : 'Off · back up from the menu-bar panel or with `saffev backup`. Turn on to back up on a schedule, incrementally, to the export destination.',
         el('div', { class: 'ctl' }, [bkAuto])));
-      const bkEvery = el('select', { class: 'input', 'aria-label': 'Backup frequency' });
-      [[1, 'Every hour'], [6, 'Every 6 hours'], [24, 'Daily'], [168, 'Weekly']].forEach(([h, label]) => {
-        const o = el('option', { value: String(h), text: label });
-        if ((s.backupIntervalHours || 24) === h) o.selected = true;
-        bkEvery.appendChild(o);
-      });
-      bkEvery.disabled = !s.backupAuto;
-      bkEvery.addEventListener('change', () => this.save(view, { backupIntervalHours: parseInt(bkEvery.value, 10) }));
+      const curHours = s.backupIntervalHours || 24;
+      const bkOpts = [
+        { value: '1', label: 'Every hour' },
+        { value: '6', label: 'Every 6 hours' },
+        { value: '24', label: 'Daily' },
+        { value: '168', label: 'Weekly' },
+      ];
+      if (!bkOpts.some((o) => o.value === String(curHours))) {
+        bkOpts.push({ value: String(curHours), label: 'Every ' + curHours + 'h (current)' });
+      }
+      const bkEvery = dropdown(
+        bkOpts,
+        String(curHours),
+        (v) => this.save(view, { backupIntervalHours: parseInt(v, 10) }),
+        { ariaLabel: 'Backup frequency', disabled: !s.backupAuto }
+      );
       arCard.appendChild(setRow('Backup frequency', !s.backupAuto ? 'Turn on automatic backups first.' : 'A backup missed while the machine slept (or the drive was unplugged) runs soon after.', el('div', { class: 'ctl' }, [bkEvery])));
       panel.appendChild(arCard);
     },
@@ -2205,24 +2224,39 @@
       panel.appendChild(sysCard);
     },
 
-    async save(view, update) {
-      if (this.saving) return; this.saving = true;
-      try {
-        const updated = await api('/settings', { method: 'PUT', body: update });
-        hideBanner();
-        // Mode/ports don't apply live · settings_put persists them but returns the
-        // STILL-RUNNING values, so the control would silently snap back. Surface a
-        // persistent "restart to apply" note and keep the requested value shown.
-        if (updated.restartRequired && updated.restartRequired.length) {
-          this._pendingUpdate = Object.assign({}, this._pendingUpdate, update);
-          this._restartNote = updated.restartNote
-            || ('Saved. Restart Saffev to apply: ' + updated.restartRequired.join(', ') + '.');
-        }
-        this.draw(view, updated);
-      } catch (e) { handleApiError(e); }
-      this.saving = false;
+    async save(view, update, opts) {
+      opts = opts || {};
+      const myNav = navSeq;
+      // Serialize concurrent saves so rapid toggle clicks are queued instead
+      // of silently dropped.
+      this._saveChain = (this._saveChain || Promise.resolve()).then(async () => {
+        this.saving = true;
+        try {
+          const updated = await api('/settings', { method: 'PUT', body: update });
+          hideBanner();
+          // Mode/ports don't apply live · settings_put persists them but returns the
+          // STILL-RUNNING values, so the control would silently snap back. Surface a
+          // persistent "restart to apply" note and keep the requested value shown;
+          // if the user switched back to the running mode, clear the pending banner.
+          if (updated.restartRequired && updated.restartRequired.length) {
+            this._pendingUpdate = Object.assign({}, this._pendingUpdate, update);
+            this._restartNote = updated.restartNote
+              || ('Saved. Restart Saffev to apply: ' + updated.restartRequired.join(', ') + '.');
+          } else if (update && Object.prototype.hasOwnProperty.call(update, 'mode')) {
+            this._pendingUpdate = null;
+            this._restartNote = null;
+          }
+          if (opts.redraw !== false && myNav === navSeq && activePage === Settings) {
+            this.draw(view, updated);
+          }
+        } catch (e) { handleApiError(e); }
+        this.saving = false;
+      });
+      return this._saveChain;
     },
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* =========================================================================
@@ -2472,7 +2506,9 @@
       return el('div', { class: 'card reveal', style: 'animation-delay:.21s' }, [row]);
     },
 
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* =========================================================================
@@ -2502,7 +2538,13 @@
     const up = pct > 0;
     return el('div', { class: 'delta ' + (up === goodUp ? 'up' : 'down'), text: (up ? '▲ ' : '▼ ') + Math.abs(pct) + '% vs prev' });
   }
-  const actionLabel = (a) => ({ observed: 'Observed', would_mask: 'Would mask (dry-run)', masked: 'Masked' }[a] || a);
+  const actionLabel = (a) => ({
+    observed: 'Observed',
+    would_mask: 'Would mask (dry-run)',
+    masked: 'Masked',
+    would_block: 'Would block (dry-run)',
+    blocked: 'Blocked',
+  }[a] || a);
   function dataTable(headers, rows) {
     const gtc = headers.map((h, i) => (i === 0 ? 'minmax(120px,1.4fr)' : '1fr')).join(' ');
     const t = el('div', { class: 'ttable', style: '--gtc:' + gtc });
@@ -2552,15 +2594,28 @@
       { k: 'explorer', l: 'Explorer' },
     ],
 
+    needsLocalAnalytics() {
+      if (this.tab === 'quality' || this.tab === 'billing') return false;
+      if (this.tab === 'usage' && this.usageScope === 'cloud') return false;
+      return true;
+    },
+
     async render(view) {
       view.innerHTML = '';
+      this.data = null;
+      this._dataRangeMs = null;
       const tabs = el('div', { class: 'tabbar', role: 'tablist', 'aria-label': 'Analytics sections' });
       this.TABS.forEach((t) => {
         const b = el('button', { class: 'tab' + (this.tab === t.k ? ' active' : ''), type: 'button', role: 'tab', 'data-k': t.k, text: t.l });
         b.addEventListener('click', () => { if (this.tab !== t.k) { this.tab = t.k; this.renderTab(); } });
         tabs.appendChild(b);
       });
-      const range = dropdown(this.RANGES, this.rangeMs, (v) => { this.rangeMs = parseInt(v, 10); this.reload(); }, { ariaLabel: 'Time range', align: 'right' });
+      const range = dropdown(this.RANGES, this.rangeMs, (v) => {
+        this.rangeMs = parseInt(v, 10);
+        this.data = null;
+        if (this.needsLocalAnalytics()) this.reload();
+        else this.renderTab();
+      }, { ariaLabel: 'Time range', align: 'right' });
       // Usage-source picker lives on the same row as the Window filter (compact);
       // only shown while the Usage tab is active — renderTab toggles it.
       const srcSel = dropdown(
@@ -2574,17 +2629,25 @@
       ]);
       view.appendChild(el('div', { class: 'an-head reveal' }, [tabs, el('div', { class: 'spacer' }), srcWrap, el('span', { class: 'an-range-lbl', text: 'Window' }), range]));
       view.appendChild(el('div', { class: 'an-panel', id: 'anPanel' }));
-      await this.reload();
+      if (this.needsLocalAnalytics()) await this.reload();
+      else this.renderTab();
     },
 
     async reload() {
+      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      const myNav = navSeq;
       const panel = $('#anPanel');
       if (panel) { panel.innerHTML = ''; panel.appendChild(loadingState('Crunching analytics…')); }
       try {
         const tz = new Date().getTimezoneOffset();
-        this.data = await api('/analytics?rangeMs=' + this.rangeMs + '&tzOffsetMin=' + tz);
+        const reqRange = this.rangeMs;
+        const res = await api('/analytics?rangeMs=' + reqRange + '&tzOffsetMin=' + tz);
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
+        this.data = res;
+        this._dataRangeMs = reqRange;
         hideBanner();
       } catch (e) {
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
         handleApiError(e);
         if (panel) { panel.innerHTML = ''; panel.appendChild(emptyState('Could not load analytics', e.message || '')); }
         return;
@@ -2606,7 +2669,8 @@
       if (this.tab === 'privacy') { Privacy.render(panel, this); return; }
       if (this.tab === 'quality') { Quality.draw(panel, this.rangeMs); return; }
       if (this.tab === 'billing') { Agents.billingPanel(panel); return; }
-      if (!this.data) return;
+      if (this.tab === 'usage' && this.usageScope === 'cloud') { Agents.cloudUsagePanel(panel); return; }
+      if (!this.data || this._dataRangeMs !== this.rangeMs) { this.reload(); return; }
       const d = this.data;
       // Usage handles its own empty state — its Cloud models side reads agent
       // transcripts off disk and has data even with zero proxy traffic.
@@ -2741,7 +2805,9 @@
       return [headers.join(',')].concat(rows.map((r) => r.map(esc2).join(','))).join('\n');
     },
 
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   function setRow(label, hint, ctl) {
@@ -2830,6 +2896,8 @@
   const Quality = {
     rangeMs: 24 * 60 * 60 * 1000,
     async draw(container, rangeMs) {
+      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      const myNav = navSeq;
       const body = container;
       const range = rangeMs || this.rangeMs;
       if (!body) return;
@@ -2837,7 +2905,11 @@
       body.appendChild(loadingState('Loading evaluations…'));
       let d;
       try { d = await api('/quality?rangeMs=' + range); hideBanner(); }
-      catch (e) { handleApiError(e); body.innerHTML = ''; body.appendChild(emptyState('Could not load quality data', e.message || '')); return; }
+      catch (e) {
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
+        handleApiError(e); body.innerHTML = ''; body.appendChild(emptyState('Could not load quality data', e.message || '')); return;
+      }
+      if (seq !== this._reqSeq || myNav !== navSeq) return;
       body.innerHTML = '';
 
       if (!d.evalEnabled) {
@@ -2860,7 +2932,14 @@
       body.appendChild(kpis);
 
       // Safety flags over time · only meaningful once there are flags.
-      const xl = d.series.map((b) => new Date(b.ts));
+      const daily = range >= 7 * 86400000;
+      const p2 = (n) => String(n).padStart(2, '0');
+      const xl = d.series.map((b) => {
+        const dt = new Date(b.ts);
+        return daily
+          ? dt.toLocaleString(undefined, { month: 'short' }) + ' ' + dt.getDate()
+          : p2(dt.getHours()) + ':' + p2(dt.getMinutes());
+      });
       if (d.totalFlagged > 0) {
         body.appendChild(el('div', { class: 'card reveal', style: 'animation-delay:.06s' }, [
           el('div', { class: 'hrow' }, [el('h3', { text: 'Safety flags over time' }), el('div', { class: 'spacer' }), el('span', { class: 'tag', text: 'safety' })]),
@@ -2914,7 +2993,9 @@
       }
       body.appendChild(listCard);
     },
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   /* =========================================================================
@@ -3001,9 +3082,14 @@
       panel.appendChild(loadingState('Reading coding-agent history…'));
       view.appendChild(panel);
 
+      const myNav = navSeq;
       let ov;
       try { ov = await api('/agents'); hideBanner(); }
-      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not read agent history', e.message || '')); return; }
+      catch (e) {
+        if (myNav !== navSeq) return;
+        handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not read agent history', e.message || '')); return;
+      }
+      if (myNav !== navSeq) return;
       this._overview = ov;
       this._tools = ov.tools;
       this._analysis = ov.analysis || { available: false, enabled: false };
@@ -3054,7 +3140,7 @@
       // Filter bar: search + source (tool) facet.
       const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
       const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search inside conversations, titles, projects…', value: this.q });
-      let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reloadSessions(); }, 250); });
+      search.addEventListener('input', () => { clearTimeout(this._searchTimer); this._searchTimer = setTimeout(() => { this.q = search.value.trim(); this.reloadSessions(); }, 250); });
       const scopes = [{ value: '', label: 'All sources' }].concat((this._present || []).map((t) => ({ value: t.tool, label: t.label })));
       const seg = dropdown(scopes, this.tool, (v) => { if (this.tool === v) return; this.tool = v; this.reloadSessions(); }, { ariaLabel: 'Filter by source' });
       panel.appendChild(el('div', { class: 'filterbar reveal' }, [
@@ -3083,10 +3169,16 @@
        headline with thousands of maybe-IP-addresses would train people to ignore
        the whole report. */
     async privacyTab(panel) {
+      const seq = (this._privSeq = (this._privSeq || 0) + 1);
+      const myNav = navSeq;
       panel.appendChild(loadingState('Scanning preserved conversations…'));
       let d;
       try { d = await api('/agents/privacy?rangeMs=' + this.rangeMs); hideBanner(); }
-      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not build the privacy report', e.message || '')); return; }
+      catch (e) {
+        if (seq !== this._privSeq || myNav !== navSeq || this.tab !== 'privacy') return;
+        handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not build the privacy report', e.message || '')); return;
+      }
+      if (seq !== this._privSeq || myNav !== navSeq || this.tab !== 'privacy') return;
       panel.innerHTML = '';
 
       if (!d.coverage.archiveEnabled) {
@@ -3161,15 +3253,29 @@
       ]));
     },
 
+    async fetchAgentAnalytics() {
+      const cached = this._analyticsCache;
+      if (cached && Date.now() - cached.at < 15000) return cached.data;
+      const data = await api('/agents/analytics');
+      this._analyticsCache = { at: Date.now(), data };
+      return data;
+    },
+
     /* Usage across coding agents — the cloud-model side of the usage story.
        Rendered inside Analytics › Usage under the "Cloud models" toggle; the
        data (sessions, tokens, billing blocks) comes from agent transcripts,
        not proxy traffic, so it lives here with the other agent readers. */
     async cloudUsagePanel(panel) {
+      const seq = (this._usageSeq = (this._usageSeq || 0) + 1);
+      const myNav = navSeq;
       panel.appendChild(loadingState('Adding up usage…'));
       let d;
-      try { d = await api('/agents/analytics'); hideBanner(); }
-      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load usage', e.message || '')); return; }
+      try { d = await this.fetchAgentAnalytics(); hideBanner(); }
+      catch (e) {
+        if (seq !== this._usageSeq || myNav !== navSeq) return;
+        handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load usage', e.message || '')); return;
+      }
+      if (seq !== this._usageSeq || myNav !== navSeq) return;
       panel.innerHTML = '';
 
       panel.appendChild(statStrip(4, [
@@ -3211,10 +3317,16 @@
        table's as-of date is always shown so estimates are dated. Rendered as
        the Analytics › Billing tab. */
     async billingPanel(panel) {
+      const seq = (this._billSeq = (this._billSeq || 0) + 1);
+      const myNav = navSeq;
       panel.appendChild(loadingState('Adding up usage…'));
       let d;
-      try { d = await api('/agents/analytics'); hideBanner(); }
-      catch (e) { handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load billing blocks', e.message || '')); return; }
+      try { d = await this.fetchAgentAnalytics(); hideBanner(); }
+      catch (e) {
+        if (seq !== this._billSeq || myNav !== navSeq) return;
+        handleApiError(e); panel.innerHTML = ''; panel.appendChild(emptyState('Could not load billing blocks', e.message || '')); return;
+      }
+      if (seq !== this._billSeq || myNav !== navSeq) return;
       panel.innerHTML = '';
       const u = d.usage;
       if (!u) {
@@ -3476,7 +3588,7 @@
       try {
         const r = await api('/archive/run', { method: 'POST' });
         showBanner('Archived ' + fmtNum(r.archived) + ' new · ' + fmtNum(r.skipped) + ' unchanged' + (r.deletedDetected ? ' · ' + r.deletedDetected + ' deleted from source, preserved here' : ''));
-        this.render($('#view')); // refresh counts + banner
+        if (activePage === Agents) this.render($('#view')); // refresh counts + banner
       } catch (e) {
         handleApiError(e); btn.disabled = false; btn.innerHTML = orig;
       }
@@ -3505,12 +3617,18 @@
     },
 
     async reloadSessions() {
+      const seq = (this._sessSeq = (this._sessSeq || 0) + 1);
+      const myNav = navSeq;
       const list = $('#agentList');
       if (!list) return;
       list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Loading sessions…' })]));
       let rows;
       try { rows = await api('/agents/sessions?limit=500' + (this.tool ? '&tool=' + encodeURIComponent(this.tool) : '') + (this.q ? '&q=' + encodeURIComponent(this.q) : '')); }
-      catch (e) { list.innerHTML = ''; list.appendChild(el('div', { class: 'state sm', text: e.message || 'Could not load.' })); return; }
+      catch (e) {
+        if (seq !== this._sessSeq || myNav !== navSeq) return;
+        list.innerHTML = ''; list.appendChild(el('div', { class: 'state sm', text: e.message || 'Could not load.' })); return;
+      }
+      if (seq !== this._sessSeq || myNav !== navSeq) return;
       list.innerHTML = '';
       if (!rows.length) { list.appendChild(el('div', { class: 'state sm', style: 'padding:28px', text: this.q ? 'No sessions match.' : 'No sessions.' })); return; }
       rows.forEach((s) => list.appendChild(this.row(s)));
@@ -3544,9 +3662,20 @@
     },
 
     async openDetail(id) {
+      const seq = ++detailSeq;
       let d;
-      try { d = await api('/agents/sessions/' + encodeURIComponent(id)); }
-      catch (e) { handleApiError(e); return; }
+      try {
+        const reqs = [api('/agents/sessions/' + encodeURIComponent(id))];
+        // Opening a session from Timeline before visiting Agents leaves
+        // `this._analysis` unset; fetch `/settings` lazily so AI Summary shows.
+        if (!this._analysis) reqs.push(api('/settings').catch(() => null));
+        const [detail, settings] = await Promise.all(reqs);
+        if (seq !== detailSeq) return;
+        d = detail;
+        if (settings && !this._analysis) {
+          this._analysis = { available: !!settings.analysisAvailable, enabled: !!settings.analysisEnabled };
+        }
+      } catch (e) { if (seq === detailSeq) handleApiError(e); return; }
       closeDrawer();
       const s = d.session;
       const bg = el('div', { class: 'drawer-bg', onclick: closeDrawer });
@@ -3692,7 +3821,9 @@
       btn.disabled = false;
     },
 
-    teardown() {},
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   // Minimal, XSS-safe markdown for AI output: escapes first, then applies bold,
@@ -3745,7 +3876,7 @@
       view.innerHTML = '';
       const MAG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
       const search = el('input', { class: 'sf-input', type: 'search', placeholder: 'Search everything…', value: this.q });
-      let t; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
+      search.addEventListener('input', () => { clearTimeout(this._searchTimer); this._searchTimer = setTimeout(() => { this.q = search.value.trim(); this.reload(); }, 250); });
       view.appendChild(el('div', { class: 'filterbar reveal' }, [
         el('div', { class: 'searchfield' }, [el('span', { class: 'sf-ic', html: MAG }), search]),
         dropdown(this.SCOPES, this.kind, (v) => { if (this.kind === v) return; this.kind = v; this.reload(); }, { ariaLabel: 'Filter by source' }),
@@ -3771,6 +3902,8 @@
     gtc() { return this.COLS.map((c) => c.w).join(' '); },
 
     async reload() {
+      const seq = (this._reqSeq = (this._reqSeq || 0) + 1);
+      const myNav = navSeq;
       const list = $('#tlList');
       if (!list) return;
       list.innerHTML = ''; list.appendChild(el('div', { class: 'state' }, [el('div', { class: 'spin' }), el('div', { class: 'sm', text: 'Gathering…' })]));
@@ -3780,8 +3913,10 @@
           + (this.q ? '&q=' + encodeURIComponent(this.q) : '')
           + (this.kind ? '&kind=' + this.kind : '')
           + (this.rangeMs ? '&rangeMs=' + this.rangeMs : ''));
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
         hideBanner();
       } catch (e) {
+        if (seq !== this._reqSeq || myNav !== navSeq) return;
         handleApiError(e);
         list.innerHTML = ''; list.appendChild(el('div', { class: 'state sm', text: e.message || 'Could not load.' }));
         return;
@@ -3843,16 +3978,22 @@
       row.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
       return row;
     },
+
+    teardown() {
+      if (this._searchTimer) { clearTimeout(this._searchTimer); this._searchTimer = null; }
+    },
   };
 
   const ROUTES = { timeline: Timeline, live: Live, history: History, agents: Agents, analytics: Analytics, engines: Engines, settings: Settings, about: About };
   let activePage = null;
+  let navSeq = 0;
 
   function setActiveNav(route) {
     $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === route));
   }
 
   async function navigate() {
+    const myNav = ++navSeq;
     let raw = (location.hash || '#/live').replace(/^#\/?/, '');
     // Consolidated pages redirect to their Analytics tab (deep links still work).
     const REDIRECT = { privacy: 'analytics/privacy', quality: 'analytics/quality' };
@@ -3877,7 +4018,11 @@
     closeDrawer();
     const view = $('#view');
     try { await page.render(view); }
-    catch (e) { view.innerHTML = ''; view.appendChild(emptyState('Something went wrong', e.message || String(e))); }
+    catch (e) {
+      if (myNav !== navSeq) return;
+      view.innerHTML = '';
+      view.appendChild(emptyState('Something went wrong', e.message || String(e)));
+    }
   }
 
   /* =========================================================================
@@ -3895,16 +4040,36 @@
     return h;
   }
   const LeakAlerts = {
-    log: [], unseen: 0, _stop: false, _retry: 0, _ctrl: null,
-    init() { this._stop = false; this.wireBell(); this._run(); },
+    log: [], unseen: 0, _stop: false, _retry: 0, _ctrl: null, _timer: null, _offClick: null, _state: 'idle', _active: false,
+    init() { this._stop = false; this.wireBell(); this.ensureRunning(); },
+    ensureRunning() {
+      if (this._active || this._stop || !TOKEN) return;
+      this._run();
+    },
+    _setState(s) {
+      this._state = s;
+      if (Live._streamSubscribed) Live.setLiveTag(s);
+    },
     async _run() {
       if (this._stop || !TOKEN) return;
+      this._active = true;
+      if (this._timer) { clearTimeout(this._timer); this._timer = null; }
       const ctrl = new AbortController(); this._ctrl = ctrl;
       const headers = { Accept: 'text/event-stream', Authorization: 'Bearer ' + TOKEN };
       try {
-        const res = await fetch('/api/stream?token=' + encodeURIComponent(TOKEN), { headers, signal: ctrl.signal, cache: 'no-store' });
-        if (!res.ok || !res.body) throw new Error('alert stream ' + res.status);
+        const res = await fetch('/api/stream', { headers, signal: ctrl.signal, cache: 'no-store' });
+        if (!res.ok || !res.body) {
+          if (res.status === 401 || res.status === 403) {
+            if (Live._streamSubscribed) handleApiError({ status: res.status });
+            this._active = false;
+            this._setState('idle');
+            return;
+          }
+          throw new Error('alert stream ' + res.status);
+        }
+        hideBanner();
         this._retry = 0;
+        this._setState('live');
         const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
         for (;;) {
           const { value, done } = await reader.read(); if (done) break;
@@ -3912,10 +4077,15 @@
           let idx;
           while ((idx = buf.indexOf('\n\n')) !== -1) { const frame = buf.slice(0, idx); buf = buf.slice(idx + 2); this._frame(frame); }
         }
-      } catch (e) { /* reconnect below */ }
+      } catch (e) {
+        if (this._stop || (e && e.name === 'AbortError')) { this._active = false; return; }
+      }
+      this._active = false;
       if (this._stop) return;
-      const delay = Math.min(1500 * Math.pow(2, this._retry++), 20000);
-      setTimeout(() => this._run(), delay);
+      this._setState('reconnecting');
+      this._retry = Math.min(this._retry + 1, 6);
+      const delay = Math.min(1500 * Math.pow(2, this._retry - 1), 20000);
+      this._timer = setTimeout(() => { this._timer = null; this._run(); }, delay);
     },
     _frame(frame) {
       const lines = [];
@@ -3923,6 +4093,7 @@
       if (!lines.length) return;
       let msg; try { msg = JSON.parse(lines.join('\n')); } catch (e) { return; }
       if (msg.type === 'pii' && msg.finding) this.consider(msg.finding, msg.id);
+      if (Live._streamSubscribed) Live.onEvent(msg);
     },
     consider(f, id) {
       if (!LEAK_KINDS[f.kind]) return;                    // only alert on secrets
@@ -3957,9 +4128,16 @@
       const bell = $('#alertBell'); if (!bell || bell._wired) return; bell._wired = true;
       bell.addEventListener('click', (e) => { e.stopPropagation(); this.toggleMenu(); });
     },
-    toggleMenu() {
+    closeMenu() {
       const existing = $('#alertMenu');
-      if (existing) { existing.remove(); return; }
+      if (existing) existing.remove();
+      if (this._offClick) {
+        document.removeEventListener('click', this._offClick);
+        this._offClick = null;
+      }
+    },
+    toggleMenu() {
+      if ($('#alertMenu')) { this.closeMenu(); return; }
       this.unseen = 0; this.updateBell();
       const m = el('div', { class: 'alert-menu', id: 'alertMenu' }, [el('div', { class: 'alert-menu-h', text: 'Recent leaks' })]);
       if (!this.log.length) m.appendChild(el('div', { class: 'alert-menu-empty', text: 'No secrets detected this session.' }));
@@ -3969,14 +4147,15 @@
           el('span', { class: 'alert-item-t', text: r.side === 'response' ? 'response' : 'prompt' }),
           el('span', { class: 'alert-item-time', text: new Date(r.ts).toLocaleTimeString() }),
         ]);
-        row.addEventListener('click', () => { const mm = $('#alertMenu'); if (mm) mm.remove(); openDetail(r.id); });
+        row.addEventListener('click', () => { this.closeMenu(); openDetail(r.id); });
         m.appendChild(row);
       });
       const bell = $('#alertBell'); bell.appendChild(m);
-      setTimeout(() => document.addEventListener('click', function off(ev) {
-        const mm = $('#alertMenu');
-        if (mm && !bell.contains(ev.target)) { mm.remove(); document.removeEventListener('click', off); }
-      }), 0);
+      const off = (ev) => {
+        if (!bell.contains(ev.target)) this.closeMenu();
+      };
+      this._offClick = off;
+      setTimeout(() => { if (this._offClick === off) document.addEventListener('click', off); }, 0);
     },
   };
 

@@ -318,15 +318,17 @@ impl GeminiReader {
                             }
                         }
                     }
-                    let text = extract_text(m.get("content"));
-                    if with_messages && !text.is_empty() {
-                        messages.push(AgentMessage {
-                            role: Role::Assistant,
-                            kind: MessageKind::Text,
-                            content: text,
-                            ts,
-                            tool_name: None,
-                        });
+                    if with_messages {
+                        let text = extract_text(m.get("content"));
+                        if !text.is_empty() {
+                            messages.push(AgentMessage {
+                                role: Role::Assistant,
+                                kind: MessageKind::Text,
+                                content: text,
+                                ts,
+                                tool_name: None,
+                            });
+                        }
                     }
                     for tc in m
                         .get("toolCalls")
@@ -358,9 +360,7 @@ impl GeminiReader {
         }
         if msg_count == 0 {
             // A metadata-only or fully-garbage file is not a session.
-            if session_id.is_none() {
-                return None;
-            }
+            session_id.as_ref()?;
         }
 
         let raw_id = session_id.unwrap_or_else(|| {
@@ -430,28 +430,29 @@ impl AgentReader for GeminiReader {
         ))
     }
     fn session_detail(&self, raw_id: &str) -> Option<AgentSessionDetail> {
-        // Session files embed the id in the metadata record, and (for the
-        // jsonl era) the first 8 chars in the filename. Cheapest correct
-        // route: find the file whose parse yields the id.
-        for (p, pdir) in self.session_files() {
+        let want = AgentSession::make_id(AgentTool::Gemini, raw_id);
+        let files = self.session_files();
+        // Fast path: check files whose name carries the 8-char id prefix.
+        for (p, pdir) in &files {
             let name = p.file_name().map(|n| n.to_string_lossy().to_string());
             let quick_match = raw_id
                 .get(..8)
                 .zip(name.as_deref())
                 .is_some_and(|(prefix, n)| n.contains(prefix));
             if quick_match {
-                if let Some(d) = Self::parse(&p, &pdir, true) {
-                    if d.session.id.ends_with(raw_id) {
+                if let Some(d) = Self::parse(p, pdir, true) {
+                    if d.session.id == want {
                         return Some(d);
                     }
                 }
             }
         }
-        // Fallback: full scan (legacy files whose stem differs from the id).
-        for (p, pdir) in self.session_files() {
-            if let Some(d) = Self::parse(&p, &pdir, true) {
-                if d.session.id.ends_with(raw_id) {
-                    return Some(d);
+        // Fallback: metadata-only scan to find the matching file, then full-parse
+        // only that single file (legacy files whose stem differs from the id).
+        for (p, pdir) in &files {
+            if let Some(meta) = Self::parse(p, pdir, false) {
+                if meta.session.id == want {
+                    return Self::parse(p, pdir, true);
                 }
             }
         }

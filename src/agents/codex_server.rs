@@ -105,7 +105,7 @@ pub fn run_prompt(
         }
     }
     let cfg = model
-        .map(|m| format!("model = \"{m}\"\n"))
+        .map(|m| format!("model = {}\n", toml::Value::String(m.to_string())))
         .unwrap_or_default();
     let _ = std::fs::write(home.join("config.toml"), cfg);
 
@@ -181,8 +181,10 @@ pub fn run_prompt(
                 &mut stdin,
                 &json!({"method":"turn/start","id":2,"params":{"threadId":t,"input":[{"type":"text","text":prompt}]}}),
             )?;
-        } else if id == Some(2) && error.is_some() {
-            return Err(format!("turn/start: {}", error.unwrap()));
+        } else if id == Some(2) {
+            if let Some(err) = error {
+                return Err(format!("turn/start: {err}"));
+            }
         } else if method == "item/agentMessage/delta" {
             if let Some(d) = msg
                 .get("params")

@@ -89,7 +89,7 @@ struct Supervisor {
 impl Supervisor {
     fn new(config: &Config) -> Self {
         Self {
-            config_path: config.config_path(),
+            config_path: config.active_config_path(),
             pid_path: daemon::pid_path(config),
             log_path: daemon::log_path(config),
             child: None,
@@ -146,20 +146,34 @@ impl Supervisor {
 
     fn restart(&mut self) {
         self.stop();
-        std::thread::sleep(Duration::from_millis(600));
+        // Wait briefly for the daemon to exit and reap our own child handle
+        // before spawning — otherwise an unreaped zombie still answers `kill -0`
+        // and `start()` silently becomes a no-op. Budget exceeds the daemon's
+        // 5s drain timeout so a graceful shutdown never races `start()`.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            self.reap();
+            if !self.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         self.start();
     }
 
     /// One supervision tick: reap, then restart a crashed daemon (bounded).
-    fn tick(&mut self) {
+    /// Returns whether the daemon is running (avoids redundant `kill -0` forks
+    /// during the same refresh pass).
+    fn tick(&mut self) -> bool {
         self.reap();
 
+        let running = self.is_running();
         let in_grace = self
             .last_spawn
             .map(|t| t.elapsed() < SPAWN_GRACE)
             .unwrap_or(false);
         let (respawn, attempts, gave_up) = plan_tick(
-            self.is_running(),
+            running,
             self.user_stopped,
             self.gave_up,
             self.attempts,
@@ -169,12 +183,15 @@ impl Supervisor {
         self.gave_up = gave_up;
         if respawn {
             self.spawn();
+            return false;
         }
+        running
     }
 
-    /// Whether a spawn is still inside its grace window (the "starting" state).
-    fn is_starting(&self) -> bool {
-        !self.is_running()
+    /// Whether a spawn is still inside its grace window (the "starting" state),
+    /// using a pre-sampled `running` flag.
+    fn is_starting_with(&self, running: bool) -> bool {
+        !running
             && !self.user_stopped
             && !self.gave_up
             && self
@@ -183,24 +200,24 @@ impl Supervisor {
                 .unwrap_or(false)
     }
 
-    /// Machine-readable status for the panel.
-    fn status_key(&self) -> &'static str {
-        if self.is_running() {
+    /// Machine-readable status for the panel, using a pre-sampled `running` flag.
+    fn status_key_with(&self, running: bool) -> &'static str {
+        if running {
             "running"
         } else if self.gave_up {
             "failed"
         } else if self.user_stopped {
             "stopped"
-        } else if self.is_starting() || self.attempts > 0 {
+        } else if self.is_starting_with(running) || self.attempts > 0 {
             "starting"
         } else {
             "stopped"
         }
     }
 
-    /// Status line for the menu.
-    fn status_text(&self) -> &'static str {
-        match self.status_key() {
+    /// Status line for the menu, using a pre-sampled `running` flag.
+    fn status_text_with(&self, running: bool) -> &'static str {
+        match self.status_key_with(running) {
             "running" => "● Running",
             "failed" => "△ Failed to start — see Open Logs",
             "starting" => "◌ Starting…",
@@ -374,22 +391,25 @@ pub fn run_tray() -> ExitCode {
     let mut theme = String::new();
     let refresh = Duration::from_secs(2);
 
-    let host_state =
-        |sup: &Supervisor, panel: &Option<Panel>, studio_url: &str, theme: &str| HostState {
-            app_name: crate::brand::APP_NAME.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            studio_url: studio_url.to_string(),
-            running: sup.is_running(),
-            status: sup.status_key().to_string(),
-            status_text: sup
-                .status_text()
-                .trim_start_matches(['●', '○', '◌', '△', ' '])
-                .to_string(),
-            login_enabled: login_enabled(),
-            pinned: panel.as_ref().map(|p| p.pinned).unwrap_or(false),
-            theme: theme.to_string(),
-            home_dir: crate::agents::home().to_string_lossy().to_string(),
-        };
+    let host_state = |sup: &Supervisor,
+                      running: bool,
+                      panel: &Option<Panel>,
+                      studio_url: &str,
+                      theme: &str| HostState {
+        app_name: crate::brand::APP_NAME.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        studio_url: studio_url.to_string(),
+        running,
+        status: sup.status_key_with(running).to_string(),
+        status_text: sup
+            .status_text_with(running)
+            .trim_start_matches(['●', '○', '◌', '△', ' '])
+            .to_string(),
+        login_enabled: login_enabled(),
+        pinned: panel.as_ref().map(|p| p.pinned).unwrap_or(false),
+        theme: theme.to_string(),
+        home_dir: crate::agents::home().to_string_lossy().to_string(),
+    };
 
     // The supervision tick runs on a fixed deadline, checked on EVERY wake-up.
     // Re-arming `WaitUntil(now + refresh)` per event would let a busy webview
@@ -402,11 +422,13 @@ pub fn run_tray() -> ExitCode {
     event_loop.run(move |event, target, control_flow| {
         let now = Instant::now();
         let ticked = now >= next_tick;
+        let mut sampled_running: Option<bool> = None;
         if ticked {
             next_tick = now + refresh;
-            sup.tick();
+            let r = sup.tick();
+            sampled_running = Some(r);
             if let Some(p) = panel.as_mut() {
-                p.sync(sup.is_running());
+                p.sync(r);
             }
         }
         *control_flow = ControlFlow::WaitUntil(next_tick);
@@ -425,9 +447,10 @@ pub fn run_tray() -> ExitCode {
         match event {
             // macOS: the status item must be created after the app is initialized.
             Event::NewEvents(StartCause::Init) => {
+                let r = *sampled_running.get_or_insert_with(|| sup.is_running());
                 let mut builder = TrayIconBuilder::new()
                     .with_tooltip("Saffev — local AI studio")
-                    .with_icon(status_icon(Glyph::of(&sup)))
+                    .with_icon(status_icon(Glyph::of_running(&sup, r)))
                     // macOS template images are automatically rendered white
                     // or black for the current menu-bar appearance. The source
                     // stays a pure alpha mask, so it remains legible in either.
@@ -461,7 +484,8 @@ pub fn run_tray() -> ExitCode {
                     rect.position,
                     panel.is_some()
                 );
-                let state = host_state(&sup, &panel, &studio_url, &theme);
+                let r = *sampled_running.get_or_insert_with(|| sup.is_running());
+                let state = host_state(&sup, r, &panel, &studio_url, &theme);
                 if let Some(p) = panel.as_mut() {
                     p.toggle(rect, &state);
                 }
@@ -476,7 +500,8 @@ pub fn run_tray() -> ExitCode {
             }
             Event::UserEvent(UserEvent::Panel(msg)) => match &msg {
                 PanelMsg::Ready => {
-                    let state = host_state(&sup, &panel, &studio_url, &theme);
+                    let r = *sampled_running.get_or_insert_with(|| sup.is_running());
+                    let state = host_state(&sup, r, &panel, &studio_url, &theme);
                     if let Some(p) = panel.as_mut() {
                         p.mark_ready();
                         p.push_state(&state);
@@ -623,8 +648,12 @@ pub fn run_tray() -> ExitCode {
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            // Actions like Start/Stop/Restart can change running state;
+            // re-sample once for both `panel.sync` and the UI refresh below.
+            let r = sup.is_running();
+            sampled_running = Some(r);
             if let Some(p) = panel.as_mut() {
-                p.sync(sup.is_running());
+                p.sync(r);
             }
         }
 
@@ -633,8 +662,8 @@ pub fn run_tray() -> ExitCode {
         }
         // Refresh the icon + fallback menu, and push state to the panel only
         // when something changed (the page re-renders on every push).
-        let running = sup.is_running();
-        let glyph = Glyph::of(&sup);
+        let running = sampled_running.unwrap_or_else(|| sup.is_running());
+        let glyph = Glyph::of_running(&sup, running);
         if shown_icon != Some(glyph) {
             if let Some(t) = &tray {
                 let _ = t.set_icon_with_as_template(
@@ -644,7 +673,7 @@ pub fn run_tray() -> ExitCode {
                 shown_icon = Some(glyph);
             }
         }
-        let status = sup.status_text();
+        let status = sup.status_text_with(running);
         if status != shown_status {
             status_item.set_text(status);
             shown_status = status;
@@ -654,7 +683,7 @@ pub fn run_tray() -> ExitCode {
         restart_item.set_enabled(running);
         backup_item.set_enabled(!backup_running);
 
-        let state = host_state(&sup, &panel, &studio_url, &theme);
+        let state = host_state(&sup, running, &panel, &studio_url, &theme);
         if last_state.as_ref() != Some(&state) {
             if let Some(p) = panel.as_ref() {
                 p.push_state(&state);
@@ -688,10 +717,26 @@ fn spawn_folder_picker(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
     });
 }
 
+/// Spawn a short-lived desktop helper (`open`) and reap it on a detached thread
+/// so exited children never accumulate as zombies over days of tray uptime.
+fn spawn_and_reap(mut cmd: std::process::Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// Show a folder in Finder. Callers pass only paths this process produced or
-/// [`sanitize_reveal_path`] accepted.
+/// [`sanitize_reveal_path`] accepted. Uses `-R` on macOS so Finder reveals the
+/// item rather than executing a bundle.
 fn reveal(dir: &Path) {
-    let _ = std::process::Command::new("open").arg(dir).spawn();
+    let mut cmd = std::process::Command::new("open");
+    if cfg!(target_os = "macos") {
+        cmd.arg("-R");
+    }
+    cmd.arg(dir);
+    spawn_and_reap(cmd);
 }
 
 /// The folder `saffev backup --print-dir` reported: the whole remainder of its
@@ -741,7 +786,9 @@ fn spawn_backup(config_path: PathBuf, proxy: tao::event_loop::EventLoopProxy<Use
 }
 
 fn open_url(url: &str) {
-    let _ = std::process::Command::new("open").arg(url).spawn();
+    let mut cmd = std::process::Command::new("open");
+    cmd.arg(url);
+    spawn_and_reap(cmd);
 }
 
 /// Open the daemon log in the user's default viewer. Touch the file first so
@@ -753,7 +800,9 @@ fn open_logs(path: &Path) {
         }
         let _ = std::fs::write(path, b"");
     }
-    let _ = std::process::Command::new("open").arg(path).spawn();
+    let mut cmd = std::process::Command::new("open");
+    cmd.arg(path);
+    spawn_and_reap(cmd);
 }
 
 /// A hand-rasterized 32×32 alpha mask of the canonical Saffev recorder mark.
@@ -808,10 +857,10 @@ enum Glyph {
 }
 
 impl Glyph {
-    fn of(sup: &Supervisor) -> Self {
-        if sup.is_running() {
+    fn of_running(sup: &Supervisor, running: bool) -> Self {
+        if running {
             Glyph::Recording
-        } else if sup.status_key() == "failed" {
+        } else if sup.status_key_with(running) == "failed" {
             Glyph::NeedsYou
         } else {
             Glyph::Paused
@@ -874,41 +923,53 @@ fn login_enabled() -> bool {
     launch_agent_path().is_file()
 }
 
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn set_login(enable: bool) {
     let path = launch_agent_path();
     if enable {
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
+        let exe_escaped = xml_escape(&exe.to_string_lossy());
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.saffev.launcher</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>tray</string></array>
+  <key>ProgramArguments</key><array><string>{exe_escaped}</string><string>tray</string></array>
   <key>RunAtLoad</key><true/>
 </dict></plist>
-"#,
-            exe.display()
+"#
         );
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if std::fs::write(&path, plist).is_ok() {
-            let _ = std::process::Command::new("launchctl")
-                .arg("load")
-                .arg(&path)
-                .status();
-        } else {
+        // Write the plist for the next login without calling `launchctl load`
+        // (with `RunAtLoad=true`, loading it now would immediately launch a
+        // duplicate tray instance while this one is already running).
+        if std::fs::write(&path, plist).is_err() {
             // The plist could not be written — remove any stale one so
             // `login_enabled()` (and the re-synced checkbox) reflect reality.
             let _ = std::fs::remove_file(&path);
         }
     } else {
-        let _ = std::process::Command::new("launchctl")
-            .arg("unload")
-            .arg(&path)
-            .status();
+        // Removing the plist disables launching at next login without calling
+        // `launchctl unload` (which would SIGTERM this running process if it
+        // was started by launchd).
         let _ = std::fs::remove_file(&path);
     }
 }

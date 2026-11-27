@@ -31,15 +31,20 @@ fn unknown_reportable(port: u16) -> bool {
 /// How long to wait on an identifying HTTP probe before giving up.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
-/// Build a short-timeout, loopback-only HTTP client for probing. On-device only:
-/// no proxy, no redirect chasing off the local host.
-fn probe_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .connect_timeout(PROBE_TIMEOUT)
-        .no_proxy()
-        .build()
-        .unwrap_or_default()
+/// Shared short-timeout, loopback-only HTTP client for probing. On-device only:
+/// no proxy, no redirect chasing off the local host. Reused across probes so we
+/// don't re-load TLS roots and build a fresh connection pool on every poll.
+pub(crate) fn probe_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(PROBE_TIMEOUT)
+            .connect_timeout(PROBE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 /// Probe one port; return an [`EngineInfo`] if an engine answers.
@@ -68,7 +73,7 @@ pub async fn probe_upstream(port: u16) -> Result<Option<EngineInfo>> {
 /// Probe one port, tagging any engine found with `adoption_state`.
 async fn probe_port_as(port: u16, adoption_state: AdoptionState) -> Result<Option<EngineInfo>> {
     let client = probe_client();
-    let kind = identify_with(&client, port).await;
+    let kind = identify_with(client, port).await;
 
     // Nothing listening / unrecognized-and-silent → no engine here.
     let Some(kind) = kind else {
@@ -80,7 +85,7 @@ async fn probe_port_as(port: u16, adoption_state: AdoptionState) -> Result<Optio
         return Ok(None);
     }
 
-    let version = probe_version(&client, port, kind).await;
+    let version = probe_version(client, port, kind).await;
     let how_it_starts = start_mode(kind).await.unwrap_or(StartMode::Unknown);
 
     Ok(Some(EngineInfo {
@@ -105,7 +110,7 @@ pub fn engine_name(kind: EngineKind) -> &'static str {
 /// Identify the engine answering on `port` by calling its identifying endpoint.
 pub async fn identify(port: u16) -> Result<EngineKind> {
     let client = probe_client();
-    Ok(identify_with(&client, port)
+    Ok(identify_with(client, port)
         .await
         .unwrap_or(EngineKind::Unknown))
 }

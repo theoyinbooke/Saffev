@@ -121,9 +121,14 @@ impl AgentReader for CursorReader {
         let src = self.db.to_string_lossy().to_string();
         with_sqlite_snapshot(&self.db, |conn: &Connection| {
             // `value` is TEXT (JSON) for composerData/bubbleId rows — read as String
-            // (reading as bytes fails on the driver for these).
+            // (reading as bytes fails on the driver for these). Use an exact
+            // ASCII prefix range (`:`..`;`) so SQLite uses the primary-key B-tree
+            // index instead of a case-insensitive `LIKE` full table scan.
             let mut stmt = conn
-                .prepare("SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+                .prepare(
+                    "SELECT value FROM cursorDiskKV \
+                     WHERE key >= 'composerData:' AND key < 'composerData;'",
+                )
                 .ok()?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?;
             let mut out = Vec::new();
@@ -136,7 +141,7 @@ impl AgentReader for CursorReader {
                     }
                 }
             }
-            out.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
+            out.sort_by_key(|s| std::cmp::Reverse(s.updated_ts));
             out.truncate(MAX_LIST);
             Some(out)
         })
@@ -165,13 +170,16 @@ impl AgentReader for CursorReader {
             let session = Self::session_from_composer(&composer, &src)?;
 
             // Fetch all bubbles for this composer into a map, then order by headers.
+            // Range predicate uses the B-tree index and ignores LIKE wildcards in raw_id.
             let mut bubbles: HashMap<String, Value> = HashMap::new();
             {
                 let mut bstmt = conn
-                    .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE ?1")
+                    .prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2")
                     .ok()?;
+                let lo = format!("bubbleId:{raw_id}:");
+                let hi = format!("bubbleId:{raw_id};");
                 let rows = bstmt
-                    .query_map([format!("bubbleId:{raw_id}:%")], |r| {
+                    .query_map([lo, hi], |r| {
                         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                     })
                     .ok()?;

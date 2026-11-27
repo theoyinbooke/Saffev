@@ -195,6 +195,20 @@ pub struct AgentSession {
     pub source_path: String,
 }
 
+/// Validate that a raw session id is a single normal path component (non-empty,
+/// no `/` or `\`, no `.` or `..`, no root/prefix). Prevents path traversal when
+/// adapters join `raw_id` onto a sessions directory.
+pub(crate) fn is_safe_path_id(raw_id: &str) -> bool {
+    if raw_id.is_empty() || raw_id.contains('/') || raw_id.contains('\\') {
+        return false;
+    }
+    let mut comps = std::path::Path::new(raw_id).components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 impl AgentSession {
     /// Build a namespaced id from a tool + raw id.
     pub fn make_id(tool: AgentTool, raw: &str) -> String {
@@ -516,7 +530,7 @@ pub fn all_sessions() -> Vec<AgentSession> {
         .filter(|r| r.is_present())
         .flat_map(|r| sessions_for(r.as_ref()))
         .collect();
-    out.sort_by(|a, b| b.updated_ts.cmp(&a.updated_ts));
+    out.sort_by_key(|s| std::cmp::Reverse(s.updated_ts));
     out
 }
 
@@ -592,8 +606,17 @@ pub fn detected() -> Vec<ToolStat> {
 }
 
 /// Per-tool rollups from an already-listed sessions slice (so callers that need
-/// several views can list once).
+/// several views can list once), using the built-in default price table.
 pub fn tool_stats(sessions: &[AgentSession]) -> Vec<ToolStat> {
+    tool_stats_with(sessions, &crate::config::PricingConfig::default())
+}
+
+/// Per-tool rollups from an already-listed sessions slice using an explicit
+/// [`PricingConfig`] (e.g. live user overrides from `saffev.toml`).
+pub fn tool_stats_with(
+    sessions: &[AgentSession],
+    pricing: &crate::config::PricingConfig,
+) -> Vec<ToolStat> {
     readers()
         .iter()
         .map(|r| {
@@ -604,7 +627,8 @@ pub fn tool_stats(sessions: &[AgentSession]) -> Vec<ToolStat> {
             let cost_usd = mine
                 .iter()
                 .map(|s| {
-                    cost_usd_split(
+                    cost_usd_split_with(
+                        pricing,
                         s.model.as_deref(),
                         s.input_tokens,
                         s.output_tokens,
